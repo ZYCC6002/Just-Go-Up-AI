@@ -12,6 +12,10 @@ wheels/
 # Databases
 *.db
 *.sqlite
+*.sql
+
+# Images
+data/raw/kilter_images
 
 # Models
 models/
