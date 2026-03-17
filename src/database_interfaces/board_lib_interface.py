@@ -8,6 +8,8 @@ from typing import Any, Iterable, Optional, Sequence
 
 import sqlite3
 
+from database_interfaces.hold_metadata_importer import import_kilter_board_csv_metadata
+
 
 @dataclass(frozen=True)
 class HoldPlacement:
@@ -17,6 +19,20 @@ class HoldPlacement:
 	x: Optional[int]
 	y: Optional[int]
 	role_name: Optional[str]
+	metadata: Optional["ExternalHoldMetadata"] = None
+
+
+@dataclass(frozen=True)
+class ExternalHoldMetadata:
+	hole_id: int
+	external_hold_id: int
+	type: Optional[str]
+	function: Optional[str]
+	depth: Optional[int]
+	orientation: Optional[int]
+	texture: Optional[int]
+	size: Optional[int]
+	source: str
 
 
 class BoardLibInterface:
@@ -280,7 +296,55 @@ class BoardLibInterface:
 		rows = self.fetchall("SELECT id, name FROM placement_roles;")
 		return {int(r[0]): str(r[1]) for r in rows}
 
-	def get_hold_positions_for_climb(self, climb_uuid: str) -> list[HoldPlacement]:
+	def _table_exists(self, table_name: str) -> bool:
+		row = self.execute(
+			"SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1",
+			[table_name],
+		).fetchone()
+		return row is not None
+
+	def _fetch_external_hold_metadata(
+		self,
+		hole_ids: list[int],
+		*,
+		source: str,
+	) -> dict[int, ExternalHoldMetadata]:
+		if not hole_ids or not self._table_exists("external_hold_metadata"):
+			return {}
+
+		placeholders = ",".join(["?"] * len(hole_ids))
+		rows = self.fetchall(
+			f"""
+			SELECT hole_id, external_hold_id, type, function, depth, orientation, texture, size, source
+			FROM external_hold_metadata
+			WHERE source = ? AND hole_id IN ({placeholders})
+			""",
+			[source, *hole_ids],
+		)
+
+		metadata_by_hole: dict[int, ExternalHoldMetadata] = {}
+		for hole_id, external_hold_id, hold_type, hold_function, depth, orientation, texture, size, src in rows:
+			metadata_by_hole[int(hole_id)] = ExternalHoldMetadata(
+				hole_id=int(hole_id),
+				external_hold_id=int(external_hold_id),
+				type=str(hold_type) if hold_type is not None else None,
+				function=str(hold_function) if hold_function is not None else None,
+				depth=int(depth) if depth is not None else None,
+				orientation=int(orientation) if orientation is not None else None,
+				texture=int(texture) if texture is not None else None,
+				size=int(size) if size is not None else None,
+				source=str(src),
+			)
+		return metadata_by_hole
+
+	def get_hold_positions_for_climb(
+		self,
+		climb_uuid: str,
+		*,
+		include_metadata: bool = True,
+		metadata_source: str = "kilter_board_csv",
+		metadata_product_id: int = 1,
+	) -> list[HoldPlacement]:
 		climb = self.get_climb_by_uuid(climb_uuid)
 		if climb is None:
 			return []
@@ -301,10 +365,23 @@ class BoardLibInterface:
 		hole_ids = sorted({hole_id for hole_id in placement_to_hole.values()})
 		placeholders = ",".join(["?"] * len(hole_ids))
 		hole_rows = self.fetchall(
-			f"SELECT id, x, y FROM holes WHERE id IN ({placeholders});",
+			f"SELECT id, x, y, product_id FROM holes WHERE id IN ({placeholders});",
 			hole_ids,
 		)
-		hole_to_xy = {int(hid): (int(x), int(y)) for hid, x, y in hole_rows}
+		hole_to_xy = {int(hid): (int(x), int(y)) for hid, x, y, _product_id in hole_rows}
+		hole_to_product_id = {int(hid): int(product_id) for hid, _x, _y, product_id in hole_rows}
+
+		metadata_by_hole: dict[int, ExternalHoldMetadata] = {}
+		if include_metadata and hole_ids:
+			all_match_product = all(
+				hole_to_product_id.get(hole_id) == metadata_product_id
+				for hole_id in hole_ids
+			)
+			if all_match_product:
+				metadata_by_hole = self._fetch_external_hold_metadata(
+					hole_ids,
+					source=metadata_source,
+				)
 
 		role_map = self._role_map()
 
@@ -313,6 +390,7 @@ class BoardLibInterface:
 			hole_id = placement_to_hole.get(placement_id)
 			coords = hole_to_xy.get(hole_id) if hole_id is not None else None
 			x, y = coords if coords else (None, None)
+			metadata = metadata_by_hole.get(hole_id) if hole_id is not None else None
 			holds.append(
 				HoldPlacement(
 					placement_id=placement_id,
@@ -321,6 +399,7 @@ class BoardLibInterface:
 					x=x,
 					y=y,
 					role_name=role_map.get(role_id),
+					metadata=metadata,
 				)
 			)
 		return holds
@@ -335,5 +414,23 @@ class BoardLibInterface:
 			counts[climb_uuid] = len(pairs)
 		return counts
 
+	def import_external_hold_metadata(
+		self,
+		csv_path: str | Path,
+		*,
+		source: str = "kilter_board_csv",
+		product_id: int = 1,
+		create_table: bool = True,
+	) -> dict[str, Any]:
+		"""Import external hold metadata CSV and map rows to ``holes.id``."""
+		conn = self.connect()
+		return import_kilter_board_csv_metadata(
+			conn,
+			csv_path,
+			source=source,
+			product_id=product_id,
+			create_table=create_table,
+		)
 
-__all__ = ["BoardLibInterface", "HoldPlacement"]
+
+__all__ = ["BoardLibInterface", "HoldPlacement", "ExternalHoldMetadata"]
