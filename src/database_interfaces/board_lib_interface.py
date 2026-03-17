@@ -66,12 +66,12 @@ class BoardLibInterface:
 
 	def get_climb_by_uuid(self, climb_uuid: str) -> Optional[dict[str, Any]]:
 		row = self.execute(
-			"SELECT uuid, name, frames, edge_left, edge_right, edge_bottom, edge_top FROM climbs WHERE uuid = ?",
+			"SELECT uuid, layout_id, name, frames, hsm, edge_left, edge_right, edge_bottom, edge_top, angle FROM climbs WHERE uuid = ?",
 			[climb_uuid],
 		).fetchone()
 		if row is None:
 			return None
-		keys = ["uuid", "name", "frames", "edge_left", "edge_right", "edge_bottom", "edge_top"]
+		keys = ["uuid", "layout_id", "name", "frames", "hsm", "edge_left", "edge_right", "edge_bottom", "edge_top", "angle"]
 		return dict(zip(keys, row))
 
 	@staticmethod
