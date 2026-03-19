@@ -36,6 +36,7 @@ class RouteVAEEncoderConfig:
 	dim_feedforward: int = 256
 	dropout: float = 0.1
 	layer_norm_eps: float = 1e-5
+	condition_hidden_dim: int = 64
 
 
 class ScalarSinusoidalEmbedding(nn.Module):
@@ -141,6 +142,13 @@ class RouteTransformerEncoder(nn.Module):
 		self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=cfg.num_layers)
 		self.final_norm = nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps)
 
+		# Condition embedding: [angle, grade, grade_missing] -> d_model
+		self.cond_mlp = nn.Sequential(
+			nn.Linear(3, cfg.condition_hidden_dim),
+			nn.GELU(),
+			nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
+		)
+
 	def _project_numeric(self, tensor_2d: torch.Tensor, proj: nn.Linear) -> torch.Tensor:
 		return proj(tensor_2d.unsqueeze(-1).to(torch.float32))
 
@@ -153,6 +161,29 @@ class RouteTransformerEncoder(nn.Module):
 	def _normalize_size(size: torch.Tensor) -> torch.Tensor:
 		# size range: [2, 5]
 		return ((size.to(torch.float32) - 2.0) / 3.0).clamp(0.0, 1.0)
+
+	def _build_condition_embedding(
+		self,
+		*,
+		angle: torch.Tensor,
+		grade: torch.Tensor,
+		grade_missing: torch.Tensor | None,
+	) -> torch.Tensor:
+		if grade_missing is None:
+			grade_missing = torch.zeros_like(grade, dtype=torch.float32)
+		else:
+			grade_missing = grade_missing.to(torch.float32)
+
+		cond_input = torch.stack(
+			[
+				angle.to(torch.float32),
+				grade.to(torch.float32),
+				grade_missing,
+			],
+			dim=-1,
+		)
+		# [B, d_model]
+		return self.cond_mlp(cond_input)
 
 	def build_token_embeddings(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
 		type_emb = self.type_embedding(batch["type_encoded_id"])  # [B, L, d_type]
@@ -202,7 +233,14 @@ class RouteTransformerEncoder(nn.Module):
 		counts = valid_mask.sum(dim=1).clamp(min=1.0)  # [B, 1]
 		return summed / counts
 
-	def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+	def forward(
+		self,
+		batch: dict[str, torch.Tensor],
+		*,
+		angle: torch.Tensor,
+		grade: torch.Tensor,
+		grade_missing: torch.Tensor | None = None,
+	) -> dict[str, torch.Tensor]:
 		"""Encode hold-token sequences.
 
 		Returns:
@@ -213,6 +251,14 @@ class RouteTransformerEncoder(nn.Module):
 		"""
 		padding_mask = batch["padding_mask"].bool()
 		tokens = self.build_token_embeddings(batch)
+		cond_emb = self._build_condition_embedding(
+			angle=angle,
+			grade=grade,
+			grade_missing=grade_missing,
+		)  # [B, d_model]
+
+		# Add the same condition embedding to each hold token before transformer.
+		tokens = tokens + cond_emb.unsqueeze(1)
 		encoded = self.encoder(tokens, src_key_padding_mask=padding_mask)
 		encoded = self.final_norm(encoded)
 		route_embedding = self.masked_mean_pool(encoded, padding_mask)
