@@ -8,7 +8,7 @@ import torch.nn as nn
 
 
 @dataclass
-class RouteTransformerConfig:
+class RouteVAEEncoderConfig:
 	"""Configuration for hold-token transformer encoder."""
 
 	# Feature vocab sizes (set based on your preprocessing dictionaries)
@@ -89,7 +89,7 @@ class RouteTransformerEncoder(nn.Module):
 	- padding_mask: bool [B, L], True for padded tokens
 	"""
 
-	def __init__(self, cfg: RouteTransformerConfig) -> None:
+	def __init__(self, cfg: RouteVAEEncoderConfig) -> None:
 		super().__init__()
 		self.cfg = cfg
 
@@ -278,7 +278,7 @@ def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.T
 
 
 __all__ = [
-	"RouteTransformerConfig",
+	"RouteVAEEncoderConfig",
 	"ScalarSinusoidalEmbedding",
 	"RouteTransformerEncoder",
 	"collate_hold_token_batch",

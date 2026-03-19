@@ -9,7 +9,7 @@ import random
 import torch
 
 from database_interfaces.board_lib_interface import BoardLibInterface, HoldPlacement
-from model_training.route_transformer_encoder import RouteTransformerConfig
+from model_training.route_vae_encoder import RouteVAEEncoderConfig
 
 
 UNKNOWN_TOKEN = "<UNK>"
@@ -39,7 +39,7 @@ class RouteVocabBundle:
 	role_vocab: CategoricalVocab
 	hole_vocab: CategoricalVocab
 
-	def to_transformer_config(self, **overrides: Any) -> RouteTransformerConfig:
+	def to_transformer_config(self, **overrides: Any) -> RouteVAEEncoderConfig:
 		base = dict(
 			type_vocab_size=self.type_vocab.size,
 			function_vocab_size=self.function_vocab.size,
@@ -47,7 +47,7 @@ class RouteVocabBundle:
 			hole_id_vocab_size=self.hole_vocab.size,
 		)
 		base.update(overrides)
-		return RouteTransformerConfig(**base)
+		return RouteVAEEncoderConfig(**base)
 
 
 @dataclass
