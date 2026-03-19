@@ -135,10 +135,10 @@ def _encode_route_tokens(route_tokens: list[RawHoldToken], vocabs: RouteVocabBun
 	orientation_cos = [p[1] for p in orientation_pairs]
 
 	return {
-		"type_id": torch.tensor(type_ids, dtype=torch.long),
-		"function_id": torch.tensor(function_ids, dtype=torch.long),
-		"role_id": torch.tensor(role_ids, dtype=torch.long),
-		"hole_id": torch.tensor(hole_ids, dtype=torch.long),
+		"type_encoded_id": torch.tensor(type_ids, dtype=torch.long),
+		"function_encoded_id": torch.tensor(function_ids, dtype=torch.long),
+		"role_encoded_id": torch.tensor(role_ids, dtype=torch.long),
+		"hole_encoded_id": torch.tensor(hole_ids, dtype=torch.long),
 		"x": torch.tensor([tok.x for tok in route_tokens], dtype=torch.float32),
 		"y": torch.tensor([tok.y for tok in route_tokens], dtype=torch.float32),
 		"depth": torch.tensor([tok.depth for tok in route_tokens], dtype=torch.float32),

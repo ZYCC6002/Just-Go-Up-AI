@@ -76,10 +76,10 @@ class RouteTransformerEncoder(nn.Module):
 	"""Transformer encoder over hold tokens with per-feature embeddings.
 
 	Expected token-level inputs (each [B, L], except padding_mask):
-	- type_id: categorical hold type index
-	- function_id: categorical hold function index
-	- role_id: placement role index
-	- hole_id: categorical hole index
+	- type_encoded_id: encoded hold type index
+	- function_encoded_id: encoded hold function index
+	- role_encoded_id: encoded placement role index
+	- hole_encoded_id: encoded hole index
 	- x: board x coordinate (sinusoidal embedding)
 	- y: board y coordinate (sinusoidal embedding)
 	- depth: numeric
@@ -155,10 +155,10 @@ class RouteTransformerEncoder(nn.Module):
 		return ((size.to(torch.float32) - 2.0) / 3.0).clamp(0.0, 1.0)
 
 	def build_token_embeddings(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-		type_emb = self.type_embedding(batch["type_id"])  # [B, L, d_type]
-		function_emb = self.function_embedding(batch["function_id"])  # [B, L, d_func]
-		role_emb = self.role_embedding(batch["role_id"])  # [B, L, d_role]
-		hole_emb = self.hole_embedding(batch["hole_id"])  # [B, L, d_hole]
+		type_emb = self.type_embedding(batch["type_encoded_id"])  # [B, L, d_type]
+		function_emb = self.function_embedding(batch["function_encoded_id"])  # [B, L, d_func]
+		role_emb = self.role_embedding(batch["role_encoded_id"])  # [B, L, d_role]
+		hole_emb = self.hole_embedding(batch["hole_encoded_id"])  # [B, L, d_hole]
 
 		x_emb = self.x_embedding(batch["x"].to(torch.float32))  # [B, L, d_x]
 		y_emb = self.y_embedding(batch["y"].to(torch.float32))  # [B, L, d_y]
@@ -223,17 +223,17 @@ def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.T
 	"""Pad variable-length hold-token samples into a batch.
 
 	Each sample should be a dict with keys:
-	- type_id, function_id, role_id, hole_id, x, y, depth, orientation_sin, orientation_cos, size
+	- type_encoded_id, function_encoded_id, role_encoded_id, hole_encoded_id, x, y, depth, orientation_sin, orientation_cos, size
 	Each value is a 1D tensor of length L_i.
 	"""
 	if not samples:
 		raise ValueError("samples must be non-empty")
 
 	feature_keys = [
-		"type_id",
-		"function_id",
-		"role_id",
-		"hole_id",
+		"type_encoded_id",
+		"function_encoded_id",
+		"role_encoded_id",
+		"hole_encoded_id",
 		"x",
 		"y",
 		"depth",
@@ -242,7 +242,7 @@ def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.T
 		"size",
 	]
 
-	lengths = [int(sample["type_id"].shape[0]) for sample in samples]
+	lengths = [int(sample["type_encoded_id"].shape[0]) for sample in samples]
 	max_len = max(lengths)
 	batch_size = len(samples)
 
@@ -257,7 +257,7 @@ def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.T
 		padded = []
 		for sample in samples:
 			t = sample[key]
-			pad_value = 0 if key in {"type_id", "function_id", "role_id", "hole_id"} else 0.0
+			pad_value = 0 if key in {"type_encoded_id", "function_encoded_id", "role_encoded_id", "hole_encoded_id"} else 0.0
 			padded.append(_pad_1d(t, max_len, pad_value))
 		batch[key] = torch.stack(padded, dim=0)
 
@@ -267,10 +267,10 @@ def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.T
 	batch["padding_mask"] = padding_mask
 
 	# enforce dtypes
-	batch["type_id"] = batch["type_id"].long()
-	batch["function_id"] = batch["function_id"].long()
-	batch["role_id"] = batch["role_id"].long()
-	batch["hole_id"] = batch["hole_id"].long()
+	batch["type_encoded_id"] = batch["type_encoded_id"].long()
+	batch["function_encoded_id"] = batch["function_encoded_id"].long()
+	batch["role_encoded_id"] = batch["role_encoded_id"].long()
+	batch["hole_encoded_id"] = batch["hole_encoded_id"].long()
 	for key in ["x", "y", "depth", "orientation_sin", "orientation_cos", "size"]:
 		batch[key] = batch[key].to(torch.float32)
 
