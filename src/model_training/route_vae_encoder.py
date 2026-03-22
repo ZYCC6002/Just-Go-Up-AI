@@ -38,6 +38,16 @@ class RouteVAEEncoderConfig:
 	layer_norm_eps: float = 1e-5
 	condition_hidden_dim: int = 64
 
+	# Input normalization ranges
+	x_min: float = 0.0
+	x_max: float = 140.0
+	y_min: float = 0.0
+	y_max: float = 160.0
+	angle_min: float = 0.0
+	angle_max: float = 70.0
+	grade_min: float = 0.0
+	grade_max: float = 70.0
+
 
 class ScalarSinusoidalEmbedding(nn.Module):
 	"""Sinusoidal embedding for scalar coordinates (e.g. x/y board coordinates)."""
@@ -153,6 +163,11 @@ class RouteTransformerEncoder(nn.Module):
 		return proj(tensor_2d.unsqueeze(-1).to(torch.float32))
 
 	@staticmethod
+	def _normalize_minmax(values: torch.Tensor, vmin: float, vmax: float) -> torch.Tensor:
+		denom = max(vmax - vmin, 1e-6)
+		return ((values.to(torch.float32) - vmin) / denom).clamp(0.0, 1.0)
+
+	@staticmethod
 	def _normalize_depth(depth: torch.Tensor) -> torch.Tensor:
 		# depth range: [0, 3]
 		return (depth.to(torch.float32) / 3.0).clamp(0.0, 1.0)
@@ -161,6 +176,18 @@ class RouteTransformerEncoder(nn.Module):
 	def _normalize_size(size: torch.Tensor) -> torch.Tensor:
 		# size range: [2, 5]
 		return ((size.to(torch.float32) - 2.0) / 3.0).clamp(0.0, 1.0)
+
+	def _normalize_x(self, x: torch.Tensor) -> torch.Tensor:
+		return self._normalize_minmax(x, self.cfg.x_min, self.cfg.x_max)
+
+	def _normalize_y(self, y: torch.Tensor) -> torch.Tensor:
+		return self._normalize_minmax(y, self.cfg.y_min, self.cfg.y_max)
+
+	def _normalize_angle(self, angle: torch.Tensor) -> torch.Tensor:
+		return self._normalize_minmax(angle, self.cfg.angle_min, self.cfg.angle_max)
+
+	def _normalize_grade(self, grade: torch.Tensor) -> torch.Tensor:
+		return self._normalize_minmax(grade, self.cfg.grade_min, self.cfg.grade_max)
 
 	def _build_condition_embedding(
 		self,
@@ -176,8 +203,8 @@ class RouteTransformerEncoder(nn.Module):
 
 		cond_input = torch.stack(
 			[
-				angle.to(torch.float32),
-				grade.to(torch.float32),
+				self._normalize_angle(angle),
+				self._normalize_grade(grade),
 				grade_missing,
 			],
 			dim=-1,
@@ -191,8 +218,8 @@ class RouteTransformerEncoder(nn.Module):
 		role_emb = self.role_embedding(batch["role_encoded_id"])  # [B, L, d_role]
 		hole_emb = self.hole_embedding(batch["hole_encoded_id"])  # [B, L, d_hole]
 
-		x_emb = self.x_embedding(batch["x"].to(torch.float32))  # [B, L, d_x]
-		y_emb = self.y_embedding(batch["y"].to(torch.float32))  # [B, L, d_y]
+		x_emb = self.x_embedding(self._normalize_x(batch["x"]))  # [B, L, d_x]
+		y_emb = self.y_embedding(self._normalize_y(batch["y"]))  # [B, L, d_y]
 
 		depth_norm = self._normalize_depth(batch["depth"])
 		size_norm = self._normalize_size(batch["size"])

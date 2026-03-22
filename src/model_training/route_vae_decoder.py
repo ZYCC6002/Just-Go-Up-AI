@@ -43,11 +43,21 @@ class RouteVAEDecoderConfig:
 	layer_norm_eps: float = 1e-5
 	max_seq_len: int = 128
 
+	# Input normalization ranges
+	x_min: float = 0.0
+	x_max: float = 140.0
+	y_min: float = 0.0
+	y_max: float = 160.0
+	angle_min: float = 0.0
+	angle_max: float = 70.0
+	grade_min: float = 0.0
+	grade_max: float = 70.0
+
 
 class RouteTransformerDecoder(nn.Module):
 	"""Autoregressive transformer decoder conditioned on latent, angle, and grade.
 
-	Expected teacher-forcing input keys:
+	Expected teacher-forcing input keys (shifted-right with BOS at position 0):
 	- type_encoded_id, function_encoded_id, role_encoded_id, hole_encoded_id
 	- x, y, depth, orientation_sin, orientation_cos, size
 	- padding_mask (bool, True for padded tokens)
@@ -56,6 +66,13 @@ class RouteTransformerDecoder(nn.Module):
 	def __init__(self, cfg: RouteVAEDecoderConfig) -> None:
 		super().__init__()
 		self.cfg = cfg
+
+		# EOS token ids for categorical output vocabularies.
+		# Output heads predict base vocab + EOS.
+		self.type_eos_id = cfg.type_vocab_size
+		self.function_eos_id = cfg.function_vocab_size
+		self.role_eos_id = cfg.role_vocab_size
+		self.hole_eos_id = cfg.hole_id_vocab_size
 
 		# Categorical input embeddings
 		self.type_embedding = nn.Embedding(cfg.type_vocab_size, cfg.type_embed_dim)
@@ -92,12 +109,17 @@ class RouteTransformerDecoder(nn.Module):
 			nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps),
 			nn.Dropout(cfg.dropout),
 		)
+		self.bos_embedding = nn.Parameter(torch.randn(cfg.d_model) * 0.02)
 
 		# Learned sequence position embedding for decoder time-step order
 		self.sequence_position_embedding = nn.Embedding(cfg.max_seq_len, cfg.d_model)
 
 		# Conditioning pathways
-		self.latent_to_tgt_bias = nn.Linear(cfg.latent_dim, cfg.d_model)
+		self.z_mlp = nn.Sequential(
+			nn.Linear(cfg.latent_dim, cfg.condition_hidden_dim),
+			nn.GELU(),
+			nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
+		)
 		self.angle_mlp = nn.Sequential(
 			nn.Linear(1, cfg.condition_hidden_dim),
 			nn.GELU(),
@@ -122,10 +144,10 @@ class RouteTransformerDecoder(nn.Module):
 		self.final_norm = nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps)
 
 		# Output heads (next-token predictions)
-		self.type_head = nn.Linear(cfg.d_model, cfg.type_vocab_size)
-		self.function_head = nn.Linear(cfg.d_model, cfg.function_vocab_size)
-		self.role_head = nn.Linear(cfg.d_model, cfg.role_vocab_size)
-		self.hole_head = nn.Linear(cfg.d_model, cfg.hole_id_vocab_size)
+		self.type_head = nn.Linear(cfg.d_model, cfg.type_vocab_size + 1)
+		self.function_head = nn.Linear(cfg.d_model, cfg.function_vocab_size + 1)
+		self.role_head = nn.Linear(cfg.d_model, cfg.role_vocab_size + 1)
+		self.hole_head = nn.Linear(cfg.d_model, cfg.hole_id_vocab_size + 1)
 
 		self.x_head = nn.Linear(cfg.d_model, 1)
 		self.y_head = nn.Linear(cfg.d_model, 1)
@@ -138,12 +160,29 @@ class RouteTransformerDecoder(nn.Module):
 		return proj(tensor_2d.unsqueeze(-1).to(torch.float32))
 
 	@staticmethod
+	def _normalize_minmax(values: torch.Tensor, vmin: float, vmax: float) -> torch.Tensor:
+		denom = max(vmax - vmin, 1e-6)
+		return ((values.to(torch.float32) - vmin) / denom).clamp(0.0, 1.0)
+
+	@staticmethod
 	def _normalize_depth(depth: torch.Tensor) -> torch.Tensor:
 		return (depth.to(torch.float32) / 3.0).clamp(0.0, 1.0)
 
 	@staticmethod
 	def _normalize_size(size: torch.Tensor) -> torch.Tensor:
 		return ((size.to(torch.float32) - 2.0) / 3.0).clamp(0.0, 1.0)
+
+	def _normalize_x(self, x: torch.Tensor) -> torch.Tensor:
+		return self._normalize_minmax(x, self.cfg.x_min, self.cfg.x_max)
+
+	def _normalize_y(self, y: torch.Tensor) -> torch.Tensor:
+		return self._normalize_minmax(y, self.cfg.y_min, self.cfg.y_max)
+
+	def _normalize_angle(self, angle: torch.Tensor) -> torch.Tensor:
+		return self._normalize_minmax(angle, self.cfg.angle_min, self.cfg.angle_max)
+
+	def _normalize_grade(self, grade: torch.Tensor) -> torch.Tensor:
+		return self._normalize_minmax(grade, self.cfg.grade_min, self.cfg.grade_max)
 
 	@staticmethod
 	def _causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
@@ -154,25 +193,31 @@ class RouteTransformerDecoder(nn.Module):
 	def _build_condition_memory(
 		self,
 		*,
+		z: torch.Tensor,
 		angle: torch.Tensor,
 		grade: torch.Tensor,
 		grade_missing: torch.Tensor | None,
 	) -> torch.Tensor:
 		"""Create condition memory tokens used as cross-attention keys/values.
 
-		Returns memory shape [B, 2, d_model]:
-		- token 0: angle condition embedding
-		- token 1: grade condition embedding
+		Returns memory shape [B, 3, d_model]:
+		- token 0: latent z embedding
+		- token 1: angle condition embedding
+		- token 2: grade condition embedding
 		"""
 		if grade_missing is None:
 			grade_missing = torch.zeros_like(grade, dtype=torch.float32)
 		else:
 			grade_missing = grade_missing.to(torch.float32)
 
-		angle_token = self.angle_mlp(angle.to(torch.float32).unsqueeze(-1)).unsqueeze(1)
-		grade_input = torch.stack([grade.to(torch.float32), grade_missing], dim=-1)
+		z_token = self.z_mlp(z.to(torch.float32)).unsqueeze(1)
+		norm_angle = self._normalize_angle(angle)
+		norm_grade = self._normalize_grade(grade)
+
+		angle_token = self.angle_mlp(norm_angle.unsqueeze(-1)).unsqueeze(1)
+		grade_input = torch.stack([norm_grade, grade_missing], dim=-1)
 		grade_token = self.grade_mlp(grade_input).unsqueeze(1)
-		return torch.cat([angle_token, grade_token], dim=1)
+		return torch.cat([z_token, angle_token, grade_token], dim=1)
 
 	def build_decoder_inputs(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
 		type_emb = self.type_embedding(batch["type_encoded_id"])
@@ -180,8 +225,8 @@ class RouteTransformerDecoder(nn.Module):
 		role_emb = self.role_embedding(batch["role_encoded_id"])
 		hole_emb = self.hole_embedding(batch["hole_encoded_id"])
 
-		x_emb = self.x_embedding(batch["x"].to(torch.float32))
-		y_emb = self.y_embedding(batch["y"].to(torch.float32))
+		x_emb = self.x_embedding(self._normalize_x(batch["x"]))
+		y_emb = self.y_embedding(self._normalize_y(batch["y"]))
 
 		depth_norm = self._normalize_depth(batch["depth"])
 		size_norm = self._normalize_size(batch["size"])
@@ -217,6 +262,10 @@ class RouteTransformerDecoder(nn.Module):
 			)
 		positions = torch.arange(seq_len, device=tokens.device).unsqueeze(0).expand(batch_size, seq_len)
 		tokens = tokens + self.sequence_position_embedding(positions)
+
+		# Force a learned BOS anchor at timestep 0.
+		bos = self.bos_embedding.unsqueeze(0).expand(batch_size, -1)
+		tokens[:, 0, :] = bos + self.sequence_position_embedding.weight[0].unsqueeze(0)
 		return tokens
 
 	def forward(
@@ -240,12 +289,9 @@ class RouteTransformerDecoder(nn.Module):
 		padding_mask = batch["padding_mask"].bool()
 		tgt = self.build_decoder_inputs(batch)
 
-		# Inject latent into every decoding step as an additive bias.
-		latent_bias = self.latent_to_tgt_bias(z).unsqueeze(1)  # [B, 1, d_model]
-		tgt = tgt + latent_bias
-
 		# Cross-attention memory comes from condition embeddings.
 		memory = self._build_condition_memory(
+			z=z,
 			angle=angle,
 			grade=grade,
 			grade_missing=grade_missing,
