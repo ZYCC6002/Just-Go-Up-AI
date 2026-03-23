@@ -149,7 +149,22 @@ class RouteTransformerEncoder(nn.Module):
 			layer_norm_eps=cfg.layer_norm_eps,
 			batch_first=True,
 		)
-		self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=cfg.num_layers)
+		# Disable nested-tensor path for MPS compatibility.
+		# Some PyTorch/MPS versions do not implement
+		# aten::_nested_tensor_from_mask_left_aligned.
+		try:
+			self.encoder = nn.TransformerEncoder(
+				encoder_layer,
+				num_layers=cfg.num_layers,
+				enable_nested_tensor=False,
+				mask_check=False,
+			)
+		except TypeError:
+			self.encoder = nn.TransformerEncoder(
+				encoder_layer,
+				num_layers=cfg.num_layers,
+				enable_nested_tensor=False,
+			)
 		self.final_norm = nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps)
 
 		# Condition embedding: [angle, grade, grade_missing] -> d_model

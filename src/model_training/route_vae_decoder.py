@@ -186,8 +186,8 @@ class RouteTransformerDecoder(nn.Module):
 
 	@staticmethod
 	def _causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
-		# Shape [L, L], -inf above diagonal blocks future positions.
-		mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
+		# Shape [L, L], True above diagonal blocks future positions.
+		mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
 		return torch.triu(mask, diagonal=1)
 
 	def _build_condition_memory(
