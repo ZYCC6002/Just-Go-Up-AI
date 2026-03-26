@@ -156,6 +156,8 @@ def _load_raw_routes(
 	metadata_product_id: int,
 	max_routes: int | None,
 	min_holds: int,
+	min_quality_average: float,
+	min_ascensionist_count: int,
 ) -> list[tuple[dict[str, Any], list[RawHoldToken], float]]:
 	"""Load climbs and convert each hold to raw token records.
 
@@ -167,7 +169,14 @@ def _load_raw_routes(
 
 	rows = db.fetchall(
 		"""
-		SELECT c.uuid, c.name, c.layout_id, c.angle, cs.difficulty_average
+		SELECT
+			c.uuid,
+			c.name,
+			c.layout_id,
+			c.angle,
+			cs.difficulty_average,
+			cs.quality_average,
+			cs.ascensionist_count
 		FROM climbs c
 		LEFT JOIN climb_stats cs ON c.uuid = cs.climb_uuid
 		WHERE c.frames IS NOT NULL AND c.frames != ''
@@ -175,10 +184,14 @@ def _load_raw_routes(
 	)
 
 	raw_routes: list[tuple[dict[str, Any], list[RawHoldToken], float]] = []
-	for uuid, name, layout_id, angle, difficulty_average in rows:
+	for uuid, name, layout_id, angle, difficulty_average, quality_average, ascensionist_count in rows:
 		# Require conditioning features to be present.
 		# Do not coerce missing angle/grade to defaults.
 		if angle is None or difficulty_average is None:
+			continue
+		if quality_average is None or float(quality_average) < float(min_quality_average):
+			continue
+		if ascensionist_count is None or int(ascensionist_count) < int(min_ascensionist_count):
 			continue
 
 		holds = db.get_hold_positions_for_climb(
@@ -219,11 +232,14 @@ def build_training_samples_from_db(
 	metadata_product_id: int = 1,
 	max_routes: int | None = None,
 	min_holds: int = 1,
+	min_quality_average: float = 2.8,
+	min_ascensionist_count: int = 50,
 ) -> tuple[list[RouteSample], RouteVocabBundle]:
 	"""Prepare train-ready route samples and vocabularies from SQLite.
 
 	- Handles missing metadata (with UNKNOWN defaults) unless full metadata is required.
 	- Converts orientation degrees to explicit sin/cos inputs.
+	- Filters low-signal climbs by `quality_average` and `ascensionist_count`.
 	- Returns token tensors ready for `collate_hold_token_batch`.
 	"""
 
@@ -235,6 +251,8 @@ def build_training_samples_from_db(
 			metadata_product_id=metadata_product_id,
 			max_routes=max_routes,
 			min_holds=min_holds,
+			min_quality_average=min_quality_average,
+			min_ascensionist_count=min_ascensionist_count,
 		)
 
 	if not raw_routes:
