@@ -176,6 +176,11 @@ def _load_raw_routes(
 
 	raw_routes: list[tuple[dict[str, Any], list[RawHoldToken], float]] = []
 	for uuid, name, layout_id, angle, difficulty_average in rows:
+		# Require conditioning features to be present.
+		# Do not coerce missing angle/grade to defaults.
+		if angle is None or difficulty_average is None:
+			continue
+
 		holds = db.get_hold_positions_for_climb(
 			str(uuid),
 			include_metadata=True,
@@ -195,8 +200,8 @@ def _load_raw_routes(
 			"uuid": str(uuid),
 			"name": str(name),
 			"layout_id": int(layout_id),
-			"angle": float(angle) if angle is not None else 0.0,
-			"grade": float(difficulty_average) if difficulty_average is not None else None,
+			"angle": float(angle),
+			"grade": float(difficulty_average),
 		}
 		raw_routes.append((climb_info, tokens, coverage))
 

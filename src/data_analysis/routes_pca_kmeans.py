@@ -48,7 +48,6 @@ def _load_samples_and_vocabs(
 	cache_path: str,
 	metadata_source: str,
 	metadata_product_id: int,
-	max_routes: int,
 ) -> tuple[list[RouteSample], Any]:
 	cache_file = Path(cache_path)
 	if cache_file.exists():
@@ -58,7 +57,7 @@ def _load_samples_and_vocabs(
 			vocabs = payload.get("vocabs")
 			if samples and vocabs is not None:
 				print(f"Loaded preprocessed routes cache: {cache_file}")
-				return samples[:max_routes], vocabs
+				return samples, vocabs
 		except Exception as exc:
 			print(f"Warning: failed to load cache at {cache_file}; rebuilding from DB. Error: {exc}")
 
@@ -67,9 +66,44 @@ def _load_samples_and_vocabs(
 		db_path,
 		metadata_source=metadata_source,
 		metadata_product_id=metadata_product_id,
-		max_routes=max_routes,
+		max_routes=None,
 	)
 	return samples, vocabs
+
+
+def _angle_grade_map_path(cache_path: str) -> Path:
+	base = Path(cache_path)
+	return base.with_name(f"{base.stem}_angle_grade_map.pt")
+
+
+def _load_or_build_angle_grade_map(samples: list[RouteSample], *, cache_path: str) -> dict[str, Any]:
+	map_path = _angle_grade_map_path(cache_path)
+	if map_path.exists():
+		try:
+			payload = torch.load(map_path, map_location="cpu", weights_only=False)
+			if (
+				int(payload.get("count", -1)) == len(samples)
+				and payload.get("first_uuid") == (samples[0].uuid if samples else None)
+				and payload.get("last_uuid") == (samples[-1].uuid if samples else None)
+			):
+				return payload
+		except Exception:
+			pass
+
+	angles = np.array([float(s.angle) for s in samples], dtype=np.float32)
+	grades = np.array(
+		[float(s.grade) if s.grade is not None else np.nan for s in samples],
+		dtype=np.float32,
+	)
+	payload = {
+		"count": len(samples),
+		"first_uuid": samples[0].uuid if samples else None,
+		"last_uuid": samples[-1].uuid if samples else None,
+		"angles": angles,
+		"grades": grades,
+	}
+	torch.save(payload, map_path)
+	return payload
 
 
 
@@ -132,6 +166,41 @@ def _filter_samples_by_decoder_len(samples: list[RouteSample], *, max_seq_len: i
 	max_target_len = max_seq_len - 1  # account for BOS
 	kept = [s for s in samples if _sample_token_len(s) <= max_target_len]
 	return kept, len(samples) - len(kept)
+
+
+def _filter_samples_by_grade_angle(
+	samples: list[RouteSample],
+	*,
+	angle_grade_map: dict[str, Any],
+	min_grade: float | None,
+	max_grade: float | None,
+	min_angle: float | None,
+	max_angle: float | None,
+	include_ungraded: bool,
+) -> tuple[np.ndarray, int]:
+	angles = np.asarray(angle_grade_map["angles"], dtype=np.float32)
+	grades = np.asarray(angle_grade_map["grades"], dtype=np.float32)
+
+	mask = np.ones(len(samples), dtype=bool)
+	if min_angle is not None:
+		mask &= angles >= float(min_angle)
+	if max_angle is not None:
+		mask &= angles <= float(max_angle)
+
+	if min_grade is not None or max_grade is not None:
+		non_missing = ~np.isnan(grades)
+		in_range = np.ones(len(samples), dtype=bool)
+		if min_grade is not None:
+			in_range &= grades >= float(min_grade)
+		if max_grade is not None:
+			in_range &= grades <= float(max_grade)
+		if include_ungraded:
+			mask &= (~non_missing) | (non_missing & in_range)
+		else:
+			mask &= non_missing & in_range
+
+	kept_indices = np.flatnonzero(mask)
+	return kept_indices, int(len(samples) - len(kept_indices))
 
 
 
@@ -259,6 +328,11 @@ def run_analysis(
 	n_clusters: int,
 	batch_size: int,
 	latent_dim_override: int | None,
+	min_grade: float | None,
+	max_grade: float | None,
+	min_angle: float | None,
+	max_angle: float | None,
+	include_ungraded: bool,
 	seed: int,
 	output_path: str,
 	show_plot: bool,
@@ -269,10 +343,29 @@ def run_analysis(
 		cache_path=cache_path,
 		metadata_source=metadata_source,
 		metadata_product_id=metadata_product_id,
-		max_routes=max_routes,
 	)
 	if not samples:
 		raise ValueError("No route samples available for analysis.")
+
+	angle_grade_map = _load_or_build_angle_grade_map(samples, cache_path=cache_path)
+
+	kept_indices, filtered_by_grade_angle = _filter_samples_by_grade_angle(
+		samples,
+		angle_grade_map=angle_grade_map,
+		min_grade=min_grade,
+		max_grade=max_grade,
+		min_angle=min_angle,
+		max_angle=max_angle,
+		include_ungraded=include_ungraded,
+	)
+	if filtered_by_grade_angle:
+		print(f"Filtered out {filtered_by_grade_angle} routes by grade/angle constraints.")
+	if kept_indices.size == 0:
+		raise ValueError("All samples were filtered out by grade/angle constraints.")
+
+	if max_routes is not None:
+		kept_indices = kept_indices[:max_routes]
+	samples = [samples[int(i)] for i in kept_indices]
 
 	device = _select_device()
 	print(f"Using device: {device}")
@@ -370,6 +463,15 @@ def main() -> None:
 	parser.add_argument("--n-clusters", type=int, default=6)
 	parser.add_argument("--batch-size", type=int, default=64)
 	parser.add_argument("--latent-dim", type=int, default=None)
+	parser.add_argument("--min-grade", type=float, default=None)
+	parser.add_argument("--max-grade", type=float, default=None)
+	parser.add_argument("--min-angle", type=float, default=None)
+	parser.add_argument("--max-angle", type=float, default=None)
+	parser.add_argument(
+		"--include-ungraded",
+		action="store_true",
+		help="Keep ungraded routes when grade filters are set.",
+	)
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument(
 		"--output-path",
@@ -394,6 +496,11 @@ def main() -> None:
 		n_clusters=args.n_clusters,
 		batch_size=args.batch_size,
 		latent_dim_override=args.latent_dim,
+		min_grade=args.min_grade,
+		max_grade=args.max_grade,
+		min_angle=args.min_angle,
+		max_angle=args.max_angle,
+		include_ungraded=args.include_ungraded,
 		seed=args.seed,
 		output_path=args.output_path,
 		show_plot=args.show,

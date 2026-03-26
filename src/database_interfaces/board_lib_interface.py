@@ -238,7 +238,6 @@ class BoardLibInterface:
 			""",
 			[layout_id, *set_ids, product_id, climb_left, climb_right, climb_bottom, climb_top, len(set_ids)],
 		).fetchone()
-		print(row)
 		if row is None:
 			raise ValueError(
 				"No product_size_id for the provided product_id can fit this climb's edge bounds while providing all required set images."

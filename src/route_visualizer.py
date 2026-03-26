@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -87,7 +88,14 @@ def visualize_route(climb_name: str) -> None:
 
 	plt.tight_layout()
 	plt.show()
- 
- 
+
+
+def main() -> None:
+	parser = argparse.ArgumentParser(description="Visualize a Kilter climb route on board image layers.")
+	parser.add_argument("--climb-name", type=str, default="Alberts dream", help="Exact climb name to visualize.")
+	args = parser.parse_args()
+	visualize_route(args.climb_name)
+
+
 if __name__ == "__main__":
-	visualize_route("Alberts dream")
+	main()
