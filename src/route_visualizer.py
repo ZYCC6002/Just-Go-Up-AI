@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -42,26 +41,23 @@ def _composite_images(image_paths: list[Path]) -> np.ndarray:
 	return np.array(base)
 
 
-def visualize_route(climb_name: str, product_size_id: Optional[int] = None) -> None:
+def visualize_route(climb_name: str) -> None:
 	"""Display a climb on the correct board image with holds circled by role color."""
 
 	db_path = _default_db_path()
 	images_root = _default_images_root()
 
 	with BoardLibInterface(db_path) as db:
-		climb_row = db.get_climb_row_by_name(climb_name)
-		if climb_row is None:
+		climb = db.get_climb_by_name(climb_name)
+		if climb is None:
 			raise ValueError(f"No climb found with name: {climb_name}")
-
-		climb_uuid, resolved_name, layout_id, _ = climb_row
-		holds = db.get_hold_positions_for_climb(climb_uuid)
+		holds = db.get_hold_positions_for_climb(climb)
 		if not holds:
-			raise ValueError(f"No hold data found for climb: {resolved_name}")
+			raise ValueError(f"No hold data found for climb: {climb.name}")
 
 		image_paths, board_edges = db.resolve_image_paths_for_climb(
-			climb_uuid,
+			climb,
 			images_root,
-			product_size_id=product_size_id,
 		)
 		board_left, board_right, board_bottom, board_top = board_edges
 
@@ -78,7 +74,7 @@ def visualize_route(climb_name: str, product_size_id: Optional[int] = None) -> N
 
 	fig, ax = plt.subplots(figsize=(10, 8))
 	ax.imshow(img)
-	ax.set_title(f"{resolved_name}")
+	ax.set_title(f"{climb.name}")
 	ax.axis("off")
 
 	for hold in holds:
@@ -94,4 +90,4 @@ def visualize_route(climb_name: str, product_size_id: Optional[int] = None) -> N
  
  
 if __name__ == "__main__":
-	visualize_route("just a day")
+	visualize_route("Alberts dream")

@@ -35,6 +35,26 @@ class ExternalHoldMetadata:
 	source: str
 
 
+@dataclass
+class Climb:
+	uuid: str
+	layout_id: int
+	name: str
+	frames: str
+	hsm: int
+	edge_left: int
+	edge_right: int
+	edge_bottom: int
+	edge_top: int
+	angle: float
+	product_id: Optional[int] = None
+	holds: Optional[list[HoldPlacement]] = None
+
+	@property
+	def edges(self) -> tuple[int, int, int, int]:
+		return (self.edge_left, self.edge_right, self.edge_bottom, self.edge_top)
+
+
 class BoardLibInterface:
 	"""Thin wrapper around BoardLib SQLite DBs.
 
@@ -80,15 +100,80 @@ class BoardLibInterface:
 	def get_table_schema(self, table: str) -> list[tuple[Any, ...]]:
 		return self.fetchall(f"PRAGMA table_info({table});")
 
-	def get_climb_by_uuid(self, climb_uuid: str) -> Optional[dict[str, Any]]:
+	def _infer_product_id_from_frames(self, frames: str) -> Optional[int]:
+		pairs = self.parse_frames(frames)
+		placement_ids = sorted({pid for pid, _rid in pairs if pid})
+		if not placement_ids:
+			return None
+
+		placeholders = ",".join(["?"] * len(placement_ids))
+		rows = self.fetchall(
+			f"""
+			SELECT DISTINCT h.product_id
+			FROM placements p
+			JOIN holes h ON h.id = p.hole_id
+			WHERE p.id IN ({placeholders})
+			""",
+			placement_ids,
+		)
+		product_ids = [int(r[0]) for r in rows if r and r[0] is not None]
+		return product_ids[0] if product_ids else None
+
+	def get_climb(self, climb_uuid: str) -> Optional[Climb]:
 		row = self.execute(
 			"SELECT uuid, layout_id, name, frames, hsm, edge_left, edge_right, edge_bottom, edge_top, angle FROM climbs WHERE uuid = ?",
 			[climb_uuid],
 		).fetchone()
 		if row is None:
 			return None
-		keys = ["uuid", "layout_id", "name", "frames", "hsm", "edge_left", "edge_right", "edge_bottom", "edge_top", "angle"]
-		return dict(zip(keys, row))
+
+		frames = str(row[3] or "")
+		product_id = self._infer_product_id_from_frames(frames)
+		return Climb(
+			uuid=str(row[0]),
+			layout_id=int(row[1]),
+			name=str(row[2]),
+			frames=frames,
+			hsm=int(row[4] or 0),
+			edge_left=int(row[5] or 0),
+			edge_right=int(row[6] or 0),
+			edge_bottom=int(row[7] or 0),
+			edge_top=int(row[8] or 0),
+			angle=float(row[9] or 0.0),
+			product_id=product_id,
+		)
+
+	def get_climb_by_name(self, climb_name: str) -> Optional[Climb]:
+		row = self.execute(
+			"""
+			SELECT uuid
+			FROM climbs
+			WHERE name = ?
+			ORDER BY created_at DESC
+			LIMIT 1
+			""",
+			[climb_name],
+		).fetchone()
+		if row is None:
+			return None
+		return self.get_climb(str(row[0]))
+
+	def get_climb_by_uuid(self, climb_uuid: str) -> Optional[dict[str, Any]]:
+		climb = self.get_climb(climb_uuid)
+		if climb is None:
+			return None
+		return {
+			"uuid": climb.uuid,
+			"layout_id": climb.layout_id,
+			"name": climb.name,
+			"frames": climb.frames,
+			"hsm": climb.hsm,
+			"edge_left": climb.edge_left,
+			"edge_right": climb.edge_right,
+			"edge_bottom": climb.edge_bottom,
+			"edge_top": climb.edge_top,
+			"angle": climb.angle,
+		}
 
 	def get_climb_row_by_name(self, climb_name: str) -> tuple[Any, ...] | None:
 		return self.execute(
@@ -125,53 +210,11 @@ class BoardLibInterface:
 		layout_id: int,
 		set_ids: list[int],
 		climb_edges: tuple[int, int, int, int],
-		product_size_id: Optional[int] = None,
+		product_id: int,
 	) -> tuple[int, tuple[int, int, int, int]]:
-		"""Choose a board size that fits the climb and has images for all required sets."""
+		"""Choose the smallest board size (for a product) that fits climb edges and required sets."""
 		climb_left, climb_right, climb_bottom, climb_top = climb_edges
 		set_placeholders = ",".join(["?"] * len(set_ids))
-
-		if product_size_id is not None:
-			row = self.execute(
-				f"""
-				SELECT ps.id, ps.edge_left, ps.edge_right, ps.edge_bottom, ps.edge_top,
-				       COUNT(DISTINCT psls.set_id) AS matched_sets
-				FROM product_sizes ps
-				LEFT JOIN product_sizes_layouts_sets psls
-					ON psls.product_size_id = ps.id
-					AND psls.layout_id = ?
-					AND psls.set_id IN ({set_placeholders})
-				WHERE ps.id = ?
-				GROUP BY ps.id, ps.edge_left, ps.edge_right, ps.edge_bottom, ps.edge_top
-				""",
-				[layout_id, *set_ids, product_size_id],
-			).fetchone()
-			if row is None:
-				raise ValueError(f"Unknown product_size_id={product_size_id}.")
-
-			selected_id = int(row[0])
-			board_edges = (
-				int(row[1]),
-				int(row[2]),
-				int(row[3]),
-				int(row[4]),
-			)
-			matched_sets = int(row[5])
-			fits_climb = (
-				board_edges[0] <= climb_left
-				and board_edges[1] >= climb_right
-				and board_edges[2] <= climb_bottom
-				and board_edges[3] >= climb_top
-			)
-			if matched_sets != len(set_ids):
-				raise ValueError(
-					f"product_size_id={product_size_id} does not have all required images for layout_id={layout_id}."
-				)
-			if not fits_climb:
-				raise ValueError(
-					f"product_size_id={product_size_id} does not fit climb bounds {climb_edges}."
-				)
-			return selected_id, board_edges
 
 		row = self.execute(
 			f"""
@@ -183,20 +226,22 @@ class BoardLibInterface:
 				ON psls.product_size_id = ps.id
 				AND psls.layout_id = ?
 				AND psls.set_id IN ({set_placeholders})
-			WHERE ps.edge_left <= ?
-			  AND ps.edge_right >= ?
-			  AND ps.edge_bottom <= ?
-			  AND ps.edge_top >= ?
+			WHERE ps.product_id = ?
+			  AND ps.edge_left < ?
+			  AND ps.edge_right > ?
+			  AND ps.edge_bottom < ?
+			  AND ps.edge_top > ?
 			GROUP BY ps.id, ps.edge_left, ps.edge_right, ps.edge_bottom, ps.edge_top
 			HAVING matched_sets = ?
 			ORDER BY board_area ASC, ps.id ASC
 			LIMIT 1
 			""",
-			[layout_id, *set_ids, climb_left, climb_right, climb_bottom, climb_top, len(set_ids)],
+			[layout_id, *set_ids, product_id, climb_left, climb_right, climb_bottom, climb_top, len(set_ids)],
 		).fetchone()
+		print(row)
 		if row is None:
 			raise ValueError(
-				"No product_size_id can fit this climb's edge bounds while providing all required set images."
+				"No product_size_id for the provided product_id can fit this climb's edge bounds while providing all required set images."
 			)
 
 		selected_id = int(row[0])
@@ -210,31 +255,28 @@ class BoardLibInterface:
 
 	def resolve_image_paths_for_climb(
 		self,
-		climb_uuid: str,
+		climb: Climb,
 		images_root: Path,
-		product_size_id: Optional[int] = None,
 	) -> tuple[list[Path], tuple[int, int, int, int]]:
 		"""Return compositable image layers and board bounds for a climb."""
-		climb = self.get_climb_by_uuid(climb_uuid)
-		if not climb or not climb.get("frames"):
+		if not climb.frames:
 			raise ValueError("Climb has no frame data.")
 
-		layout_id = int(climb["layout_id"])
-		set_ids = self.decode_hsm_set_ids(layout_id, int(climb.get("hsm") or 0))
+		layout_id = int(climb.layout_id)
+		set_ids = self.decode_hsm_set_ids(layout_id, int(climb.hsm or 0))
 		if not set_ids:
 			raise ValueError(f"Could not decode hold sets from hsm for layout_id={layout_id}.")
 
-		climb_edges = (
-			int(climb.get("edge_left") or 0),
-			int(climb.get("edge_right") or 0),
-			int(climb.get("edge_bottom") or 0),
-			int(climb.get("edge_top") or 0),
-		)
+		climb_edges = climb.edges
+
+		if climb.product_id is None:
+			raise ValueError("Climb object is missing product_id.")
+		product_id = int(climb.product_id)
 		selected_product_size_id, board_edges = self.select_product_size(
 			layout_id,
 			set_ids,
 			climb_edges,
-			product_size_id=product_size_id,
+			product_id=product_id,
 		)
 
 		set_placeholders = ",".join(["?"] * len(set_ids))
@@ -339,17 +381,17 @@ class BoardLibInterface:
 
 	def get_hold_positions_for_climb(
 		self,
-		climb_uuid: str,
+		climb_uuid: str | Climb,
 		*,
 		include_metadata: bool = True,
 		metadata_source: str = "kilter_board_csv",
 		metadata_product_id: int = 1,
 	) -> list[HoldPlacement]:
-		climb = self.get_climb_by_uuid(climb_uuid)
-		if climb is None:
+		climb_obj = climb_uuid if isinstance(climb_uuid, Climb) else self.get_climb(climb_uuid)
+		if climb_obj is None:
 			return []
 
-		frames = climb.get("frames") or ""
+		frames = climb_obj.frames or ""
 		pairs = self.parse_frames(frames)
 		if not pairs:
 			return []
@@ -402,6 +444,9 @@ class BoardLibInterface:
 					metadata=metadata,
 				)
 			)
+
+		if isinstance(climb_uuid, Climb):
+			climb_uuid.holds = holds
 		return holds
 
 	def iter_climb_hold_counts(self, climb_uuids: Iterable[str]) -> dict[str, int]:
@@ -433,4 +478,4 @@ class BoardLibInterface:
 		)
 
 
-__all__ = ["BoardLibInterface", "HoldPlacement", "ExternalHoldMetadata"]
+__all__ = ["BoardLibInterface", "Climb", "HoldPlacement", "ExternalHoldMetadata"]
