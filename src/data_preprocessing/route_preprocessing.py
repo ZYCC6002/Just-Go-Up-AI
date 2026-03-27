@@ -158,6 +158,7 @@ def _load_raw_routes(
 	min_holds: int,
 	min_quality_average: float,
 	min_ascensionist_count: int,
+	public_only: bool,
 ) -> list[tuple[dict[str, Any], list[RawHoldToken], float]]:
 	"""Load climbs and convert each hold to raw token records.
 
@@ -174,6 +175,7 @@ def _load_raw_routes(
 			c.name,
 			c.layout_id,
 			c.angle,
+			c.is_listed,
 			cs.difficulty_average,
 			cs.quality_average,
 			cs.ascensionist_count
@@ -184,9 +186,11 @@ def _load_raw_routes(
 	)
 
 	raw_routes: list[tuple[dict[str, Any], list[RawHoldToken], float]] = []
-	for uuid, name, layout_id, angle, difficulty_average, quality_average, ascensionist_count in rows:
+	for uuid, name, layout_id, angle, is_listed, difficulty_average, quality_average, ascensionist_count in rows:
 		# Require conditioning features to be present.
 		# Do not coerce missing angle/grade to defaults.
+		if public_only and int(is_listed or 0) != 1:
+			continue
 		if angle is None or difficulty_average is None:
 			continue
 		if quality_average is None or float(quality_average) < float(min_quality_average):
@@ -234,6 +238,7 @@ def build_training_samples_from_db(
 	min_holds: int = 1,
 	min_quality_average: float = 2.8,
 	min_ascensionist_count: int = 50,
+ 	public_only: bool = True,
 ) -> tuple[list[RouteSample], RouteVocabBundle]:
 	"""Prepare train-ready route samples and vocabularies from SQLite.
 
@@ -253,6 +258,7 @@ def build_training_samples_from_db(
 			min_holds=min_holds,
 			min_quality_average=min_quality_average,
 			min_ascensionist_count=min_ascensionist_count,
+			public_only=public_only,
 		)
 
 	if not raw_routes:
