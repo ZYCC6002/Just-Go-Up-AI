@@ -264,8 +264,10 @@ class RouteTransformerDecoder(nn.Module):
 		tokens = tokens + self.sequence_position_embedding(positions)
 
 		# Force a learned BOS anchor at timestep 0.
-		bos = self.bos_embedding.unsqueeze(0).expand(batch_size, -1)
-		tokens[:, 0, :] = bos + self.sequence_position_embedding.weight[0].unsqueeze(0)
+		bos_token = (self.bos_embedding + self.sequence_position_embedding.weight[0])
+		bos_token = bos_token.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1)
+		tokens = torch.cat([bos_token, tokens[:, 1:, :]], dim=1)
+  
 		return tokens
 
 	def forward(
