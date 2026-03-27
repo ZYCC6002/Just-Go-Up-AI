@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -45,6 +46,32 @@ def _compute_kl_beta_for_epoch(*, epoch: int, target_kl_beta: float, kl_warmup_e
 		return float(target_kl_beta)
 	ratio = min(max(epoch, 0), kl_warmup_epochs) / float(kl_warmup_epochs)
 	return float(target_kl_beta) * ratio
+
+
+def _save_loss_curve_plot(
+	*,
+	epochs: list[int],
+	train_total_losses: list[float],
+	val_total_losses: list[float],
+	output_path: Path,
+) -> None:
+	if not epochs:
+		return
+
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	fig = plt.figure(figsize=(9, 5))
+	ax = fig.add_subplot(111)
+	ax.plot(epochs, train_total_losses, label="Train Total Loss", linewidth=2)
+	ax.plot(epochs, val_total_losses, label="Val Total Loss", linewidth=2)
+	ax.set_title("Training Loss per Epoch")
+	ax.set_xlabel("Epoch")
+	ax.set_ylabel("Loss")
+	ax.grid(alpha=0.3)
+	ax.legend(loc="best")
+	fig.tight_layout()
+	fig.savefig(output_path, dpi=180)
+	plt.close(fig)
+	print(f"Saved loss curve plot: {output_path}")
 
 
 
@@ -347,6 +374,12 @@ def main() -> None:
 	parser.add_argument("--grad-clip-norm", type=float, default=1.0)
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument("--checkpoint-path", type=str, default=str(PROJECT_ROOT / "artifacts/route_cvae.pt"))
+	parser.add_argument(
+		"--loss-plot-path",
+		type=str,
+		default=str(PROJECT_ROOT / "artifacts/route_cvae_loss_curve.png"),
+		help="Path to save training/validation total loss curve.",
+	)
 	parser.add_argument("--resume", action="store_true")
 	parser.add_argument("--resume-path", type=str, default=None)
 	args = parser.parse_args()
@@ -419,6 +452,10 @@ def main() -> None:
 			f"(next_epoch={start_epoch}, best_val={best_val:.4f})"
 		)
 
+	epoch_history: list[int] = []
+	train_total_history: list[float] = []
+	val_total_history: list[float] = []
+
 	for epoch in range(start_epoch, args.epochs + 1):
 		epoch_kl_beta = _compute_kl_beta_for_epoch(
 			epoch=epoch,
@@ -466,6 +503,10 @@ def main() -> None:
 			f"cat={val_metrics.categorical_loss:.4f} num={val_metrics.numeric_loss:.4f} kl={val_metrics.kl_loss:.4f}"
 		)
 
+		epoch_history.append(epoch)
+		train_total_history.append(train_metrics.total_loss)
+		val_total_history.append(val_metrics.total_loss)
+
 		if val_metrics.total_loss < best_val:
 			best_val = val_metrics.total_loss
 			torch.save(
@@ -479,6 +520,13 @@ def main() -> None:
 				checkpoint_path,
 			)
 			print(f"Saved checkpoint: {checkpoint_path}")
+
+	_save_loss_curve_plot(
+		epochs=epoch_history,
+		train_total_losses=train_total_history,
+		val_total_losses=val_total_history,
+		output_path=Path(args.loss_plot_path),
+	)
 	
 	best_ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
 	model.load_state_dict(best_ckpt["model_state_dict"])
