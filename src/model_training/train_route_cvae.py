@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
+import random
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -39,9 +40,12 @@ class EpochMetrics:
 
 
 
-def _iter_minibatches(samples: list[Any], batch_size: int):
-	for i in range(0, len(samples), batch_size):
-		yield samples[i:i + batch_size]
+def _iter_minibatches(samples: list[Any], batch_size: int, shuffle=True):
+	indices = list(range(len(samples)))
+	if shuffle:
+		random.shuffle(indices)
+	for i in range(0, len(indices), batch_size):
+		yield [samples[j] for j in indices[i:i + batch_size]]
 
 
 def _sample_token_length(sample: Any) -> int:
