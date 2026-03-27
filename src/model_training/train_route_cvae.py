@@ -485,7 +485,7 @@ def main() -> None:
 
 	with torch.no_grad():
 		test_metrics = _run_epoch(
-			best_ckpt,
+			model,
 			test_samples,
 			optimizer=None,
 			device=device,
