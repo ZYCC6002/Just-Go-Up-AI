@@ -39,6 +39,14 @@ class EpochMetrics:
 	num_batches: int
 
 
+def _compute_kl_beta_for_epoch(*, epoch: int, target_kl_beta: float, kl_warmup_epochs: int) -> float:
+	"""Linear KL annealing from 0 -> target_kl_beta over warmup epochs."""
+	if kl_warmup_epochs <= 0:
+		return float(target_kl_beta)
+	ratio = min(max(epoch, 0), kl_warmup_epochs) / float(kl_warmup_epochs)
+	return float(target_kl_beta) * ratio
+
+
 
 def _iter_minibatches(samples: list[Any], batch_size: int, shuffle=True):
 	indices = list(range(len(samples)))
@@ -329,13 +337,23 @@ def main() -> None:
 	parser.add_argument("--weight-decay", type=float, default=1e-4)
 	parser.add_argument("--latent-dim", type=int, default=32)
 	parser.add_argument("--numeric-weight", type=float, default=0.25)
-	parser.add_argument("--kl-beta", type=float, default=0.01)
+	parser.add_argument("--kl-beta", type=float, default=1.0)
+	parser.add_argument(
+		"--kl-warmup-epochs",
+		type=int,
+		default=None,
+		help="Number of epochs to linearly warm KL from 0 to --kl-beta. Defaults to 25% of total epochs.",
+	)
 	parser.add_argument("--grad-clip-norm", type=float, default=1.0)
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument("--checkpoint-path", type=str, default=str(PROJECT_ROOT / "artifacts/route_cvae.pt"))
 	parser.add_argument("--resume", action="store_true")
 	parser.add_argument("--resume-path", type=str, default=None)
 	args = parser.parse_args()
+	if args.kl_warmup_epochs is None:
+		args.kl_warmup_epochs = max(1, int(math.ceil(0.25 * args.epochs)))
+	if args.kl_warmup_epochs < 0:
+		raise ValueError("--kl-warmup-epochs must be >= 0")
 
 	torch.manual_seed(args.seed)
 	device = _select_device()
@@ -402,6 +420,11 @@ def main() -> None:
 		)
 
 	for epoch in range(start_epoch, args.epochs + 1):
+		epoch_kl_beta = _compute_kl_beta_for_epoch(
+			epoch=epoch,
+			target_kl_beta=args.kl_beta,
+			kl_warmup_epochs=args.kl_warmup_epochs,
+		)
 		train_metrics = _run_epoch(
 			model,
 			train_samples,
@@ -409,7 +432,7 @@ def main() -> None:
 			device=device,
 			eos_ids=eos_ids,
 			batch_size=args.batch_size,
-			kl_beta=args.kl_beta,
+			kl_beta=epoch_kl_beta,
 			numeric_weight=args.numeric_weight,
 			grad_clip_norm=args.grad_clip_norm,
 			sample_latent=True,
@@ -423,19 +446,20 @@ def main() -> None:
 				device=device,
 				eos_ids=eos_ids,
 				batch_size=args.batch_size,
-				kl_beta=args.kl_beta,
+				kl_beta=epoch_kl_beta,
 				numeric_weight=args.numeric_weight,
 				grad_clip_norm=args.grad_clip_norm,
 				sample_latent=False,
 			)
 
 		train_recon = train_metrics.categorical_loss + args.numeric_weight * train_metrics.numeric_loss
-		train_weighted_kl = args.kl_beta * train_metrics.kl_loss
+		train_weighted_kl = epoch_kl_beta * train_metrics.kl_loss
 		val_recon = val_metrics.categorical_loss + args.numeric_weight * val_metrics.numeric_loss
-		val_weighted_kl = args.kl_beta * val_metrics.kl_loss
+		val_weighted_kl = epoch_kl_beta * val_metrics.kl_loss
 
 		print(
 			f"Epoch {epoch:03d} | "
+			f"kl_beta={epoch_kl_beta:.6f} "
 			f"train total={train_metrics.total_loss:.4f} recon={train_recon:.4f} w_kl={train_weighted_kl:.4f} "
 			f"cat={train_metrics.categorical_loss:.4f} num={train_metrics.numeric_loss:.4f} kl={train_metrics.kl_loss:.4f} | "
 			f"val total={val_metrics.total_loss:.4f} recon={val_recon:.4f} w_kl={val_weighted_kl:.4f} "

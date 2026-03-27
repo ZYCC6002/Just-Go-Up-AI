@@ -45,8 +45,8 @@ class RouteVAEEncoderConfig:
 	y_max: float = 160.0
 	angle_min: float = 0.0
 	angle_max: float = 70.0
-	grade_min: float = 0.0
-	grade_max: float = 70.0
+	grade_min: float = 10.0
+	grade_max: float = 33.0
 
 
 class ScalarSinusoidalEmbedding(nn.Module):
