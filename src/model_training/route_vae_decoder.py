@@ -308,18 +308,25 @@ class RouteTransformerDecoder(nn.Module):
 		)
 		decoded = self.final_norm(decoded)
 
+		x_pred = torch.sigmoid(self.x_head(decoded).squeeze(-1))
+		y_pred = torch.sigmoid(self.y_head(decoded).squeeze(-1))
+		depth_pred = torch.sigmoid(self.depth_head(decoded).squeeze(-1))
+		orientation_sin_pred = torch.sigmoid(self.orientation_sin_head(decoded).squeeze(-1))
+		orientation_cos_pred = torch.sigmoid(self.orientation_cos_head(decoded).squeeze(-1))
+		size_pred = torch.sigmoid(self.size_head(decoded).squeeze(-1))
+
 		return {
 			"hidden_states": decoded,
 			"type_logits": self.type_head(decoded),
 			"function_logits": self.function_head(decoded),
 			"role_logits": self.role_head(decoded),
 			"hole_logits": self.hole_head(decoded),
-			"x_pred": self.x_head(decoded).squeeze(-1),
-			"y_pred": self.y_head(decoded).squeeze(-1),
-			"depth_pred": self.depth_head(decoded).squeeze(-1),
-			"orientation_sin_pred": self.orientation_sin_head(decoded).squeeze(-1),
-			"orientation_cos_pred": self.orientation_cos_head(decoded).squeeze(-1),
-			"size_pred": self.size_head(decoded).squeeze(-1),
+			"x_pred": x_pred,
+			"y_pred": y_pred,
+			"depth_pred": depth_pred,
+			"orientation_sin_pred": orientation_sin_pred,
+			"orientation_cos_pred": orientation_cos_pred,
+			"size_pred": size_pred,
 		}
 
 

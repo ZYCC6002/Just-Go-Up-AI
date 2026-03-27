@@ -171,19 +171,21 @@ def prepare_cvae_training_batch(
 
 	batch_size, seq_len = target_batch["padding_mask"].shape
 
-	def _shift_numeric_target(key: str) -> torch.Tensor:
+	def _shift_numeric_target(key: str, vmin: float = 0.0, vmax: float = 1.0) -> torch.Tensor:
 		src = target_batch[key].to(torch.float32)
+		src = (src - vmin) / max(vmax - vmin, 1e-6)
+		src = src.clamp(0.0, 1.0)
 		tgt = torch.zeros((batch_size, seq_len + 1), dtype=torch.float32, device=src.device)
 		tgt[:, :seq_len] = src
 		return tgt
 
 	numeric_targets = {
-		"x_target": _shift_numeric_target("x"),
-		"y_target": _shift_numeric_target("y"),
-		"depth_target": _shift_numeric_target("depth"),
-		"orientation_sin_target": _shift_numeric_target("orientation_sin"),
-		"orientation_cos_target": _shift_numeric_target("orientation_cos"),
-		"size_target": _shift_numeric_target("size"),
+		"x_target": _shift_numeric_target("x", 0.0, 140.0),
+		"y_target": _shift_numeric_target("y", 0.0, 160.0),
+		"depth_target": _shift_numeric_target("depth", 0.0, 3.0),
+		"orientation_sin_target": _shift_numeric_target("orientation_sin", -1.0, 1.0),
+		"orientation_cos_target": _shift_numeric_target("orientation_cos", -1.0, 1.0),
+		"size_target": _shift_numeric_target("size", 2.0, 5.0),
 	}
 
 	# Numeric reconstruction should be evaluated on real token targets only:
