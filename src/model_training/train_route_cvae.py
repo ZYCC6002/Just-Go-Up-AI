@@ -479,10 +479,13 @@ def main() -> None:
 				checkpoint_path,
 			)
 			print(f"Saved checkpoint: {checkpoint_path}")
+	
+	best_ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+	model.load_state_dict(best_ckpt["model_state_dict"])
 
 	with torch.no_grad():
 		test_metrics = _run_epoch(
-			model,
+			best_ckpt,
 			test_samples,
 			optimizer=None,
 			device=device,
