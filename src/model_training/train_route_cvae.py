@@ -53,21 +53,48 @@ def _save_loss_curve_plot(
 	epochs: list[int],
 	train_total_losses: list[float],
 	val_total_losses: list[float],
+	train_recon_losses: list[float],
+	val_recon_losses: list[float],
+	train_kl_losses: list[float],
+	val_kl_losses: list[float],
 	output_path: Path,
 ) -> None:
 	if not epochs:
 		return
 
 	output_path.parent.mkdir(parents=True, exist_ok=True)
-	fig = plt.figure(figsize=(9, 5))
-	ax = fig.add_subplot(111)
-	ax.plot(epochs, train_total_losses, label="Train Total Loss", linewidth=2)
-	ax.plot(epochs, val_total_losses, label="Val Total Loss", linewidth=2)
-	ax.set_title("Training Loss per Epoch")
-	ax.set_xlabel("Epoch")
-	ax.set_ylabel("Loss")
-	ax.grid(alpha=0.3)
-	ax.legend(loc="best")
+	fig = plt.figure(figsize=(12, 6))
+	
+	# Total loss subplot
+	ax1 = fig.add_subplot(131)
+	ax1.plot(epochs, train_total_losses, label="Train Total Loss", linewidth=2)
+	ax1.plot(epochs, val_total_losses, label="Val Total Loss", linewidth=2)
+	ax1.set_title("Total Loss")
+	ax1.set_xlabel("Epoch")
+	ax1.set_ylabel("Loss")
+	ax1.grid(alpha=0.3)
+	ax1.legend(loc="best")
+	
+	# Reconstruction loss subplot
+	ax2 = fig.add_subplot(132)
+	ax2.plot(epochs, train_recon_losses, label="Train Recon Loss", linewidth=2)
+	ax2.plot(epochs, val_recon_losses, label="Val Recon Loss", linewidth=2)
+	ax2.set_title("Reconstruction Loss")
+	ax2.set_xlabel("Epoch")
+	ax2.set_ylabel("Loss")
+	ax2.grid(alpha=0.3)
+	ax2.legend(loc="best")
+	
+	# KL loss subplot
+	ax3 = fig.add_subplot(133)
+	ax3.plot(epochs, train_kl_losses, label="Train KL Loss", linewidth=2)
+	ax3.plot(epochs, val_kl_losses, label="Val KL Loss", linewidth=2)
+	ax3.set_title("KL Divergence Loss")
+	ax3.set_xlabel("Epoch")
+	ax3.set_ylabel("Loss")
+	ax3.grid(alpha=0.3)
+	ax3.legend(loc="best")
+	
 	fig.tight_layout()
 	fig.savefig(output_path, dpi=180)
 	plt.close(fig)
@@ -350,7 +377,7 @@ def main() -> None:
 	parser.add_argument("--metadata-source", type=str, default="kilter_board_csv")
 	parser.add_argument("--metadata-product-id", type=int, default=1)
 	parser.add_argument("--require-full-metadata", action="store_true")
-	parser.add_argument("--max-routes", type=int, default=100000)
+	parser.add_argument("--max-routes", type=int, default=1000000)
 	parser.add_argument("--min-holds", type=int, default=1)
 	parser.add_argument(
 		"--cache-path",
@@ -364,12 +391,12 @@ def main() -> None:
 	parser.add_argument("--weight-decay", type=float, default=1e-4)
 	parser.add_argument("--latent-dim", type=int, default=32)
 	parser.add_argument("--numeric-weight", type=float, default=0.25)
-	parser.add_argument("--kl-beta", type=float, default=1.0)
+	parser.add_argument("--kl-beta", type=float, default=0.1)
 	parser.add_argument(
 		"--kl-warmup-epochs",
 		type=int,
 		default=None,
-		help="Number of epochs to linearly warm KL from 0 to --kl-beta. Defaults to 25% of total epochs.",
+		help="Number of epochs to linearly warm KL from 0 to --kl-beta. Defaults to 40% of total epochs.",
 	)
 	parser.add_argument("--grad-clip-norm", type=float, default=1.0)
 	parser.add_argument("--seed", type=int, default=42)
@@ -384,7 +411,7 @@ def main() -> None:
 	parser.add_argument("--resume-path", type=str, default=None)
 	args = parser.parse_args()
 	if args.kl_warmup_epochs is None:
-		args.kl_warmup_epochs = max(1, int(math.ceil(0.25 * args.epochs)))
+		args.kl_warmup_epochs = max(1, int(math.ceil(0.40 * args.epochs)))
 	if args.kl_warmup_epochs < 0:
 		raise ValueError("--kl-warmup-epochs must be >= 0")
 
@@ -455,6 +482,10 @@ def main() -> None:
 	epoch_history: list[int] = []
 	train_total_history: list[float] = []
 	val_total_history: list[float] = []
+	train_recon_history: list[float] = []
+	val_recon_history: list[float] = []
+	train_kl_history: list[float] = []
+	val_kl_history: list[float] = []
 
 	for epoch in range(start_epoch, args.epochs + 1):
 		epoch_kl_beta = _compute_kl_beta_for_epoch(
@@ -506,6 +537,10 @@ def main() -> None:
 		epoch_history.append(epoch)
 		train_total_history.append(train_metrics.total_loss)
 		val_total_history.append(val_metrics.total_loss)
+		train_recon_history.append(train_recon)
+		val_recon_history.append(val_recon)
+		train_kl_history.append(train_weighted_kl)
+		val_kl_history.append(val_weighted_kl)
 
 		if val_metrics.total_loss < best_val:
 			best_val = val_metrics.total_loss
@@ -525,6 +560,10 @@ def main() -> None:
 		epochs=epoch_history,
 		train_total_losses=train_total_history,
 		val_total_losses=val_total_history,
+		train_recon_losses=train_recon_history,
+		val_recon_losses=val_recon_history,
+		train_kl_losses=train_kl_history,
+		val_kl_losses=val_kl_history,
 		output_path=Path(args.loss_plot_path),
 	)
 	
