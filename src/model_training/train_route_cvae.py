@@ -382,7 +382,7 @@ def main() -> None:
 	parser.add_argument(
 		"--cache-path",
 		type=str,
-		default=str(PROJECT_ROOT / "artifacts/preprocessed_routes_cache.pt"),
+		default=str(PROJECT_ROOT / "data/preprocessed_routes_cache.pt"),
 	)
 	parser.add_argument("--rebuild-cache", action="store_true")
 	parser.add_argument("--epochs", type=int, default=10)
@@ -400,11 +400,11 @@ def main() -> None:
 	)
 	parser.add_argument("--grad-clip-norm", type=float, default=1.0)
 	parser.add_argument("--seed", type=int, default=42)
-	parser.add_argument("--checkpoint-path", type=str, default=str(PROJECT_ROOT / "artifacts/route_cvae.pt"))
+	parser.add_argument("--checkpoint-path", type=str, default=str(PROJECT_ROOT / "data/route_cvae.pt"))
 	parser.add_argument(
 		"--loss-plot-path",
 		type=str,
-		default=str(PROJECT_ROOT / "artifacts/route_cvae_loss_curve.png"),
+		default=str(PROJECT_ROOT / "data/route_cvae_loss_curve.png"),
 		help="Path to save training/validation total loss curve.",
 	)
 	parser.add_argument("--resume", action="store_true")

@@ -450,7 +450,7 @@ def main() -> None:
 	parser.add_argument(
 		"--cache-path",
 		type=str,
-		default=str(PROJECT_ROOT / "artifacts/preprocessed_routes_cache.pt"),
+		default=str(PROJECT_ROOT / "data/preprocessed_routes_cache.pt"),
 	)
 	parser.add_argument(
 		"--checkpoint-path",
@@ -476,7 +476,7 @@ def main() -> None:
 	parser.add_argument(
 		"--output-path",
 		type=str,
-		default=str(PROJECT_ROOT / "artifacts/routes_pca_kmeans_latent.png"),
+		default=str(PROJECT_ROOT / "data/routes_pca_kmeans_latent.png"),
 	)
 	parser.add_argument("--show", action="store_true", help="Display interactive plot window.")
 	parser.add_argument(
