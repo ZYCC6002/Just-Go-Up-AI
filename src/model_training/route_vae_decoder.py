@@ -21,6 +21,8 @@ class RouteVAEDecoderConfig:
 	# Latent/conditioning sizes
 	latent_dim: int
 	condition_hidden_dim: int = 64
+	use_cond_adaln: bool = True
+	z_memory_tokens: int = 4
 
 	# Per-feature embedding sizes
 	type_embed_dim: int = 16
@@ -54,8 +56,35 @@ class RouteVAEDecoderConfig:
 	grade_max: float = 33.0
 
 
+class ConditionAdaLayerNorm(nn.Module):
+	"""Adaptive LayerNorm modulated by a route-level condition embedding."""
+
+	def __init__(self, d_model: int, cond_dim: int, eps: float = 1e-5) -> None:
+		super().__init__()
+		self.norm = nn.LayerNorm(d_model, eps=eps, elementwise_affine=False)
+		self.modulation = nn.Sequential(
+			nn.Linear(cond_dim, d_model * 2),
+			nn.GELU(),
+			nn.Linear(d_model * 2, d_model * 2),
+		)
+
+	def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+		"""
+		Args:
+			x: hidden states [B, L, d_model]
+			cond: condition embedding [B, cond_dim]
+		"""
+		gamma_beta = self.modulation(cond)
+		gamma, beta = gamma_beta.chunk(2, dim=-1)
+		x_norm = self.norm(x)
+		return x_norm * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+
+
 class RouteTransformerDecoder(nn.Module):
-	"""Autoregressive transformer decoder conditioned on latent, angle, and grade.
+	"""Autoregressive transformer decoder.
+
+	Cross-attention memory uses only latent `z`.
+	Angle/grade conditioning is injected via AdaLN modulation.
 
 	Expected teacher-forcing input keys (shifted-right with BOS at position 0):
 	- type_encoded_id, function_encoded_id, role_encoded_id, hole_encoded_id
@@ -115,11 +144,15 @@ class RouteTransformerDecoder(nn.Module):
 		self.sequence_position_embedding = nn.Embedding(cfg.max_seq_len, cfg.d_model)
 
 		# Conditioning pathways
+		if cfg.z_memory_tokens <= 0:
+			raise ValueError("z_memory_tokens must be >= 1")
+		self.z_memory_tokens = cfg.z_memory_tokens
 		self.z_mlp = nn.Sequential(
 			nn.Linear(cfg.latent_dim, cfg.condition_hidden_dim),
 			nn.GELU(),
-			nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
+			nn.Linear(cfg.condition_hidden_dim, cfg.d_model * cfg.z_memory_tokens),
 		)
+		self.z_memory_positional = nn.Parameter(torch.randn(cfg.z_memory_tokens, cfg.d_model) * 0.02)
 		self.angle_mlp = nn.Sequential(
 			nn.Linear(1, cfg.condition_hidden_dim),
 			nn.GELU(),
@@ -130,6 +163,25 @@ class RouteTransformerDecoder(nn.Module):
 			nn.GELU(),
 			nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
 		)
+		self.condition_fusion = nn.Sequential(
+			nn.Linear(cfg.d_model * 2, cfg.condition_hidden_dim),
+			nn.GELU(),
+			nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
+		)
+		if cfg.use_cond_adaln:
+			self.pre_decoder_adaln = ConditionAdaLayerNorm(
+				d_model=cfg.d_model,
+				cond_dim=cfg.d_model,
+				eps=cfg.layer_norm_eps,
+			)
+			self.post_decoder_adaln = ConditionAdaLayerNorm(
+				d_model=cfg.d_model,
+				cond_dim=cfg.d_model,
+				eps=cfg.layer_norm_eps,
+			)
+		else:
+			self.pre_decoder_adaln = None
+			self.post_decoder_adaln = None
 
 		decoder_layer = nn.TransformerDecoderLayer(
 			d_model=cfg.d_model,
@@ -198,26 +250,36 @@ class RouteTransformerDecoder(nn.Module):
 		grade: torch.Tensor,
 		grade_missing: torch.Tensor | None,
 	) -> torch.Tensor:
-		"""Create condition memory tokens used as cross-attention keys/values.
+		"""Create memory token(s) used as cross-attention keys/values.
 
-		Returns memory shape [B, 3, d_model]:
-		- token 0: latent z embedding
-		- token 1: angle condition embedding
-		- token 2: grade condition embedding
+		Returns memory shape [B, K, d_model], K = z_memory_tokens.
+		Each memory token is produced from z with a learned token-specific offset.
 		"""
+		batch_size = z.shape[0]
+		z_tokens = self.z_mlp(z.to(torch.float32)).view(batch_size, self.z_memory_tokens, self.cfg.d_model)
+		z_tokens = z_tokens + self.z_memory_positional.unsqueeze(0)
+		return z_tokens
+
+	def _build_condition_embedding(
+		self,
+		*,
+		angle: torch.Tensor,
+		grade: torch.Tensor,
+		grade_missing: torch.Tensor | None,
+	) -> torch.Tensor:
+		"""Create a single route-level conditioning embedding for AdaLN."""
 		if grade_missing is None:
 			grade_missing = torch.zeros_like(grade, dtype=torch.float32)
 		else:
 			grade_missing = grade_missing.to(torch.float32)
 
-		z_token = self.z_mlp(z.to(torch.float32)).unsqueeze(1)
 		norm_angle = self._normalize_angle(angle)
 		norm_grade = self._normalize_grade(grade)
 
-		angle_token = self.angle_mlp(norm_angle.unsqueeze(-1)).unsqueeze(1)
+		angle_emb = self.angle_mlp(norm_angle.unsqueeze(-1))
 		grade_input = torch.stack([norm_grade, grade_missing], dim=-1)
-		grade_token = self.grade_mlp(grade_input).unsqueeze(1)
-		return torch.cat([z_token, angle_token, grade_token], dim=1)
+		grade_emb = self.grade_mlp(grade_input)
+		return self.condition_fusion(torch.cat([angle_emb, grade_emb], dim=-1))
 
 	def build_decoder_inputs(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
 		type_emb = self.type_embedding(batch["type_encoded_id"])
@@ -298,6 +360,13 @@ class RouteTransformerDecoder(nn.Module):
 			grade=grade,
 			grade_missing=grade_missing,
 		)
+		cond_emb = self._build_condition_embedding(
+			angle=angle,
+			grade=grade,
+			grade_missing=grade_missing,
+		)
+		if self.pre_decoder_adaln is not None:
+			tgt = self.pre_decoder_adaln(tgt, cond_emb)
 
 		seq_len = tgt.shape[1]
 		tgt_mask = self._causal_mask(seq_len=seq_len, device=tgt.device)
@@ -308,6 +377,8 @@ class RouteTransformerDecoder(nn.Module):
 			tgt_mask=tgt_mask,
 			tgt_key_padding_mask=padding_mask,
 		)
+		if self.post_decoder_adaln is not None:
+			decoded = self.post_decoder_adaln(decoded, cond_emb)
 		decoded = self.final_norm(decoded)
 
 		x_pred = torch.sigmoid(self.x_head(decoded).squeeze(-1))

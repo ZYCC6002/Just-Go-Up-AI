@@ -37,6 +37,7 @@ class RouteVAEEncoderConfig:
 	dropout: float = 0.1
 	layer_norm_eps: float = 1e-5
 	condition_hidden_dim: int = 64
+	use_cond_adaln: bool = True
 
 	# Input normalization ranges
 	x_min: float = 0.0
@@ -47,6 +48,30 @@ class RouteVAEEncoderConfig:
 	angle_max: float = 70.0
 	grade_min: float = 10.0
 	grade_max: float = 33.0
+
+
+class ConditionAdaLayerNorm(nn.Module):
+	"""Adaptive LayerNorm modulated by a route-level condition embedding."""
+
+	def __init__(self, d_model: int, cond_dim: int, eps: float = 1e-5) -> None:
+		super().__init__()
+		self.norm = nn.LayerNorm(d_model, eps=eps, elementwise_affine=False)
+		self.modulation = nn.Sequential(
+			nn.Linear(cond_dim, d_model * 2),
+			nn.GELU(),
+			nn.Linear(d_model * 2, d_model * 2),
+		)
+
+	def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+		"""
+		Args:
+			x: hidden states [B, L, d_model]
+			cond: condition embedding [B, cond_dim]
+		"""
+		gamma_beta = self.modulation(cond)
+		gamma, beta = gamma_beta.chunk(2, dim=-1)
+		x_norm = self.norm(x)
+		return x_norm * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
 
 
 class ScalarSinusoidalEmbedding(nn.Module):
@@ -173,6 +198,20 @@ class RouteTransformerEncoder(nn.Module):
 			nn.GELU(),
 			nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
 		)
+		if cfg.use_cond_adaln:
+			self.pre_encoder_adaln = ConditionAdaLayerNorm(
+				d_model=cfg.d_model,
+				cond_dim=cfg.d_model,
+				eps=cfg.layer_norm_eps,
+			)
+			self.post_encoder_adaln = ConditionAdaLayerNorm(
+				d_model=cfg.d_model,
+				cond_dim=cfg.d_model,
+				eps=cfg.layer_norm_eps,
+			)
+		else:
+			self.pre_encoder_adaln = None
+			self.post_encoder_adaln = None
 
 	def _project_numeric(self, tensor_2d: torch.Tensor, proj: nn.Linear) -> torch.Tensor:
 		return proj(tensor_2d.unsqueeze(-1).to(torch.float32))
@@ -299,9 +338,14 @@ class RouteTransformerEncoder(nn.Module):
 			grade_missing=grade_missing,
 		)  # [B, d_model]
 
-		# Add the same condition embedding to each hold token before transformer.
-		tokens = tokens + cond_emb.unsqueeze(1)
+		if self.pre_encoder_adaln is not None:
+			tokens = self.pre_encoder_adaln(tokens, cond_emb)
+		else:
+			# Backward-compatible fallback path.
+			tokens = tokens + cond_emb.unsqueeze(1)
 		encoded = self.encoder(tokens, src_key_padding_mask=padding_mask)
+		if self.post_encoder_adaln is not None:
+			encoded = self.post_encoder_adaln(encoded, cond_emb)
 		encoded = self.final_norm(encoded)
 		route_embedding = self.masked_mean_pool(encoded, padding_mask)
 		return {"token_embeddings": encoded, "route_embedding": route_embedding}
@@ -367,6 +411,7 @@ def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.T
 
 __all__ = [
 	"RouteVAEEncoderConfig",
+	"ConditionAdaLayerNorm",
 	"ScalarSinusoidalEmbedding",
 	"RouteTransformerEncoder",
 	"collate_hold_token_batch",
