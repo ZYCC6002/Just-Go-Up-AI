@@ -37,6 +37,7 @@ class RouteVAEEncoderConfig:
 	dropout: float = 0.1
 	layer_norm_eps: float = 1e-5
 	condition_hidden_dim: int = 64
+	use_condition: bool = True
 	use_cond_adaln: bool = True
 
 	# Input normalization ranges
@@ -332,19 +333,21 @@ class RouteTransformerEncoder(nn.Module):
 		"""
 		padding_mask = batch["padding_mask"].bool()
 		tokens = self.build_token_embeddings(batch)
-		cond_emb = self._build_condition_embedding(
-			angle=angle,
-			grade=grade,
-			grade_missing=grade_missing,
-		)  # [B, d_model]
+		cond_emb: torch.Tensor | None = None
+		if self.cfg.use_condition:
+			cond_emb = self._build_condition_embedding(
+				angle=angle,
+				grade=grade,
+				grade_missing=grade_missing,
+			)  # [B, d_model]
 
-		if self.pre_encoder_adaln is not None:
-			tokens = self.pre_encoder_adaln(tokens, cond_emb)
-		else:
-			# Backward-compatible fallback path.
-			tokens = tokens + cond_emb.unsqueeze(1)
+			if self.pre_encoder_adaln is not None:
+				tokens = self.pre_encoder_adaln(tokens, cond_emb)
+			else:
+				# Backward-compatible fallback path.
+				tokens = tokens + cond_emb.unsqueeze(1)
 		encoded = self.encoder(tokens, src_key_padding_mask=padding_mask)
-		if self.post_encoder_adaln is not None:
+		if self.post_encoder_adaln is not None and cond_emb is not None:
 			encoded = self.post_encoder_adaln(encoded, cond_emb)
 		encoded = self.final_norm(encoded)
 		route_embedding = self.masked_mean_pool(encoded, padding_mask)

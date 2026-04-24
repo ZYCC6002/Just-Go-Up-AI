@@ -290,14 +290,27 @@ def _select_device() -> torch.device:
 
 
 
-def _build_model(vocab_bundle, device: torch.device, latent_dim: int) -> tuple[RouteConditionalVAE, DecoderEOSIds]:
+def _build_model(
+	vocab_bundle,
+	device: torch.device,
+	latent_dim: int,
+	*,
+	encoder_use_condition: bool,
+	encoder_use_cond_adaln: bool,
+	decoder_use_cond_adaln: bool,
+	decoder_z_memory_tokens: int,
+) -> tuple[RouteConditionalVAE, DecoderEOSIds]:
 	enc_cfg = vocab_bundle.to_transformer_config()
+	enc_cfg.use_condition = encoder_use_condition
+	enc_cfg.use_cond_adaln = encoder_use_cond_adaln
 	dec_cfg = RouteVAEDecoderConfig(
 		type_vocab_size=enc_cfg.type_vocab_size,
 		function_vocab_size=enc_cfg.function_vocab_size,
 		role_vocab_size=enc_cfg.role_vocab_size,
 		hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
 		latent_dim=latent_dim,
+		use_cond_adaln=decoder_use_cond_adaln,
+		z_memory_tokens=decoder_z_memory_tokens,
 		# Keep normalization ranges consistent across encoder and decoder.
 		x_min=enc_cfg.x_min,
 		x_max=enc_cfg.x_max,
@@ -394,6 +407,30 @@ def main() -> None:
 	parser.add_argument("--numeric-weight", type=float, default=0.25)
 	parser.add_argument("--kl-beta", type=float, default=0.1)
 	parser.add_argument(
+		"--encoder-use-condition",
+		action=argparse.BooleanOptionalAction,
+		default=True,
+		help="Inject angle/grade into the encoder (q(z|x,c)). Disable to encourage condition-invariant z.",
+	)
+	parser.add_argument(
+		"--encoder-use-cond-adaln",
+		action=argparse.BooleanOptionalAction,
+		default=True,
+		help="Use AdaLN for encoder conditioning. If disabled and encoder conditioning is enabled, falls back to additive conditioning.",
+	)
+	parser.add_argument(
+		"--decoder-use-cond-adaln",
+		action=argparse.BooleanOptionalAction,
+		default=True,
+		help="Use AdaLN for decoder angle/grade conditioning.",
+	)
+	parser.add_argument(
+		"--decoder-z-memory-tokens",
+		type=int,
+		default=4,
+		help="Number of latent memory tokens exposed to decoder cross-attention.",
+	)
+	parser.add_argument(
 		"--kl-warmup-epochs",
 		type=int,
 		default=None,
@@ -430,6 +467,8 @@ def main() -> None:
 		args.kl_warmup_epochs = max(1, int(math.ceil(0.40 * args.epochs)))
 	if args.kl_warmup_epochs < 0:
 		raise ValueError("--kl-warmup-epochs must be >= 0")
+	if args.decoder_z_memory_tokens < 1:
+		raise ValueError("--decoder-z-memory-tokens must be >= 1")
 	if args.early_stop_delta is not None and args.early_stop_delta < 0:
 		raise ValueError("--early-stop-delta must be >= 0")
 	if args.early_stop_patience < 1:
@@ -445,7 +484,15 @@ def main() -> None:
 		f"Loaded routes: total={len(samples)} train={len(train_samples)} val={len(val_samples)} test={len(test_samples)}"
 	)
 
-	model, eos_ids = _build_model(vocabs, device=device, latent_dim=args.latent_dim)
+	model, eos_ids = _build_model(
+		vocabs,
+		device=device,
+		latent_dim=args.latent_dim,
+		encoder_use_condition=args.encoder_use_condition,
+		encoder_use_cond_adaln=args.encoder_use_cond_adaln,
+		decoder_use_cond_adaln=args.decoder_use_cond_adaln,
+		decoder_z_memory_tokens=args.decoder_z_memory_tokens,
+	)
 
 	train_samples, skipped_train = _filter_samples_by_decoder_max_len(
 		train_samples,
