@@ -339,6 +339,7 @@ def _load_or_build_samples_and_vocabs(args: argparse.Namespace) -> tuple[list[An
 		"db_path": str(Path(args.db_path).resolve()),
 		"metadata_source": args.metadata_source,
 		"metadata_product_id": args.metadata_product_id,
+		"required_product_id": 1,
 		"require_full_metadata": args.require_full_metadata,
 		"max_routes": args.max_routes,
 		"min_holds": args.min_holds,

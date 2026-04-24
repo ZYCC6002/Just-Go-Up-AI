@@ -166,7 +166,9 @@ def _load_raw_routes(
 	- climb row dict
 	- raw hold tokens
 	- metadata coverage ratio [0,1]
+	- only climbs on product_id=1 (Kilter Board Original) are kept
 	"""
+	required_product_id = 1
 
 	rows = db.fetchall(
 		"""
@@ -196,6 +198,10 @@ def _load_raw_routes(
 		if quality_average is None or float(quality_average) < float(min_quality_average):
 			continue
 		if ascensionist_count is None or int(ascensionist_count) < int(min_ascensionist_count):
+			continue
+
+		climb = db.get_climb(str(uuid))
+		if climb is None or climb.product_id != required_product_id:
 			continue
 
 		holds = db.get_hold_positions_for_climb(
@@ -245,6 +251,7 @@ def build_training_samples_from_db(
 	- Handles missing metadata (with UNKNOWN defaults) unless full metadata is required.
 	- Converts orientation degrees to explicit sin/cos inputs.
 	- Filters low-signal climbs by `quality_average` and `ascensionist_count`.
+	- Keeps only climbs on product_id=1 (Kilter Board Original).
 	- Returns token tensors ready for `collate_hold_token_batch`.
 	"""
 

@@ -455,7 +455,7 @@ def main() -> None:
 	parser.add_argument(
 		"--checkpoint-path",
 		type=str,
-		default=str(PROJECT_ROOT / "artifacts/route_cvae.pt"),
+		default=str(PROJECT_ROOT / "data/route_cvae.pt"),
 	)
 	parser.add_argument("--metadata-source", type=str, default="kilter_board_csv")
 	parser.add_argument("--metadata-product-id", type=int, default=1)
