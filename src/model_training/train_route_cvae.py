@@ -410,11 +410,30 @@ def main() -> None:
 	)
 	parser.add_argument("--resume", action="store_true")
 	parser.add_argument("--resume-path", type=str, default=None)
+	parser.add_argument(
+		"--early-stop-delta",
+		type=float,
+		default=None,
+		help=(
+			"Enable early stopping when absolute change in consecutive validation total loss "
+			"falls below this threshold. Disabled if not set."
+		),
+	)
+	parser.add_argument(
+		"--early-stop-patience",
+		type=int,
+		default=1,
+		help="Number of consecutive epochs meeting --early-stop-delta before stopping.",
+	)
 	args = parser.parse_args()
 	if args.kl_warmup_epochs is None:
 		args.kl_warmup_epochs = max(1, int(math.ceil(0.40 * args.epochs)))
 	if args.kl_warmup_epochs < 0:
 		raise ValueError("--kl-warmup-epochs must be >= 0")
+	if args.early_stop_delta is not None and args.early_stop_delta < 0:
+		raise ValueError("--early-stop-delta must be >= 0")
+	if args.early_stop_patience < 1:
+		raise ValueError("--early-stop-patience must be >= 1")
 
 	torch.manual_seed(args.seed)
 	device = _select_device()
@@ -487,6 +506,7 @@ def main() -> None:
 	val_recon_history: list[float] = []
 	train_kl_history: list[float] = []
 	val_kl_history: list[float] = []
+	early_stop_stable_epochs = 0
 
 	for epoch in range(start_epoch, args.epochs + 1):
 		epoch_kl_beta = _compute_kl_beta_for_epoch(
@@ -556,6 +576,24 @@ def main() -> None:
 				checkpoint_path,
 			)
 			print(f"Saved checkpoint: {checkpoint_path}")
+
+		if args.early_stop_delta is not None and len(val_total_history) >= 2:
+			val_delta = abs(val_total_history[-1] - val_total_history[-2])
+			if val_delta < args.early_stop_delta:
+				early_stop_stable_epochs += 1
+				print(
+					f"Early-stopping monitor | val_delta={val_delta:.6f} < {args.early_stop_delta:.6f} "
+					f"(stable_epochs={early_stop_stable_epochs}/{args.early_stop_patience})"
+				)
+				if early_stop_stable_epochs >= args.early_stop_patience:
+					print(
+						"Early stopping triggered: "
+						f"|Δval_total_loss| < {args.early_stop_delta} "
+						f"for {args.early_stop_patience} consecutive epoch(s)."
+					)
+					break
+			else:
+				early_stop_stable_epochs = 0
 
 	_save_loss_curve_plot(
 		epochs=epoch_history,
