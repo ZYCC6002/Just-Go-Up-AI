@@ -25,62 +25,42 @@ Contains labelled data for the standard 12x12 Kilter board holds
 
 ## Feature engineering
 
-Quality filters
+Quality filters: Only publicly available routes are used. Routes are also filtered by quality_average and ascenscionist_count. This intentionally biases training toward established routes with stronger community consensus.
 
-Only publicly available routes are used. Routes are also filtered by quality_average and ascenscionist_count. This intentionally biases training toward established routes with stronger community consensus.
-
-Per-Hold Token Construction
-
-Each hold is embedded as a single token by independently embedding all features and concatenating before projection.
+Per-Hold Token Construction: Each hold is embedded as a single token by independently embedding all features and concatenating before projection.
 
 Categorical features (type, function, role, hole_id) each get their own learned embedding table, allowing the model to learn dense geometric relationships between categories from co-occurrence in routes.
 
-Coordinates use sinusoidal positional encoding on normalised values, providing multi-scale spatial representation across both fine-grained proximity and coarse board zones. 
-
-Variable Length Handling
-
-Routes on Kilter range from a few holds to upwards of 20. Variable-length sequences are handled by padding all routes in a batch to the length of the longest route with a null token, combined with a boolean padding_mask that prevents padded positions from contributing to attention and loss computation.
+Coordinates use sinusoidal positional encoding on normalised values, providing multi-scale spatial representation across both fine-grained proximity and coarse board zones.
 
 ---
 
 ## Model selection and considerations
 
-### Why CVAE
+### Why CVAE with transformer encoder/decoder
 
 A CVAE was chosen to perform analysis and clustering of route data.
 
 Reasoning:
 
-- Routes are **sequences**, not independent points.
-- We want a meaningful **latent space** for clustering/search.
-- We want generation to be **controllable** by context (angle/grade).
-- We want some tolerance to ambiguity in route style, which VAEs handle naturally.
+- Latent Space analysis: We want a meaningful latent space for clustering/search.
+- Sequential Modelling: Routes are sequences, and transformers can model hold order and relationships between holds instead of treating each hold independently.
+- Context-conditioned routes: We want the learned representation to depend on context, since angle and grade change the route distribution.
+- Non-linear structure: The CVAE can capture non-linear relationships in route data that linear methods like PCA may miss.
+- Generative Capabilities: Because the latent space is continuous, we can sample from it to generate new routes as well as cluster existing ones.
 
-The CVAE supports:
+### Challenges Faced
+Posterior collapse: The decoder is often too strong, and often ignores the latent variable, causing the learned latent space to contain little to no information.
 
-- compact latent embeddings for clustering/search,
-- conditional decoding for controlled generation,
-- uncertainty-aware training through KL regularization.
+Conditional leakage: Angle and grade conditioning can dominate the prediction task, allowing the model to rely on context instead of route-style structure in the latent space.
 
-### Architecture highlights
+Latent space quality is hard to evaluate: good reconstruction does not necessarily mean the latent space is useful for clustering or generation.
 
-- **Encoder**: A Transformer encoder over route tokens was chosen over FFN.
-- **Bottleneck**: latent `mu/logvar` with reparameterization.
-- **Decoder**: autoregressive Transformer decoder with BOS/EOS handling.
-- **Conditioning**: angle/grade and latent tokens via decoder conditioning path.
+### Steps taken
 
-### Training considerations
+KL Annealing: We gradually increase KL pressure during training so the model first learns to reconstruct routes well, then is pushed toward a smooth, informative latent space. This helps reduce the chance of posterior collapse.
 
-- Training balances three needs:
-	- correctness of discrete hold decisions,
-	- accuracy of continuous hold attributes,
-	- a smooth latent space that stays useful for sampling.
-- Overly long routes are filtered so training remains stable.
-- Preprocessing is cached to speed up experiment loops.
-
-### Cache/checkpoint compatibility
-
-Checkpoint weights depend on vocabulary sizes. If preprocessing filters change, cached vocabularies can change too. Rebuild cache and retrain (or use matching cache/checkpoint pairs) to avoid shape mismatch errors.
+AdaLN: We use Adaptive LayerNorm to condition the model on angle and grade in a more stable way, improving context awareness while helping to reduce angle/grade leakage into the latent space.
 
 ---
 
@@ -109,7 +89,13 @@ Useful options:
 - `--checkpoint-path data/route_cvae.pt`
 - `--resume`
 - `--resume-path <path>`
-- `--max-routes`, `--epochs`, `--batch-size`, `--latent-dim`
+- `--epochs`, `--batch-size`, `--lr`, `--weight-decay`, `--latent-dim`
+- `--numeric-weight`, `--kl-beta`, `--kl-warmup-epochs`
+- `--encoder-use-condition`, `--encoder-use-cond-adaln`, `--decoder-use-cond-adaln`
+- `--decoder-z-memory-tokens`, `--grad-clip-norm`, `--seed`
+- `--max-routes`
+
+Tip: if you change preprocessing filters, rebuild the cache and retrain so the checkpoint vocabularies still match.
 
 ### 2) Latent PCA + KMeans analysis
 
@@ -148,18 +134,18 @@ Run:
 
 - End-to-end flow is in place (data -> train -> latent analysis -> visualization).
 - PCA and t-SNE views now share a precomputed clustered latent cache.
-- Preprocessing now prioritizes route quality and cleaner supervision by default.
+- Preprocessing now filters by route quality and number of ascentionists by default.
 
 ---
 
 ## Future goals
 
-1. **Generation quality**: make decoded routes feel more climbable and intentional.
+<!-- 1. **Generation quality**: make decoded routes feel more climbable and intentional.
 2. **Recommendations**: suggest routes by style similarity and training goals.
 3. **Evaluation**: build practical metrics for novelty, feasibility, and difficulty calibration.
 4. **Coverage**: improve performance across underrepresented angle/grade slices.
 5. **Reproducibility**: tighten experiment tracking for model/data/version comparisons.
-6. **Productization**: expose route search/generation through a simple CLI or API.
+6. **Productization**: expose route search/generation through a simple CLI or API. -->
 
 ---
 
