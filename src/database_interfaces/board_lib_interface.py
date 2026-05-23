@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import sqlite3
 
@@ -157,35 +157,6 @@ class BoardLibInterface:
 		if row is None:
 			return None
 		return self.get_climb(str(row[0]))
-
-	def get_climb_by_uuid(self, climb_uuid: str) -> Optional[dict[str, Any]]:
-		climb = self.get_climb(climb_uuid)
-		if climb is None:
-			return None
-		return {
-			"uuid": climb.uuid,
-			"layout_id": climb.layout_id,
-			"name": climb.name,
-			"frames": climb.frames,
-			"hsm": climb.hsm,
-			"edge_left": climb.edge_left,
-			"edge_right": climb.edge_right,
-			"edge_bottom": climb.edge_bottom,
-			"edge_top": climb.edge_top,
-			"angle": climb.angle,
-		}
-
-	def get_climb_row_by_name(self, climb_name: str) -> tuple[Any, ...] | None:
-		return self.execute(
-			"""
-			SELECT uuid, name, layout_id, created_at
-			FROM climbs
-			WHERE name = ?
-			ORDER BY created_at DESC
-			LIMIT 1
-			""",
-			[climb_name],
-		).fetchone()
 
 	def decode_hsm_set_ids(self, layout_id: int, hsm: int) -> list[int]:
 		"""Decode a layout-specific hold-set mask into concrete set_ids."""
@@ -447,16 +418,6 @@ class BoardLibInterface:
 		if isinstance(climb_uuid, Climb):
 			climb_uuid.holds = holds
 		return holds
-
-	def iter_climb_hold_counts(self, climb_uuids: Iterable[str]) -> dict[str, int]:
-		counts: dict[str, int] = {}
-		for climb_uuid in climb_uuids:
-			climb = self.get_climb_by_uuid(climb_uuid)
-			if not climb:
-				continue
-			pairs = self.parse_frames(climb.get("frames") or "")
-			counts[climb_uuid] = len(pairs)
-		return counts
 
 	def import_external_hold_metadata(
 		self,

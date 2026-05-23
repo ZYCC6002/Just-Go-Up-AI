@@ -206,10 +206,20 @@ def prepare_cvae_training_batch(
 	}
 
 
+def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+	"""MSE loss over positions selected by a boolean mask."""
+	if pred.shape != target.shape:
+		raise ValueError(f"Shape mismatch: pred={pred.shape}, target={target.shape}")
+	mask_f = mask.to(torch.float32)
+	denom = mask_f.sum().clamp(min=1.0)
+	return (((pred - target) ** 2) * mask_f).sum() / denom
+
+
 __all__ = [
 	"DecoderEOSIds",
 	"FEATURE_KEYS",
 	"build_condition_tensors",
+	"masked_mse",
 	"prepare_cvae_training_batch",
 	"prepare_teacher_forcing_batch",
 ]
