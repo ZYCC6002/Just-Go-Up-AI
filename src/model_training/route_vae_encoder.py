@@ -6,416 +6,231 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from .model_utils import (
+    ConditionAdaLayerNorm,
+    HoldTokenEmbedder,
+    ScalarSinusoidalEmbedding,
+    normalize_minmax,
+)
+
 
 @dataclass
 class RouteVAEEncoderConfig:
-	"""Configuration for hold-token transformer encoder."""
+    """Configuration for hold-token transformer encoder."""
 
-	# Feature vocab sizes (set based on your preprocessing dictionaries)
-	type_vocab_size: int
-	function_vocab_size: int
-	role_vocab_size: int
-	hole_id_vocab_size: int
+    # Feature vocab sizes (set based on preprocessing vocabularies)
+    type_vocab_size: int
+    function_vocab_size: int
+    role_vocab_size: int
+    hole_id_vocab_size: int
 
-	# Per-feature embedding sizes
-	type_embed_dim: int = 16
-	function_embed_dim: int = 8
-	role_embed_dim: int = 8
-	hole_id_embed_dim: int = 16
-	x_embed_dim: int = 16
-	y_embed_dim: int = 16
-	depth_embed_dim: int = 8
-	orientation_sin_embed_dim: int = 8
-	orientation_cos_embed_dim: int = 8
-	size_embed_dim: int = 8
+    # Per-feature embedding sizes
+    type_embed_dim: int = 16
+    function_embed_dim: int = 8
+    role_embed_dim: int = 8
+    hole_id_embed_dim: int = 16
+    x_embed_dim: int = 16
+    y_embed_dim: int = 16
+    depth_embed_dim: int = 8
+    orientation_sin_embed_dim: int = 8
+    orientation_cos_embed_dim: int = 8
+    size_embed_dim: int = 8
 
-	# Transformer sizes
-	d_model: int = 128
-	nhead: int = 8
-	num_layers: int = 4
-	dim_feedforward: int = 256
-	dropout: float = 0.1
-	layer_norm_eps: float = 1e-5
-	condition_hidden_dim: int = 64
-	use_condition: bool = True
-	use_cond_adaln: bool = True
+    # Transformer sizes
+    d_model: int = 128
+    nhead: int = 8
+    num_layers: int = 4
+    dim_feedforward: int = 256
+    dropout: float = 0.1
+    layer_norm_eps: float = 1e-5
+    condition_hidden_dim: int = 64
+    use_condition: bool = True
+    use_cond_adaln: bool = True
 
-	# Input normalization ranges
-	x_min: float = 0.0
-	x_max: float = 140.0
-	y_min: float = 0.0
-	y_max: float = 160.0
-	angle_min: float = 0.0
-	angle_max: float = 70.0
-	grade_min: float = 10.0
-	grade_max: float = 33.0
-
-
-class ConditionAdaLayerNorm(nn.Module):
-	"""Adaptive LayerNorm modulated by a route-level condition embedding."""
-
-	def __init__(self, d_model: int, cond_dim: int, eps: float = 1e-5) -> None:
-		super().__init__()
-		self.norm = nn.LayerNorm(d_model, eps=eps, elementwise_affine=False)
-		self.modulation = nn.Sequential(
-			nn.Linear(cond_dim, d_model * 2),
-			nn.GELU(),
-			nn.Linear(d_model * 2, d_model * 2),
-		)
-
-	def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-		"""
-		Args:
-			x: hidden states [B, L, d_model]
-			cond: condition embedding [B, cond_dim]
-		"""
-		gamma_beta = self.modulation(cond)
-		gamma, beta = gamma_beta.chunk(2, dim=-1)
-		x_norm = self.norm(x)
-		return x_norm * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
-
-
-class ScalarSinusoidalEmbedding(nn.Module):
-	"""Sinusoidal embedding for scalar coordinates (e.g. x/y board coordinates)."""
-
-	def __init__(self, embed_dim: int) -> None:
-		super().__init__()
-		if embed_dim % 2 != 0:
-			raise ValueError("Sinusoidal embedding dimension must be even.")
-		self.embed_dim = embed_dim
-
-	def forward(self, values: torch.Tensor) -> torch.Tensor:
-		"""
-		Args:
-			values: Tensor of shape [B, L] or [N] with scalar coordinates.
-
-		Returns:
-			Tensor of shape [B, L, embed_dim] (or [N, embed_dim] for 1D input).
-		"""
-		device = values.device
-		dtype = values.dtype
-		if values.dim() not in (1, 2):
-			raise ValueError("values must have shape [B, L] or [N].")
-
-		values_f = values.to(torch.float32)
-		half_dim = self.embed_dim // 2
-		exponents = torch.arange(half_dim, device=device, dtype=torch.float32)
-		denom = torch.pow(10000.0, 2 * exponents / self.embed_dim)
-
-		angles = values_f.unsqueeze(-1) / denom
-		sin = torch.sin(angles)
-		cos = torch.cos(angles)
-		emb = torch.stack((sin, cos), dim=-1).reshape(*sin.shape[:-1], self.embed_dim)
-		return emb.to(dtype=dtype)
+    # Input normalization ranges
+    x_min: float = 0.0
+    x_max: float = 140.0
+    y_min: float = 0.0
+    y_max: float = 160.0
+    angle_min: float = 0.0
+    angle_max: float = 70.0
+    grade_min: float = 10.0
+    grade_max: float = 33.0
 
 
 class RouteTransformerEncoder(nn.Module):
-	"""Transformer encoder over hold tokens with per-feature embeddings.
+    """Transformer encoder over hold tokens with per-feature embeddings.
 
-	Expected token-level inputs (each [B, L], except padding_mask):
-	- type_encoded_id: encoded hold type index
-	- function_encoded_id: encoded hold function index
-	- role_encoded_id: encoded placement role index
-	- hole_encoded_id: encoded hole index
-	- x: board x coordinate (sinusoidal embedding)
-	- y: board y coordinate (sinusoidal embedding)
-	- depth: numeric
-	- orientation_sin: numeric (sin(theta))
-	- orientation_cos: numeric (cos(theta))
-	- size: numeric
-	- padding_mask: bool [B, L], True for padded tokens
-	"""
+    Expected token-level inputs (each [B, L], except padding_mask):
+    - type_encoded_id, function_encoded_id, role_encoded_id, hole_encoded_id
+    - x, y, depth, orientation_sin, orientation_cos, size
+    - padding_mask: bool [B, L], True for padded tokens
+    """
 
-	def __init__(self, cfg: RouteVAEEncoderConfig) -> None:
-		super().__init__()
-		self.cfg = cfg
+    def __init__(self, cfg: RouteVAEEncoderConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
 
-		# Categorical feature embeddings
-		self.type_embedding = nn.Embedding(cfg.type_vocab_size, cfg.type_embed_dim)
-		self.function_embedding = nn.Embedding(cfg.function_vocab_size, cfg.function_embed_dim)
-		self.role_embedding = nn.Embedding(cfg.role_vocab_size, cfg.role_embed_dim)
-		self.hole_embedding = nn.Embedding(cfg.hole_id_vocab_size, cfg.hole_id_embed_dim)
+        self.hold_embedder = HoldTokenEmbedder(cfg)
 
-		# Positional scalar sinusoidal embeddings
-		self.x_embedding = ScalarSinusoidalEmbedding(cfg.x_embed_dim)
-		self.y_embedding = ScalarSinusoidalEmbedding(cfg.y_embed_dim)
+        # Disable nested-tensor path for MPS compatibility.
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=cfg.d_model,
+            nhead=cfg.nhead,
+            dim_feedforward=cfg.dim_feedforward,
+            dropout=cfg.dropout,
+            activation="gelu",
+            layer_norm_eps=cfg.layer_norm_eps,
+            batch_first=True,
+        )
+        try:
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=cfg.num_layers,
+                enable_nested_tensor=False,
+                mask_check=False,
+            )
+        except TypeError:
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=cfg.num_layers,
+                enable_nested_tensor=False,
+            )
+        self.final_norm = nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps)
 
-		# Numeric feature projections (scalar -> vector)
-		self.depth_projection = nn.Linear(1, cfg.depth_embed_dim)
-		self.orientation_sin_projection = nn.Linear(1, cfg.orientation_sin_embed_dim)
-		self.orientation_cos_projection = nn.Linear(1, cfg.orientation_cos_embed_dim)
-		self.size_projection = nn.Linear(1, cfg.size_embed_dim)
+        # Condition embedding: [angle, grade, grade_missing] -> d_model
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(3, cfg.condition_hidden_dim),
+            nn.GELU(),
+            nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
+        )
+        if cfg.use_cond_adaln:
+            self.pre_encoder_adaln = ConditionAdaLayerNorm(cfg.d_model, cfg.d_model, cfg.layer_norm_eps)
+            self.post_encoder_adaln = ConditionAdaLayerNorm(cfg.d_model, cfg.d_model, cfg.layer_norm_eps)
+        else:
+            self.pre_encoder_adaln = None
+            self.post_encoder_adaln = None
 
-		token_input_dim = (
-			cfg.type_embed_dim
-			+ cfg.function_embed_dim
-			+ cfg.role_embed_dim
-			+ cfg.hole_id_embed_dim
-			+ cfg.x_embed_dim
-			+ cfg.y_embed_dim
-			+ cfg.depth_embed_dim
-			+ cfg.orientation_sin_embed_dim
-			+ cfg.orientation_cos_embed_dim
-			+ cfg.size_embed_dim
-		)
+    def _build_condition_embedding(
+        self,
+        *,
+        angle: torch.Tensor,
+        grade: torch.Tensor,
+        grade_missing: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if grade_missing is None:
+            grade_missing = torch.zeros_like(grade, dtype=torch.float32)
+        else:
+            grade_missing = grade_missing.to(torch.float32)
 
-		self.token_projection = nn.Sequential(
-			nn.Linear(token_input_dim, cfg.d_model),
-			nn.GELU(),
-			nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps),
-			nn.Dropout(cfg.dropout),
-		)
+        cond_input = torch.stack(
+            [
+                normalize_minmax(angle, self.cfg.angle_min, self.cfg.angle_max),
+                normalize_minmax(grade, self.cfg.grade_min, self.cfg.grade_max),
+                grade_missing,
+            ],
+            dim=-1,
+        )
+        return self.cond_mlp(cond_input)
 
-		encoder_layer = nn.TransformerEncoderLayer(
-			d_model=cfg.d_model,
-			nhead=cfg.nhead,
-			dim_feedforward=cfg.dim_feedforward,
-			dropout=cfg.dropout,
-			activation="gelu",
-			layer_norm_eps=cfg.layer_norm_eps,
-			batch_first=True,
-		)
-		# Disable nested-tensor path for MPS compatibility.
-		# Some PyTorch/MPS versions do not implement
-		# aten::_nested_tensor_from_mask_left_aligned.
-		try:
-			self.encoder = nn.TransformerEncoder(
-				encoder_layer,
-				num_layers=cfg.num_layers,
-				enable_nested_tensor=False,
-				mask_check=False,
-			)
-		except TypeError:
-			self.encoder = nn.TransformerEncoder(
-				encoder_layer,
-				num_layers=cfg.num_layers,
-				enable_nested_tensor=False,
-			)
-		self.final_norm = nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps)
+    @staticmethod
+    def masked_mean_pool(token_embeddings: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
+        """Mean pool over non-padded tokens.
 
-		# Condition embedding: [angle, grade, grade_missing] -> d_model
-		self.cond_mlp = nn.Sequential(
-			nn.Linear(3, cfg.condition_hidden_dim),
-			nn.GELU(),
-			nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
-		)
-		if cfg.use_cond_adaln:
-			self.pre_encoder_adaln = ConditionAdaLayerNorm(
-				d_model=cfg.d_model,
-				cond_dim=cfg.d_model,
-				eps=cfg.layer_norm_eps,
-			)
-			self.post_encoder_adaln = ConditionAdaLayerNorm(
-				d_model=cfg.d_model,
-				cond_dim=cfg.d_model,
-				eps=cfg.layer_norm_eps,
-			)
-		else:
-			self.pre_encoder_adaln = None
-			self.post_encoder_adaln = None
+        Args:
+            token_embeddings: [B, L, D]
+            padding_mask: [B, L] where True means padded token
+        """
+        valid_mask = (~padding_mask).unsqueeze(-1).to(token_embeddings.dtype)
+        summed = (token_embeddings * valid_mask).sum(dim=1)
+        counts = valid_mask.sum(dim=1).clamp(min=1.0)
+        return summed / counts
 
-	def _project_numeric(self, tensor_2d: torch.Tensor, proj: nn.Linear) -> torch.Tensor:
-		return proj(tensor_2d.unsqueeze(-1).to(torch.float32))
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        angle: torch.Tensor,
+        grade: torch.Tensor,
+        grade_missing: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Encode hold-token sequences.
 
-	@staticmethod
-	def _normalize_minmax(values: torch.Tensor, vmin: float, vmax: float) -> torch.Tensor:
-		denom = max(vmax - vmin, 1e-6)
-		return ((values.to(torch.float32) - vmin) / denom).clamp(0.0, 1.0)
+        Returns:
+            {
+              "token_embeddings": [B, L, d_model],
+              "route_embedding":  [B, d_model],  # mean pooled
+            }
+        """
+        padding_mask = batch["padding_mask"].bool()
+        tokens = self.hold_embedder.embed(batch)
 
-	@staticmethod
-	def _normalize_depth(depth: torch.Tensor) -> torch.Tensor:
-		# depth range: [0, 3]
-		return (depth.to(torch.float32) / 3.0).clamp(0.0, 1.0)
+        cond_emb: torch.Tensor | None = None
+        if self.cfg.use_condition:
+            cond_emb = self._build_condition_embedding(
+                angle=angle, grade=grade, grade_missing=grade_missing
+            )
+            if self.pre_encoder_adaln is not None:
+                tokens = self.pre_encoder_adaln(tokens, cond_emb)
+            else:
+                tokens = tokens + cond_emb.unsqueeze(1)
 
-	@staticmethod
-	def _normalize_size(size: torch.Tensor) -> torch.Tensor:
-		# size range: [2, 5]
-		return ((size.to(torch.float32) - 2.0) / 3.0).clamp(0.0, 1.0)
+        encoded = self.encoder(tokens, src_key_padding_mask=padding_mask)
 
-	def _normalize_x(self, x: torch.Tensor) -> torch.Tensor:
-		return self._normalize_minmax(x, self.cfg.x_min, self.cfg.x_max)
+        if self.post_encoder_adaln is not None and cond_emb is not None:
+            encoded = self.post_encoder_adaln(encoded, cond_emb)
+        encoded = self.final_norm(encoded)
 
-	def _normalize_y(self, y: torch.Tensor) -> torch.Tensor:
-		return self._normalize_minmax(y, self.cfg.y_min, self.cfg.y_max)
-
-	def _normalize_angle(self, angle: torch.Tensor) -> torch.Tensor:
-		return self._normalize_minmax(angle, self.cfg.angle_min, self.cfg.angle_max)
-
-	def _normalize_grade(self, grade: torch.Tensor) -> torch.Tensor:
-		return self._normalize_minmax(grade, self.cfg.grade_min, self.cfg.grade_max)
-
-	def _build_condition_embedding(
-		self,
-		*,
-		angle: torch.Tensor,
-		grade: torch.Tensor,
-		grade_missing: torch.Tensor | None,
-	) -> torch.Tensor:
-		if grade_missing is None:
-			grade_missing = torch.zeros_like(grade, dtype=torch.float32)
-		else:
-			grade_missing = grade_missing.to(torch.float32)
-
-		cond_input = torch.stack(
-			[
-				self._normalize_angle(angle),
-				self._normalize_grade(grade),
-				grade_missing,
-			],
-			dim=-1,
-		)
-		# [B, d_model]
-		return self.cond_mlp(cond_input)
-
-	def build_token_embeddings(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-		type_emb = self.type_embedding(batch["type_encoded_id"])  # [B, L, d_type]
-		function_emb = self.function_embedding(batch["function_encoded_id"])  # [B, L, d_func]
-		role_emb = self.role_embedding(batch["role_encoded_id"])  # [B, L, d_role]
-		hole_emb = self.hole_embedding(batch["hole_encoded_id"])  # [B, L, d_hole]
-
-		x_emb = self.x_embedding(self._normalize_x(batch["x"]))  # [B, L, d_x]
-		y_emb = self.y_embedding(self._normalize_y(batch["y"]))  # [B, L, d_y]
-
-		depth_norm = self._normalize_depth(batch["depth"])
-		size_norm = self._normalize_size(batch["size"])
-
-		depth_emb = self._project_numeric(depth_norm, self.depth_projection)
-		orientation_sin_emb = self._project_numeric(batch["orientation_sin"], self.orientation_sin_projection)
-		orientation_cos_emb = self._project_numeric(batch["orientation_cos"], self.orientation_cos_projection)
-		size_emb = self._project_numeric(size_norm, self.size_projection)
-
-		# "embed all features, then concatenate embeddings"
-		token_concat = torch.cat(
-			[
-				type_emb,
-				function_emb,
-				role_emb,
-				hole_emb,
-				x_emb,
-				y_emb,
-				depth_emb,
-				orientation_sin_emb,
-				orientation_cos_emb,
-				size_emb,
-			],
-			dim=-1,
-		)
-		return self.token_projection(token_concat)
-
-	@staticmethod
-	def masked_mean_pool(token_embeddings: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
-		"""Mean pool over non-padded tokens.
-
-		Args:
-			token_embeddings: [B, L, D]
-			padding_mask: [B, L] where True means padded token
-		"""
-		valid_mask = (~padding_mask).unsqueeze(-1).to(token_embeddings.dtype)  # [B, L, 1]
-		summed = (token_embeddings * valid_mask).sum(dim=1)  # [B, D]
-		counts = valid_mask.sum(dim=1).clamp(min=1.0)  # [B, 1]
-		return summed / counts
-
-	def forward(
-		self,
-		batch: dict[str, torch.Tensor],
-		*,
-		angle: torch.Tensor,
-		grade: torch.Tensor,
-		grade_missing: torch.Tensor | None = None,
-	) -> dict[str, torch.Tensor]:
-		"""Encode hold-token sequences.
-
-		Returns:
-			{
-			  "token_embeddings": [B, L, d_model],
-			  "route_embedding": [B, d_model],  # mean pooled
-			}
-		"""
-		padding_mask = batch["padding_mask"].bool()
-		tokens = self.build_token_embeddings(batch)
-		cond_emb: torch.Tensor | None = None
-		if self.cfg.use_condition:
-			cond_emb = self._build_condition_embedding(
-				angle=angle,
-				grade=grade,
-				grade_missing=grade_missing,
-			)  # [B, d_model]
-
-			if self.pre_encoder_adaln is not None:
-				tokens = self.pre_encoder_adaln(tokens, cond_emb)
-			else:
-				# Backward-compatible fallback path.
-				tokens = tokens + cond_emb.unsqueeze(1)
-		encoded = self.encoder(tokens, src_key_padding_mask=padding_mask)
-		if self.post_encoder_adaln is not None and cond_emb is not None:
-			encoded = self.post_encoder_adaln(encoded, cond_emb)
-		encoded = self.final_norm(encoded)
-		route_embedding = self.masked_mean_pool(encoded, padding_mask)
-		return {"token_embeddings": encoded, "route_embedding": route_embedding}
+        route_embedding = self.masked_mean_pool(encoded, padding_mask)
+        return {"token_embeddings": encoded, "route_embedding": route_embedding}
 
 
 def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-	"""Pad variable-length hold-token samples into a batch.
+    """Pad variable-length hold-token samples into a batch.
 
-	Each sample should be a dict with keys:
-	- type_encoded_id, function_encoded_id, role_encoded_id, hole_encoded_id, x, y, depth, orientation_sin, orientation_cos, size
-	Each value is a 1D tensor of length L_i.
-	"""
-	if not samples:
-		raise ValueError("samples must be non-empty")
+    Each sample is a dict with 1-D tensors of length L_i for these keys:
+    type_encoded_id, function_encoded_id, role_encoded_id, hole_encoded_id,
+    x, y, depth, orientation_sin, orientation_cos, size.
+    """
+    if not samples:
+        raise ValueError("samples must be non-empty")
 
-	feature_keys = [
-		"type_encoded_id",
-		"function_encoded_id",
-		"role_encoded_id",
-		"hole_encoded_id",
-		"x",
-		"y",
-		"depth",
-		"orientation_sin",
-		"orientation_cos",
-		"size",
-	]
+    CATEGORICAL_KEYS = {"type_encoded_id", "function_encoded_id", "role_encoded_id", "hole_encoded_id"}
+    FEATURE_KEYS = [
+        "type_encoded_id", "function_encoded_id", "role_encoded_id", "hole_encoded_id",
+        "x", "y", "depth", "orientation_sin", "orientation_cos", "size",
+    ]
 
-	lengths = [int(sample["type_encoded_id"].shape[0]) for sample in samples]
-	max_len = max(lengths)
-	batch_size = len(samples)
+    lengths = [int(s["type_encoded_id"].shape[0]) for s in samples]
+    max_len = max(lengths)
+    batch_size = len(samples)
 
-	def _pad_1d(tensor: torch.Tensor, target_len: int, pad_value: float = 0.0) -> torch.Tensor:
-		if tensor.shape[0] == target_len:
-			return tensor
-		pad = torch.full((target_len - tensor.shape[0],), pad_value, dtype=tensor.dtype, device=tensor.device)
-		return torch.cat([tensor, pad], dim=0)
+    def _pad_1d(tensor: torch.Tensor, target_len: int) -> torch.Tensor:
+        if tensor.shape[0] == target_len:
+            return tensor
+        pad = torch.zeros(target_len - tensor.shape[0], dtype=tensor.dtype, device=tensor.device)
+        return torch.cat([tensor, pad], dim=0)
 
-	batch: dict[str, torch.Tensor] = {}
-	for key in feature_keys:
-		padded = []
-		for sample in samples:
-			t = sample[key]
-			pad_value = 0 if key in {"type_encoded_id", "function_encoded_id", "role_encoded_id", "hole_encoded_id"} else 0.0
-			padded.append(_pad_1d(t, max_len, pad_value))
-		batch[key] = torch.stack(padded, dim=0)
+    batch: dict[str, torch.Tensor] = {}
+    for key in FEATURE_KEYS:
+        batch[key] = torch.stack([_pad_1d(s[key], max_len) for s in samples], dim=0)
 
-	padding_mask = torch.ones((batch_size, max_len), dtype=torch.bool)
-	for i, length in enumerate(lengths):
-		padding_mask[i, :length] = False
-	batch["padding_mask"] = padding_mask
+    padding_mask = torch.ones((batch_size, max_len), dtype=torch.bool)
+    for i, length in enumerate(lengths):
+        padding_mask[i, :length] = False
+    batch["padding_mask"] = padding_mask
 
-	# enforce dtypes
-	batch["type_encoded_id"] = batch["type_encoded_id"].long()
-	batch["function_encoded_id"] = batch["function_encoded_id"].long()
-	batch["role_encoded_id"] = batch["role_encoded_id"].long()
-	batch["hole_encoded_id"] = batch["hole_encoded_id"].long()
-	for key in ["x", "y", "depth", "orientation_sin", "orientation_cos", "size"]:
-		batch[key] = batch[key].to(torch.float32)
+    for key in CATEGORICAL_KEYS:
+        batch[key] = batch[key].long()
+    for key in ["x", "y", "depth", "orientation_sin", "orientation_cos", "size"]:
+        batch[key] = batch[key].to(torch.float32)
 
-	return batch
+    return batch
 
 
 __all__ = [
-	"RouteVAEEncoderConfig",
-	"ConditionAdaLayerNorm",
-	"ScalarSinusoidalEmbedding",
-	"RouteTransformerEncoder",
-	"collate_hold_token_batch",
+    "RouteVAEEncoderConfig",
+    "RouteTransformerEncoder",
+    "ScalarSinusoidalEmbedding",
+    "collate_hold_token_batch",
 ]
