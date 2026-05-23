@@ -50,17 +50,20 @@ Reasoning:
 - Generative Capabilities: Because the latent space is continuous, we can sample from it to generate new routes as well as cluster existing ones.
 
 ### Challenges Faced
-Posterior collapse: The decoder is often too strong, and often ignores the latent variable, causing the learned latent space to contain little to no information.
 
-Conditional leakage: Angle and grade conditioning can dominate the prediction task, allowing the model to rely on context instead of route-style structure in the latent space.
+Posterior collapse: The decoder is often too strong and ignores the latent variable, causing the learned latent space to contain little to no information.
 
-Latent space quality is hard to evaluate: good reconstruction does not necessarily mean the latent space is useful for clustering or generation.
+Grade/angle entanglement: Even when angle and grade are provided as explicit conditions, the encoder still embeds them into z because it helps the decoder reconstruct routes. This means the dominant axis of the latent space tracks difficulty rather than style — KMeans clustering then just slices the difficulty gradient into bands instead of discovering movement patterns.
+
+Latent space quality is hard to evaluate: good reconstruction loss does not necessarily mean the latent space is useful for clustering or generation.
 
 ### Steps taken
 
-KL Annealing: We gradually increase KL pressure during training so the model first learns to reconstruct routes well, then is pushed toward a smooth, informative latent space. This helps reduce the chance of posterior collapse.
+KL annealing: KL pressure is increased gradually during training so the model first learns to reconstruct routes well, then is pushed toward a smooth, informative latent space. This reduces the chance of posterior collapse. Beta is kept at 0.25 (rather than 1.0) to give z more capacity for style information.
 
-AdaLN: We use Adaptive LayerNorm to condition the model on angle and grade in a more stable way, improving context awareness while helping to reduce angle/grade leakage into the latent space.
+AdaLN conditioning: Adaptive LayerNorm injects angle and grade into the encoder and decoder without routing them through z. This is a necessary but not sufficient step — without additional pressure, the encoder still finds it useful to encode grade/angle into z as well.
+
+Adversarial disentanglement: A small MLP adversary head is trained alongside the model to predict normalised grade and angle from z. A gradient reversal layer (GRL) sits between z and the adversary: the adversary's own weights are updated normally (it learns to predict grade/angle), but the gradient that flows back through z into the encoder is negated. This causes the encoder to actively hide grade/angle information from z, freeing the latent dimensions to capture style instead. The strength of this pressure is controlled by `--grade-adversary-weight` (default 0.5).
 
 ---
 
@@ -94,6 +97,8 @@ Useful options:
 - `--encoder-use-condition`, `--encoder-use-cond-adaln`, `--decoder-use-cond-adaln`
 - `--decoder-z-memory-tokens`, `--grad-clip-norm`, `--seed`
 - `--max-routes`
+- `--grade-adversary-weight` — adversarial disentanglement strength (0 = disabled, 0.5 recommended)
+- `--grade-adversary-alpha` — gradient reversal layer scale factor
 
 Tip: if you change preprocessing filters, rebuild the cache and retrain so the checkpoint vocabularies still match.
 
@@ -132,9 +137,10 @@ Run:
 
 ## Current status
 
-- End-to-end flow is in place (data -> train -> latent analysis -> visualization).
-- PCA and t-SNE views now share a precomputed clustered latent cache.
-- Preprocessing now filters by route quality and number of ascentionists by default.
+- End-to-end flow is in place (data → train → latent analysis → visualization).
+- PCA and t-SNE views share a precomputed clustered latent cache.
+- Preprocessing filters by route quality and ascensionist count by default.
+- Adversarial disentanglement added to prevent grade/angle from dominating the latent space.
 
 ---
 
