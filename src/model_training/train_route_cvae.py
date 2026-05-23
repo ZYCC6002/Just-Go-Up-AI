@@ -25,6 +25,7 @@ from model_training.model_utils import (
     select_device,
 )
 from model_training.route_vae_bottleneck import (
+    GradeAngleAdversaryHead,
     RouteConditionalVAE,
     RouteVAEBottleneck,
     RouteVAEBottleneckConfig,
@@ -41,6 +42,7 @@ class EpochMetrics:
     categorical_loss: float
     numeric_loss: float
     kl_loss: float
+    adversary_loss: float
     num_batches: int
 
 
@@ -96,7 +98,7 @@ def _build_model(
     encoder_use_cond_adaln: bool,
     decoder_use_cond_adaln: bool,
     decoder_z_memory_tokens: int,
-) -> tuple[RouteConditionalVAE, DecoderEOSIds]:
+) -> tuple[RouteConditionalVAE, DecoderEOSIds, dict[str, float]]:
     enc_cfg = vocabs.to_transformer_config()
     enc_cfg.use_condition = encoder_use_condition
     enc_cfg.use_cond_adaln = encoder_use_cond_adaln
@@ -135,7 +137,13 @@ def _build_model(
         role_eos_id=model.decoder.role_eos_id,
         hole_eos_id=model.decoder.hole_eos_id,
     )
-    return model, eos_ids
+    norm_ranges = {
+        "angle_min": float(enc_cfg.angle_min),
+        "angle_max": float(enc_cfg.angle_max),
+        "grade_min": float(enc_cfg.grade_min),
+        "grade_max": float(enc_cfg.grade_max),
+    }
+    return model, eos_ids, norm_ranges
 
 
 def _load_or_build_samples_and_vocabs(args: argparse.Namespace) -> tuple[list[Any], Any]:
@@ -182,6 +190,13 @@ def _compute_batch_losses(
     numeric_weight: float,
     ignore_index: int = -100,
     sample_latent: bool = True,
+    adversary: GradeAngleAdversaryHead | None = None,
+    grade_adversary_weight: float = 0.0,
+    grade_adversary_alpha: float = 1.0,
+    angle_min: float = 0.0,
+    angle_max: float = 70.0,
+    grade_min: float = 10.0,
+    grade_max: float = 33.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     prepared = prepare_cvae_training_batch(
         batch_samples, eos_ids=eos_ids, device=device, ignore_index=ignore_index
@@ -215,11 +230,33 @@ def _compute_batch_losses(
     kl_loss = kl_divergence_loss(out["mu"], out["logvar"], reduction="mean")
     total = categorical_loss + numeric_weight * numeric_loss + kl_beta * kl_loss
 
+    adversary_loss_val = 0.0
+    if adversary is not None and grade_adversary_weight > 0.0:
+        angle_norm = (prepared["angle"] - angle_min) / max(angle_max - angle_min, 1e-6)
+        grade_norm = (prepared["grade"] - grade_min) / max(grade_max - grade_min, 1e-6)
+        angle_norm = angle_norm.clamp(0.0, 1.0)
+        grade_norm = grade_norm.clamp(0.0, 1.0)
+
+        adv_pred = adversary(out["z"], alpha=grade_adversary_alpha)  # [B, 2]
+
+        angle_loss = F.mse_loss(adv_pred[:, 1], angle_norm)
+
+        grade_valid = 1.0 - prepared["grade_missing"]  # [B]
+        grade_mse = (grade_valid * (adv_pred[:, 0] - grade_norm).pow(2)).sum()
+        grade_loss = grade_mse / grade_valid.sum().clamp(min=1.0)
+
+        adversary_loss = (angle_loss + grade_loss) * 0.5
+        adversary_loss_val = float(adversary_loss.detach().cpu())
+        # GRL on z reverses this term's gradient for encoder/bottleneck:
+        # adversary head learns to predict; encoder learns to prevent prediction.
+        total = total + grade_adversary_weight * adversary_loss
+
     stats = {
         "total": float(total.detach().cpu()),
         "categorical": float(categorical_loss.detach().cpu()),
         "numeric": float(numeric_loss.detach().cpu()),
         "kl": float(kl_loss.detach().cpu()),
+        "adversary": adversary_loss_val,
     }
     return total, stats
 
@@ -236,16 +273,28 @@ def _run_epoch(
     numeric_weight: float,
     grad_clip_norm: float,
     sample_latent: bool,
+    adversary: GradeAngleAdversaryHead | None = None,
+    adversary_optimizer: AdamW | None = None,
+    grade_adversary_weight: float = 0.0,
+    grade_adversary_alpha: float = 1.0,
+    angle_min: float = 0.0,
+    angle_max: float = 70.0,
+    grade_min: float = 10.0,
+    grade_max: float = 33.0,
 ) -> EpochMetrics:
     is_train = optimizer is not None
     model.train(is_train)
+    if adversary is not None:
+        adversary.train(is_train)
 
-    loss_sum = cat_sum = num_sum = kl_sum = 0.0
+    loss_sum = cat_sum = num_sum = kl_sum = adv_sum = 0.0
     batches = 0
 
     for batch_samples in iter_minibatches(samples, batch_size, shuffle=is_train):
         if is_train:
             optimizer.zero_grad(set_to_none=True)
+            if adversary_optimizer is not None:
+                adversary_optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(is_train):
             loss, stats = _compute_batch_losses(
@@ -253,25 +302,35 @@ def _run_epoch(
                 device=device, eos_ids=eos_ids,
                 kl_beta=kl_beta, numeric_weight=numeric_weight,
                 sample_latent=sample_latent,
+                adversary=adversary,
+                grade_adversary_weight=grade_adversary_weight,
+                grade_adversary_alpha=grade_adversary_alpha,
+                angle_min=angle_min, angle_max=angle_max,
+                grade_min=grade_min, grade_max=grade_max,
             )
             if is_train:
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
+                if adversary_optimizer is not None:
+                    nn.utils.clip_grad_norm_(adversary.parameters(), grad_clip_norm)
+                    adversary_optimizer.step()
 
         loss_sum += stats["total"]
         cat_sum += stats["categorical"]
         num_sum += stats["numeric"]
         kl_sum += stats["kl"]
+        adv_sum += stats["adversary"]
         batches += 1
 
     if batches == 0:
-        return EpochMetrics(0.0, 0.0, 0.0, 0.0, 0)
+        return EpochMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0)
     return EpochMetrics(
         total_loss=loss_sum / batches,
         categorical_loss=cat_sum / batches,
         numeric_loss=num_sum / batches,
         kl_loss=kl_sum / batches,
+        adversary_loss=adv_sum / batches,
         num_batches=batches,
     )
 
@@ -307,6 +366,10 @@ def main() -> None:
     parser.add_argument("--resume-path", type=str, default=None)
     parser.add_argument("--early-stop-delta", type=float, default=None)
     parser.add_argument("--early-stop-patience", type=int, default=1)
+    parser.add_argument("--grade-adversary-weight", type=float, default=0.0,
+                        help="Weight for grade/angle adversarial disentanglement loss (0 = disabled).")
+    parser.add_argument("--grade-adversary-alpha", type=float, default=1.0,
+                        help="Gradient reversal layer scale factor for the adversary head.")
     args = parser.parse_args()
 
     if args.kl_warmup_epochs is None:
@@ -330,7 +393,7 @@ def main() -> None:
     )
     print(f"Routes: total={len(samples)} train={len(train_samples)} val={len(val_samples)} test={len(test_samples)}")
 
-    model, eos_ids = _build_model(
+    model, eos_ids, norm_ranges = _build_model(
         vocabs, device,
         latent_dim=args.latent_dim,
         encoder_use_condition=args.encoder_use_condition,
@@ -360,6 +423,13 @@ def main() -> None:
         raise ValueError("No training samples remain after max_seq_len filtering.")
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    adversary: GradeAngleAdversaryHead | None = None
+    adversary_optimizer: AdamW | None = None
+    if args.grade_adversary_weight > 0.0:
+        adversary = GradeAngleAdversaryHead(args.latent_dim).to(device)
+        adversary_optimizer = AdamW(adversary.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        print(f"Grade/angle adversary enabled (weight={args.grade_adversary_weight}, alpha={args.grade_adversary_alpha})")
 
     best_val = math.inf
     start_epoch = 1
@@ -397,6 +467,10 @@ def main() -> None:
             batch_size=args.batch_size, kl_beta=kl_beta,
             numeric_weight=args.numeric_weight, grad_clip_norm=args.grad_clip_norm,
             sample_latent=True,
+            adversary=adversary, adversary_optimizer=adversary_optimizer,
+            grade_adversary_weight=args.grade_adversary_weight,
+            grade_adversary_alpha=args.grade_adversary_alpha,
+            **norm_ranges,
         )
         with torch.no_grad():
             val_m = _run_epoch(
@@ -405,6 +479,10 @@ def main() -> None:
                 batch_size=args.batch_size, kl_beta=kl_beta,
                 numeric_weight=args.numeric_weight, grad_clip_norm=args.grad_clip_norm,
                 sample_latent=False,
+                adversary=adversary,
+                grade_adversary_weight=args.grade_adversary_weight,
+                grade_adversary_alpha=args.grade_adversary_alpha,
+                **norm_ranges,
             )
 
         train_recon = train_m.categorical_loss + args.numeric_weight * train_m.numeric_loss
@@ -412,10 +490,15 @@ def main() -> None:
         train_wkl = kl_beta * train_m.kl_loss
         val_wkl = kl_beta * val_m.kl_loss
 
+        adv_str = (
+            f" adv={train_m.adversary_loss:.4f}"
+            if args.grade_adversary_weight > 0.0
+            else ""
+        )
         print(
             f"Epoch {epoch:03d} | kl_beta={kl_beta:.6f} "
             f"train total={train_m.total_loss:.4f} recon={train_recon:.4f} w_kl={train_wkl:.4f} "
-            f"cat={train_m.categorical_loss:.4f} num={train_m.numeric_loss:.4f} kl={train_m.kl_loss:.4f} | "
+            f"cat={train_m.categorical_loss:.4f} num={train_m.numeric_loss:.4f} kl={train_m.kl_loss:.4f}{adv_str} | "
             f"val total={val_m.total_loss:.4f} recon={val_recon:.4f} w_kl={val_wkl:.4f} "
             f"cat={val_m.categorical_loss:.4f} num={val_m.numeric_loss:.4f} kl={val_m.kl_loss:.4f}"
         )
@@ -480,6 +563,10 @@ def main() -> None:
             batch_size=args.batch_size, kl_beta=args.kl_beta,
             numeric_weight=args.numeric_weight, grad_clip_norm=args.grad_clip_norm,
             sample_latent=False,
+            adversary=adversary,
+            grade_adversary_weight=args.grade_adversary_weight,
+            grade_adversary_alpha=args.grade_adversary_alpha,
+            **norm_ranges,
         )
     test_recon = test_m.categorical_loss + args.numeric_weight * test_m.numeric_loss
     test_wkl = args.kl_beta * test_m.kl_loss

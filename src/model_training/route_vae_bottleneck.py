@@ -10,6 +10,50 @@ from .route_vae_decoder import RouteTransformerDecoder
 from .route_vae_encoder import RouteTransformerEncoder
 
 
+class _GradientReversal(torch.autograd.Function):
+    """Identity in the forward pass; negates and scales gradient in the backward pass."""
+
+    @staticmethod
+    def forward(ctx: torch.autograd.function.FunctionCtx, x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(alpha)
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (alpha,) = ctx.saved_tensors
+        return -alpha * grad_output, None
+
+
+class GradeAngleAdversaryHead(nn.Module):
+    """Predicts normalised grade and angle from z via a gradient reversal layer.
+
+    Forward outputs [B, 2] predictions in [0, 1] for [grade, angle].
+    The gradient reversal layer causes the encoder/bottleneck to learn z
+    representations that are *not* predictive of grade/angle, disentangling
+    style from difficulty.
+    """
+
+    def __init__(self, latent_dim: int, hidden_dim: int = 64) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, z: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+        """Args:
+            z: latent vector [B, latent_dim]
+            alpha: GRL scale (ramp up during training to stabilise early epochs)
+        Returns:
+            [B, 2] predictions: [:, 0] = grade (normalised), [:, 1] = angle (normalised)
+        """
+        alpha_t = torch.tensor(alpha, dtype=z.dtype, device=z.device)
+        z_r = _GradientReversal.apply(z, alpha_t)
+        return self.mlp(z_r)
+
+
 @dataclass
 class RouteVAEBottleneckConfig:
 	"""Configuration for VAE bottleneck between encoder and decoder."""
@@ -127,6 +171,7 @@ class RouteConditionalVAE(nn.Module):
 
 
 __all__ = [
+	"GradeAngleAdversaryHead",
 	"RouteVAEBottleneckConfig",
 	"RouteVAEBottleneck",
 	"RouteConditionalVAE",
