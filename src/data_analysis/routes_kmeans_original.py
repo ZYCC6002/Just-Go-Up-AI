@@ -105,11 +105,16 @@ def _filter_samples_by_grade_angle(
 
     if min_grade is not None or max_grade is not None:
         non_missing = ~np.isnan(grades)
+        # Use floor so that integer grade filters (e.g. --min-grade 22 --max-grade 22)
+        # capture all routes in that grade band.  Kilter grades are stored as
+        # floating-point community averages (e.g. 22.013, 22.94 for V6), so an
+        # exact float comparison would match almost nothing.
+        grade_band = np.floor(grades)
         in_range = np.ones(len(samples), dtype=bool)
         if min_grade is not None:
-            in_range &= grades >= float(min_grade)
+            in_range &= grade_band >= float(min_grade)
         if max_grade is not None:
-            in_range &= grades <= float(max_grade)
+            in_range &= grade_band <= float(max_grade)
         if include_ungraded:
             mask &= (~non_missing) | (non_missing & in_range)
         else:
