@@ -104,13 +104,33 @@ def kl_divergence_loss(
 	logvar: torch.Tensor,
 	*,
 	reduction: Literal["mean", "sum", "none"] = "mean",
+	free_bits: float = 0.0,
 ) -> torch.Tensor:
 	"""KL divergence to N(0, I) for diagonal Gaussian posterior.
 
 	Per sample KL:
 	  KL(q(z|x) || p(z)) = -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
+
+	Args:
+		mu:        Mean of the posterior [B, D].
+		logvar:    Log-variance of the posterior [B, D].
+		reduction: How to reduce over the batch dimension.
+		free_bits: Minimum KL per latent dimension (nats). When > 0, each
+		           dimension's KL is clamped from below at this threshold before
+		           summing. This prevents any dimension from fully collapsing to
+		           the prior and forces the encoder to keep every z dimension
+		           active. Recommended value: 0.5 nats/dim.
 	"""
-	kl_per_sample = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
+	# Per-sample, per-dimension KL: [B, D]
+	kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+
+	if free_bits > 0.0:
+		# Clamp each dimension's KL at the free-bits floor before summing.
+		# Dimensions that try to collapse below `free_bits` nats are forced
+		# to stay active; dimensions above the floor are unaffected.
+		kl_per_dim = kl_per_dim.clamp(min=free_bits)
+
+	kl_per_sample = kl_per_dim.sum(dim=-1)
 
 	if reduction == "none":
 		return kl_per_sample

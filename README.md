@@ -51,19 +51,21 @@ Reasoning:
 
 ### Challenges Faced
 
-Posterior collapse: The decoder is often too strong and ignores the latent variable, causing the learned latent space to contain little to no information.
+Posterior collapse: The decoder can reconstruct routes from the angle/grade AdaLN condition alone without reading z via cross-attention. Once it discovers this shortcut, z receives no gradient signal and collapses to the prior N(0, I) — the latent space becomes pure noise.
 
-Grade/angle entanglement: Even when angle and grade are provided as explicit conditions, the encoder still embeds them into z because it helps the decoder reconstruct routes. This means the dominant axis of the latent space tracks difficulty rather than style — KMeans clustering then just slices the difficulty gradient into bands instead of discovering movement patterns.
+Grade/angle entanglement: Even when angle and grade are provided as explicit conditions, the encoder can still embed them into z because it improves reconstruction. This means the dominant axis of the latent space tracks difficulty rather than style — KMeans clustering then just slices the difficulty gradient into bands instead of discovering movement patterns.
 
 Latent space quality is hard to evaluate: good reconstruction loss does not necessarily mean the latent space is useful for clustering or generation.
 
 ### Steps taken
 
-KL annealing: KL pressure is increased gradually during training so the model first learns to reconstruct routes well, then is pushed toward a smooth, informative latent space. This reduces the chance of posterior collapse. Beta is kept at 0.25 (rather than 1.0) to give z more capacity for style information.
+KL annealing: KL pressure is increased gradually during training so the model first learns to reconstruct routes well, then is pushed toward a smooth, informative latent space. Beta is kept at 0.25 (rather than 1.0) to give z more capacity for style information.
 
-AdaLN conditioning: Adaptive LayerNorm injects angle and grade into the encoder and decoder without routing them through z. This is a necessary but not sufficient step — without additional pressure, the encoder still finds it useful to encode grade/angle into z as well.
+Free bits (minimum KL per dimension): Each latent dimension's KL is clamped from below at a minimum threshold (λ = 0.5 nats) before summing. This prevents any dimension from fully collapsing to the prior — the encoder is forced to keep every z dimension active. With latent_dim=16 and λ=0.5, z must carry at least 8 nats of information, making the collapsed solution infeasible. Controlled by `--free-bits` (default 0.5).
 
-Adversarial disentanglement: A small MLP adversary head is trained alongside the model to predict normalised grade and angle from z. A gradient reversal layer (GRL) sits between z and the adversary: the adversary's own weights are updated normally (it learns to predict grade/angle), but the gradient that flows back through z into the encoder is negated. This causes the encoder to actively hide grade/angle information from z, freeing the latent dimensions to capture style instead. The strength of this pressure is controlled by `--grade-adversary-weight` (default 0.5).
+AdaLN conditioning: Adaptive LayerNorm injects angle and grade into the decoder without routing them through z. This is a necessary but not sufficient step — without free bits, the encoder still finds it useful to collapse z.
+
+Adversarial disentanglement: A small MLP adversary head is trained alongside the model to predict normalised grade and angle from z. A gradient reversal layer (GRL) sits between z and the adversary: the adversary's own weights are updated normally (it learns to predict grade/angle), but the gradient that flows back through z into the encoder is negated. This causes the encoder to actively hide grade/angle information from z, freeing the latent dimensions to capture style instead. Free bits are required for this to be effective — without them, z collapses to noise before the adversary can apply any pressure. Controlled by `--grade-adversary-weight` (default 0.5).
 
 ---
 
@@ -99,6 +101,7 @@ Useful options:
 - `--max-routes`
 - `--grade-adversary-weight` — adversarial disentanglement strength (0 = disabled, 0.5 recommended)
 - `--grade-adversary-alpha` — gradient reversal layer scale factor
+- `--free-bits` — minimum KL per latent dimension in nats (0 = disabled, 0.5 recommended)
 
 Tip: if you change preprocessing filters, rebuild the cache and retrain so the checkpoint vocabularies still match.
 
@@ -140,7 +143,8 @@ Run:
 - End-to-end flow is in place (data → train → latent analysis → visualization).
 - PCA and t-SNE views share a precomputed clustered latent cache.
 - Preprocessing filters by route quality and ascensionist count by default.
-- Adversarial disentanglement added to prevent grade/angle from dominating the latent space.
+- Adversarial disentanglement (GRL) added to prevent grade/angle from dominating z.
+- Free bits (λ=0.5 nats/dim) added to prevent posterior collapse.
 
 ---
 

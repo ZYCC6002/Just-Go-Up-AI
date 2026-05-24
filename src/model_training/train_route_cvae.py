@@ -197,6 +197,7 @@ def _compute_batch_losses(
     angle_max: float = 70.0,
     grade_min: float = 10.0,
     grade_max: float = 33.0,
+    free_bits: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     prepared = prepare_cvae_training_batch(
         batch_samples, eos_ids=eos_ids, device=device, ignore_index=ignore_index
@@ -227,7 +228,7 @@ def _compute_batch_losses(
         for feat in ("x", "y", "depth", "orientation_sin", "orientation_cos", "size")
     )
 
-    kl_loss = kl_divergence_loss(out["mu"], out["logvar"], reduction="mean")
+    kl_loss = kl_divergence_loss(out["mu"], out["logvar"], reduction="mean", free_bits=free_bits)
     total = categorical_loss + numeric_weight * numeric_loss + kl_beta * kl_loss
 
     adversary_loss_val = 0.0
@@ -281,6 +282,7 @@ def _run_epoch(
     angle_max: float = 70.0,
     grade_min: float = 10.0,
     grade_max: float = 33.0,
+    free_bits: float = 0.0,
 ) -> EpochMetrics:
     is_train = optimizer is not None
     model.train(is_train)
@@ -307,6 +309,7 @@ def _run_epoch(
                 grade_adversary_alpha=grade_adversary_alpha,
                 angle_min=angle_min, angle_max=angle_max,
                 grade_min=grade_min, grade_max=grade_max,
+                free_bits=free_bits,
             )
             if is_train:
                 loss.backward()
@@ -370,6 +373,10 @@ def main() -> None:
                         help="Weight for grade/angle adversarial disentanglement loss (0 = disabled).")
     parser.add_argument("--grade-adversary-alpha", type=float, default=1.0,
                         help="Gradient reversal layer scale factor for the adversary head.")
+    parser.add_argument("--free-bits", type=float, default=0.0,
+                        help="Minimum KL per latent dimension (nats). Prevents posterior collapse by "
+                             "clamping each dimension's KL from below before summing. "
+                             "Recommended: 0.5 nats/dim.")
     args = parser.parse_args()
 
     if args.kl_warmup_epochs is None:
@@ -470,6 +477,7 @@ def main() -> None:
             adversary=adversary, adversary_optimizer=adversary_optimizer,
             grade_adversary_weight=args.grade_adversary_weight,
             grade_adversary_alpha=args.grade_adversary_alpha,
+            free_bits=args.free_bits,
             **norm_ranges,
         )
         with torch.no_grad():
@@ -482,6 +490,7 @@ def main() -> None:
                 adversary=adversary,
                 grade_adversary_weight=args.grade_adversary_weight,
                 grade_adversary_alpha=args.grade_adversary_alpha,
+                free_bits=args.free_bits,
                 **norm_ranges,
             )
 
@@ -566,6 +575,7 @@ def main() -> None:
             adversary=adversary,
             grade_adversary_weight=args.grade_adversary_weight,
             grade_adversary_alpha=args.grade_adversary_alpha,
+            free_bits=args.free_bits,
             **norm_ranges,
         )
     test_recon = test_m.categorical_loss + args.numeric_weight * test_m.numeric_loss

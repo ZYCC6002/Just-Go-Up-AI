@@ -118,10 +118,14 @@ class RouteTransformerDecoder(nn.Module):
         )
 
         if cfg.use_cond_adaln:
-            self.pre_decoder_adaln = ConditionAdaLayerNorm(cfg.d_model, cfg.d_model, cfg.layer_norm_eps)
+            # Only post-decoder AdaLN is kept. A pre-decoder AdaLN was previously
+            # used here but was removed: injecting a strong angle/grade signal
+            # BEFORE the transformer allowed the decoder to satisfy reconstruction
+            # without ever attending to z, causing posterior collapse. A single
+            # post-decoder modulation retains grade/angle conditioning while
+            # significantly weakening this shortcut.
             self.post_decoder_adaln = ConditionAdaLayerNorm(cfg.d_model, cfg.d_model, cfg.layer_norm_eps)
         else:
-            self.pre_decoder_adaln = None
             self.post_decoder_adaln = None
 
         decoder_layer = nn.TransformerDecoderLayer(
@@ -223,9 +227,6 @@ class RouteTransformerDecoder(nn.Module):
 
         memory = self._build_condition_memory(z=z)
         cond_emb = self._build_condition_embedding(angle=angle, grade=grade, grade_missing=grade_missing)
-
-        if self.pre_decoder_adaln is not None:
-            tgt = self.pre_decoder_adaln(tgt, cond_emb)
 
         tgt_mask = self._causal_mask(tgt.shape[1], tgt.device)
         decoded = self.decoder(
