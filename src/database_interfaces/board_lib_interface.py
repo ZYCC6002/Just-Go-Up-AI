@@ -419,6 +419,37 @@ class BoardLibInterface:
 			climb_uuid.holds = holds
 		return holds
 
+	def get_climb_stats(self, climb_uuid: str) -> dict[str, Any]:
+		"""Return quality_average, ascensionist_count, and FA info for a climb UUID.
+
+		Returns a dict with keys:
+		  quality_average     – float in [0, 4] or None
+		  ascensionist_count  – int or None
+		  fa_username         – str or None (first-ascent setter)
+		  fa_at               – str or None (first-ascent timestamp)
+		"""
+		rows = self.fetchall(
+			"SELECT quality_average, ascensionist_count, fa_username, fa_at, difficulty_average "
+			"FROM climb_stats WHERE climb_uuid = ?",
+			[climb_uuid],
+		)
+		if not rows:
+			return {
+				"quality_average": None,
+				"ascensionist_count": None,
+				"fa_username": None,
+				"fa_at": None,
+				"difficulty_average": None,
+			}
+		quality, ascents, fa_user, fa_at, difficulty = rows[0]
+		return {
+			"quality_average": float(quality) if quality is not None else None,
+			"ascensionist_count": int(ascents) if ascents is not None else None,
+			"fa_username": str(fa_user) if fa_user else None,
+			"fa_at": str(fa_at) if fa_at else None,
+			"difficulty_average": float(difficulty) if difficulty is not None else None,
+		}
+
 	def import_external_hold_metadata(
 		self,
 		csv_path: str | Path,

@@ -118,7 +118,7 @@ def enable_click_to_visualize(*, ax: Axes, fig: Figure, scatter, samples: list[R
 		sample = samples[idx]
 		print(f"Opening route visualizer for: {sample.name} ({sample.uuid})")
 		try:
-			visualize_route(sample.name)
+			visualize_route(sample.name, sample=sample)
 		except Exception as exc:
 			print(f"Failed to visualize route '{sample.name}': {exc}")
 
