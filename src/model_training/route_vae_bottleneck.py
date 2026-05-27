@@ -24,30 +24,54 @@ class _GradientReversal(torch.autograd.Function):
         return -alpha * grad_output, None
 
 
-class GradeAngleAdversaryHead(nn.Module):
-    """Predicts normalised grade and angle from z via a gradient reversal layer.
+# Listed angles (degrees) for product_id=1 (Kilter Board Original).
+# Sourced from the products_angles table: SELECT angle FROM products_angles WHERE product_id=1.
+KILTER_LISTED_ANGLES: list[float] = [0., 5., 10., 15., 20., 25., 30., 35., 40., 45., 50., 55., 60., 65., 70.]
 
-    Forward outputs [B, 2] predictions in [0, 1] for [grade, angle].
-    The gradient reversal layer causes the encoder/bottleneck to learn z
-    representations that are *not* predictive of grade/angle, disentangling
-    style from difficulty.
+
+class PerAngleGradeAdversaryHead(nn.Module):
+    """Predicts normalised grade at every listed wall angle from z via a GRL.
+
+    Replaces the old GradeAngleAdversaryHead which predicted a single (grade,
+    angle) pair.  Key changes:
+    - Output shape [B, num_listed_angles] instead of [B, 2].
+    - Predicts grade only (not angle): since the encoder never sees angle as
+      input, angle is structurally absent from z — predicting it is redundant.
+    - Supplies up to 15× more supervision per route, applying much stronger
+      pressure to push grade information out of z across the full angle range.
+
+    Loss is computed only over angles with known grade data (NaN elsewhere),
+    so routes with fewer angle variants contribute less signal per step but are
+    not penalised.
+
+    Args:
+        latent_dim:         Dimension of z.
+        num_listed_angles:  Number of output heads (one per listed angle).
+                            Default 15 matches Kilter Board Original.
+        hidden_dim:         Hidden layer width.
     """
 
-    def __init__(self, latent_dim: int, hidden_dim: int = 64) -> None:
+    def __init__(
+        self,
+        latent_dim: int,
+        num_listed_angles: int = len(KILTER_LISTED_ANGLES),
+        hidden_dim: int = 64,
+    ) -> None:
         super().__init__()
+        self.num_listed_angles = num_listed_angles
         self.mlp = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 2),
+            nn.Linear(hidden_dim, num_listed_angles),
             nn.Sigmoid(),
         )
 
     def forward(self, z: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
         """Args:
-            z: latent vector [B, latent_dim]
-            alpha: GRL scale (ramp up during training to stabilise early epochs)
+            z:     latent vector [B, latent_dim]
+            alpha: GRL scale factor (ramp during training to stabilise early epochs)
         Returns:
-            [B, 2] predictions: [:, 0] = grade (normalised), [:, 1] = angle (normalised)
+            [B, num_listed_angles] predicted grades in [0, 1]
         """
         alpha_t = torch.tensor(alpha, dtype=z.dtype, device=z.device)
         z_r = _GradientReversal.apply(z, alpha_t)
@@ -191,7 +215,8 @@ class RouteConditionalVAE(nn.Module):
 
 
 __all__ = [
-	"GradeAngleAdversaryHead",
+	"KILTER_LISTED_ANGLES",
+	"PerAngleGradeAdversaryHead",
 	"RouteVAEBottleneckConfig",
 	"RouteVAEBottleneck",
 	"RouteConditionalVAE",

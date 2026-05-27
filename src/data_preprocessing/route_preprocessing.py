@@ -9,11 +9,19 @@ import random
 import numpy as np
 import torch
 
-from database_interfaces.board_lib_interface import BoardLibInterface, HoldPlacement
+from database_interfaces.board_lib_interface import BoardLibInterface, Climb, HoldPlacement
 from model_training.route_vae_encoder import RouteVAEEncoderConfig
 
 
 UNKNOWN_TOKEN = "<UNK>"
+
+# Fallback coordinate spans used when select_product_size cannot determine the board
+# size for a specific route (e.g. empty set_ids or no fitting product_size row).
+# Measured from the holes table for product_id=1 (Kilter Board Original):
+#   SELECT MIN(x), MAX(x), MIN(y), MAX(y) FROM holes WHERE product_id=1
+#   → x ∈ [-20, 164] (span 184), y ∈ [4, 176] (span 172).
+_FALLBACK_BOARD_X_SPAN: float = 184.0
+_FALLBACK_BOARD_Y_SPAN: float = 172.0
 
 
 @dataclass
@@ -76,6 +84,14 @@ class RouteSample:
     num_holds: int
     metadata_coverage: float
     tokens: dict[str, torch.Tensor]
+    # All (angle → difficulty_average) pairs from climb_stats that passed quality/
+    # ascensionist filters for this route.  Used by the per-angle grade adversary to
+    # supply supervision signals at every angle where community grade data exists.
+    angle_grades: dict[float, float] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.angle_grades is None:
+            self.angle_grades = {}
 
 
 def _build_vocab(items: Iterable[Any], *, include_unknown: bool) -> CategoricalVocab:
@@ -133,7 +149,13 @@ def _is_foot_hold(tok: RawHoldToken) -> bool:
     return "foot" in (tok.role_name or "").lower()
 
 
-def _encode_route_tokens(route_tokens: list[RawHoldToken], vocabs: RouteVocabBundle) -> dict[str, torch.Tensor]:
+def _encode_route_tokens(
+    route_tokens: list[RawHoldToken],
+    vocabs: RouteVocabBundle,
+    *,
+    board_x_span: float = _FALLBACK_BOARD_X_SPAN,
+    board_y_span: float = _FALLBACK_BOARD_Y_SPAN,
+) -> dict[str, torch.Tensor]:
     # --- Sort holds bottom-to-top (ascending y = canonical climbing sequence) ---
     route_tokens = sorted(route_tokens, key=lambda t: t.y)
 
@@ -150,17 +172,26 @@ def _encode_route_tokens(route_tokens: list[RawHoldToken], vocabs: RouteVocabBun
     xs = [tok.x for tok in route_tokens]
     ys = [tok.y for tok in route_tokens]
 
+    # Board diagonal — used as the reference scale for distance-based features.
+    # Half-diagonal (~"cross-board move") serves as the upper bound for mean_move_norm.
+    board_diag = math.sqrt(board_x_span ** 2 + board_y_span ** 2)
+
     # --- Delta features (move from previous hold in y-sorted sequence) ---
-    delta_x_prev = [0.0] + [xs[i] - xs[i - 1] for i in range(1, len(xs))]
-    delta_y_prev = [0.0] + [ys[i] - ys[i - 1] for i in range(1, len(ys))]
+    # Normalised by board span so values are in roughly [-1, 1] / [0, 1] regardless
+    # of which physical board size a route was set on.
+    delta_x_raw = [0.0] + [xs[i] - xs[i - 1] for i in range(1, len(xs))]
+    delta_y_raw = [0.0] + [ys[i] - ys[i - 1] for i in range(1, len(ys))]
+    delta_x_prev = [dx / board_x_span for dx in delta_x_raw]
+    delta_y_prev = [dy / board_y_span for dy in delta_y_raw]
 
     # --- Nearest-neighbour distance (encoder-only; requires full sequence) ---
+    # Normalised by board diagonal → [0, 1] for any realistic board size.
     if len(xs) >= 2:
         coords = np.array(list(zip(xs, ys)), dtype=np.float32)
         diffs = coords[:, None, :] - coords[None, :, :]   # [N, N, 2]
         dists_mat = np.sqrt((diffs ** 2).sum(axis=-1))     # [N, N]
         np.fill_diagonal(dists_mat, np.inf)
-        dist_to_nearest = dists_mat.min(axis=1).tolist()
+        dist_to_nearest = (dists_mat.min(axis=1) / board_diag).tolist()
     else:
         dist_to_nearest = [0.0] * len(route_tokens)
 
@@ -168,8 +199,13 @@ def _encode_route_tokens(route_tokens: list[RawHoldToken], vocabs: RouteVocabBun
     n_total = max(len(route_tokens), 1)
     xs_arr = np.array(xs, dtype=np.float32)
     ys_arr = np.array(ys, dtype=np.float32)
-    x_std = float(xs_arr.std()) if len(xs_arr) > 1 else 0.0
-    y_std = float(ys_arr.std()) if len(ys_arr) > 1 else 0.0
+    # Normalise by the board coordinate span so shape descriptor features are
+    # on the same [0, ~0.5] scale as the fraction-based features.
+    # board_x_span / board_y_span come from select_product_size (the smallest
+    # product_size that fits this route's hold extents), falling back to the
+    # global hole span for product_id=1 if the lookup fails.
+    x_std = (float(xs_arr.std()) if len(xs_arr) > 1 else 0.0) / board_x_span
+    y_std = (float(ys_arr.std()) if len(ys_arr) > 1 else 0.0) / board_y_span
 
     # Use role_name to count foot holds (role is how the hold is used in this route)
     n_foot = sum(1 for t in route_tokens if _is_foot_hold(t))
@@ -194,7 +230,9 @@ def _encode_route_tokens(route_tokens: list[RawHoldToken], vocabs: RouteVocabBun
         mean_move = float(hc_pairwise[np.triu_indices(len(hand_coords), k=1)].mean())
     else:
         mean_move = 0.0
-    mean_move_norm = min(mean_move / 100.0, 1.0)  # 100 board units ≈ "very large move"
+    # Normalise by half the board diagonal: a move spanning half the diagonal is
+    # already a very large reach regardless of board size.  Clamp at 1.0.
+    mean_move_norm = min(mean_move / (board_diag * 0.5), 1.0)
 
     shape_desc = torch.tensor(
         [x_std, y_std, foot_fraction, hand_count_norm,
@@ -273,9 +311,11 @@ def _load_raw_routes(
     )
 
     # Pass 1 — row-level filters and UUID deduplication (no hold loading).
-    # Cache product_id checks so each UUID is looked up at most once.
-    _product_id_ok: dict[str, bool] = {}
-    best_per_uuid: dict[str, tuple] = {}  # uuid_str -> (score, row_tuple)
+    # Cache Climb objects so each UUID is fetched from the DB at most once
+    # (used for product_id check here and for board-span lookup in Pass 2).
+    _climb_cache: dict[str, Climb | None] = {}
+    best_per_uuid: dict[str, tuple] = {}           # uuid_str -> (score, row_tuple)
+    angle_grades_per_uuid: dict[str, dict[float, float]] = {}  # uuid_str -> {angle: grade}
 
     for row in rows:
         uuid, name, layout_id, angle, is_listed, difficulty_average, quality_average, ascensionist_count = row
@@ -289,11 +329,17 @@ def _load_raw_routes(
             continue
 
         uuid_str = str(uuid)
-        if uuid_str not in _product_id_ok:
-            climb = db.get_climb(uuid_str)
-            _product_id_ok[uuid_str] = climb is not None and climb.product_id == required_product_id
-        if not _product_id_ok[uuid_str]:
+        if uuid_str not in _climb_cache:
+            _climb_cache[uuid_str] = db.get_climb(uuid_str)
+        climb = _climb_cache[uuid_str]
+        if climb is None or climb.product_id != required_product_id:
             continue
+
+        # Collect all (angle → grade) pairs that pass quality filters.
+        # The per-angle grade adversary uses these as supervision targets.
+        if uuid_str not in angle_grades_per_uuid:
+            angle_grades_per_uuid[uuid_str] = {}
+        angle_grades_per_uuid[uuid_str][float(angle)] = float(difficulty_average)
 
         score = float(quality_average) * int(ascensionist_count)
         if uuid_str not in best_per_uuid or score > best_per_uuid[uuid_str][0]:
@@ -319,12 +365,37 @@ def _load_raw_routes(
         if require_full_metadata and coverage < 1.0:
             continue
 
+        # Resolve the board size that fits this route's hold extents.
+        # select_product_size chooses the smallest product_size whose edges
+        # fully contain the route and that has images for all required sets.
+        board_x_span = _FALLBACK_BOARD_X_SPAN
+        board_y_span = _FALLBACK_BOARD_Y_SPAN
+        climb = _climb_cache.get(uuid_str)
+        if climb is not None and climb.product_id is not None:
+            try:
+                set_ids = db.decode_hsm_set_ids(int(climb.layout_id), int(climb.hsm or 0))
+                if set_ids:
+                    _, board_edges = db.select_product_size(
+                        int(climb.layout_id),
+                        set_ids,
+                        climb.edges,
+                        product_id=int(climb.product_id),
+                    )
+                    # board_edges = (edge_left, edge_right, edge_bottom, edge_top)
+                    board_x_span = float(board_edges[1] - board_edges[0])
+                    board_y_span = float(board_edges[3] - board_edges[2])
+            except (ValueError, Exception):
+                pass  # keep fallback constants; not worth skipping the route
+
         climb_info = {
             "uuid": uuid_str,
             "name": str(name),
             "layout_id": int(layout_id),
             "angle": float(angle),
             "grade": float(difficulty_average),
+            "angle_grades": angle_grades_per_uuid.get(uuid_str, {}),
+            "board_x_span": board_x_span,
+            "board_y_span": board_y_span,
         }
         raw_routes.append((climb_info, tokens, coverage))
 
@@ -390,7 +461,12 @@ def build_training_samples_from_db(
 
     samples: list[RouteSample] = []
     for climb_info, tokens, coverage in raw_routes:
-        encoded = _encode_route_tokens(tokens, vocabs)
+        encoded = _encode_route_tokens(
+            tokens,
+            vocabs,
+            board_x_span=climb_info.get("board_x_span", _FALLBACK_BOARD_X_SPAN),
+            board_y_span=climb_info.get("board_y_span", _FALLBACK_BOARD_Y_SPAN),
+        )
         samples.append(
             RouteSample(
                 uuid=climb_info["uuid"],
@@ -401,6 +477,7 @@ def build_training_samples_from_db(
                 num_holds=len(tokens),
                 metadata_coverage=coverage,
                 tokens=encoded,
+                angle_grades=climb_info.get("angle_grades", {}),
             )
         )
 

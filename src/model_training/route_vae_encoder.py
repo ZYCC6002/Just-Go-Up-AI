@@ -53,11 +53,14 @@ class RouteVAEEncoderConfig:
     use_condition: bool = True
     use_cond_adaln: bool = True
 
-    # Input normalization ranges
-    x_min: float = 0.0
-    x_max: float = 140.0
-    y_min: float = 0.0
-    y_max: float = 160.0
+    # Input normalization ranges — derived from actual hole positions for
+    # product_id=1 (Kilter Board Original):
+    #   SELECT MIN(x), MAX(x), MIN(y), MAX(y) FROM holes WHERE product_id=1
+    #   → x ∈ [-20, 164], y ∈ [4, 176]
+    x_min: float = -20.0
+    x_max: float = 164.0
+    y_min: float = 4.0
+    y_max: float = 176.0
     angle_min: float = 0.0
     angle_max: float = 70.0
     grade_min: float = 10.0
