@@ -243,6 +243,15 @@ def _load_raw_routes(
     - raw hold tokens
     - metadata coverage ratio [0,1]
     - only climbs on product_id=1 (Kilter Board Original) are kept
+
+    The DB join (climbs × climb_stats) produces one row per (UUID, angle).
+    Since the encoder does not see angle, all angle variants of the same route
+    produce identical z vectors — keeping them inflates training data with
+    redundant examples and biases gradient updates toward popular routes.
+    This function deduplicates to one entry per UUID by retaining the
+    (UUID, angle) pair with the highest quality_average × ascensionist_count.
+    Hold tokens are loaded only for the selected row, not for every angle
+    variant, so this is also more efficient than loading all duplicates.
     """
     required_product_id = 1
 
@@ -263,10 +272,13 @@ def _load_raw_routes(
         """
     )
 
-    raw_routes: list[tuple[dict[str, Any], list[RawHoldToken], float]] = []
-    for uuid, name, layout_id, angle, is_listed, difficulty_average, quality_average, ascensionist_count in rows:
-        # Require conditioning features to be present.
-        # Do not coerce missing angle/grade to defaults.
+    # Pass 1 — row-level filters and UUID deduplication (no hold loading).
+    # Cache product_id checks so each UUID is looked up at most once.
+    _product_id_ok: dict[str, bool] = {}
+    best_per_uuid: dict[str, tuple] = {}  # uuid_str -> (score, row_tuple)
+
+    for row in rows:
+        uuid, name, layout_id, angle, is_listed, difficulty_average, quality_average, ascensionist_count = row
         if public_only and int(is_listed or 0) != 1:
             continue
         if angle is None or difficulty_average is None:
@@ -276,12 +288,24 @@ def _load_raw_routes(
         if ascensionist_count is None or int(ascensionist_count) < int(min_ascensionist_count):
             continue
 
-        climb = db.get_climb(str(uuid))
-        if climb is None or climb.product_id != required_product_id:
+        uuid_str = str(uuid)
+        if uuid_str not in _product_id_ok:
+            climb = db.get_climb(uuid_str)
+            _product_id_ok[uuid_str] = climb is not None and climb.product_id == required_product_id
+        if not _product_id_ok[uuid_str]:
             continue
 
+        score = float(quality_average) * int(ascensionist_count)
+        if uuid_str not in best_per_uuid or score > best_per_uuid[uuid_str][0]:
+            best_per_uuid[uuid_str] = (score, row)
+
+    # Pass 2 — load hold tokens only for the selected (best) row per UUID.
+    raw_routes: list[tuple[dict[str, Any], list[RawHoldToken], float]] = []
+    for uuid_str, (_score, row) in best_per_uuid.items():
+        uuid, name, layout_id, angle, is_listed, difficulty_average, quality_average, ascensionist_count = row
+
         holds = db.get_hold_positions_for_climb(
-            str(uuid),
+            uuid_str,
             include_metadata=True,
             metadata_source=metadata_source,
             metadata_product_id=metadata_product_id,
@@ -296,7 +320,7 @@ def _load_raw_routes(
             continue
 
         climb_info = {
-            "uuid": str(uuid),
+            "uuid": uuid_str,
             "name": str(name),
             "layout_id": int(layout_id),
             "angle": float(angle),

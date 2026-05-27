@@ -8,6 +8,7 @@ dependencies = [
     "boardlib>=0.14.1",
     "ipykernel>=7.2.0",
     "matplotlib>=3.10.8",
+    "numpy>=2.4.2",
     "pandas>=3.0.1",
     "scikit-learn>=1.6.0",
     "torch>=2.10.0",

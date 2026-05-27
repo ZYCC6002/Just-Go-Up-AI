@@ -199,54 +199,51 @@ def plot_2d_latents(
 		x_label:            X-axis label (default ``"Dim 1"``).
 		y_label:            Y-axis label (default ``"Dim 2"``).
 	"""
+	import matplotlib.patches as mpatches
+
 	from route_visualizer import visualize_route
 
 	unique_labels = np.unique(cluster_ids)
 	noise_mask = cluster_ids == -1
 	cluster_labels = unique_labels[unique_labels != -1]
 
+	# Build per-point RGBA colour and size arrays so a single scatter covers
+	# all points.  This is critical: scatter.contains() returns indices into
+	# the scatter's own data, so splitting noise vs. cluster into separate
+	# scatter calls breaks the index mapping used by hover/click handlers.
+	cmap = plt.cm.get_cmap("tab10", max(len(cluster_labels), 1))
+	label_to_rgba: dict[int, np.ndarray] = {}
+	for i, lbl in enumerate(cluster_labels):
+		rgba = np.array(cmap(i))
+		rgba[3] = 0.85
+		label_to_rgba[int(lbl)] = rgba
+
+	noise_rgba = np.array([0.827, 0.827, 0.827, 0.45])
+
+	point_colors = np.array([
+		noise_rgba if c == -1 else label_to_rgba[int(c)]
+		for c in cluster_ids
+	])
+	point_sizes = np.where(noise_mask, 5, 8).astype(float)
+
 	fig = plt.figure(figsize=(10, 8))
 	ax = fig.add_subplot(111)
 
-	# Plot noise points first (grey, not in legend)
-	if noise_mask.any():
-		ax.scatter(
-			projected_2d[noise_mask, 0],
-			projected_2d[noise_mask, 1],
-			c="lightgrey",
-			s=6,
-			alpha=0.5,
-			label="_noise",
-			zorder=1,
-		)
-
-	# Plot cluster points — use tab10 but only over the actual cluster labels
-	cmap = plt.cm.get_cmap("tab10", max(len(cluster_labels), 1))
-	label_to_color: dict[int, Any] = {int(lbl): cmap(i) for i, lbl in enumerate(cluster_labels)}
-
-	# Build unified colour array for scatter (needed for hover)
-	non_noise = ~noise_mask
-	colors_non_noise = [label_to_color[int(c)] for c in cluster_ids[non_noise]]
-
 	scatter = ax.scatter(
-		projected_2d[non_noise, 0],
-		projected_2d[non_noise, 1],
-		c=colors_non_noise,
-		s=8,
-		alpha=0.85,
-		zorder=2,
+		projected_2d[:, 0],
+		projected_2d[:, 1],
+		c=point_colors,
+		s=point_sizes,
 	)
 
-	# Legend entries — one patch per cluster
-	import matplotlib.patches as mpatches
-
+	# Legend — one patch per cluster, plus noise count if present
 	legend_handles = [
-		mpatches.Patch(color=label_to_color[int(lbl)], label=f"Cluster {int(lbl)}")
+		mpatches.Patch(color=label_to_rgba[int(lbl)], label=f"Cluster {int(lbl)}")
 		for lbl in cluster_labels
 	]
 	if noise_mask.any():
 		legend_handles.append(
-			mpatches.Patch(color="lightgrey", label=f"Noise ({int(noise_mask.sum())})")
+			mpatches.Patch(color=noise_rgba, label=f"Noise ({int(noise_mask.sum())})")
 		)
 	ax.legend(handles=legend_handles, title="Cluster", loc="best")
 
