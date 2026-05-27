@@ -85,6 +85,8 @@ Grade/angle entanglement: Even when angle and grade are provided as explicit con
 
 Latent space quality is hard to evaluate: good reconstruction loss does not necessarily mean the latent space is useful for clustering or generation.
 
+C-shaped manifold structure: PCA on the extracted latent vectors consistently revealed curved, C-shaped arcs rather than a compact spherical blob. The arcs are smooth, continuous manifold where nearby points correspond to similar climbing styles. However, it exposed a fundamental limitation of K-means clustering: the two tips of a C-arc can land in the same cluster simply because they're close in straight-line distance, even though they're far apart along the manifold and represent very different movement styles.
+
 ### Steps taken
 
 KL annealing: KL pressure is increased gradually during training so the model first learns to reconstruct routes well, then is pushed toward a smooth, informative latent space. Beta is kept at 0.25 (rather than 1.0) to give z more capacity for style information.
@@ -94,6 +96,8 @@ Free bits (minimum KL per dimension): Each latent dimension's KL is clamped from
 Post-only AdaLN: Adaptive LayerNorm injects angle and grade into the decoder **after** the transformer stack (not before it). An earlier design applied AdaLN both before and after — this gave the decoder a powerful shortcut to satisfy reconstruction without ever reading z through cross-attention. Removing the pre-decoder AdaLN weakened this shortcut enough that the decoder must attend to z to reconstruct routes accurately, which keeps z informative.
 
 Adversarial disentanglement: A small MLP adversary head is trained alongside the model to predict normalised grade and angle from z. A gradient reversal layer (GRL) sits between z and the adversary: the adversary's own weights are updated normally (it learns to predict grade/angle), but the gradient that flows back through z into the encoder is negated. This causes the encoder to actively hide grade/angle information from z, freeing the latent dimensions to capture style instead. Free bits are required for this to be effective — without them, z collapses to noise before the adversary can apply any pressure. Controlled by `--grade-adversary-weight` (default 0.5).
+
+UMAP + HDBSCAN clustering: To address the C-shaped manifold problem, UMAP is applied as a pre-reduction step before clustering. UMAP is a manifold learning algorithm that "unfolds" curved structures and preserves the topological relationships between points, so that distances in the reduced space better reflect distances along the route style manifold. HDBSCAN is then applied to the UMAP-reduced representation. Unlike K-means, HDBSCAN finds clusters as regions of high density without assuming any particular cluster shape or count, and can label sparse inter-cluster routes as noise (label −1) — a route that doesn't cleanly fit any style archetype.
 
 ---
 
@@ -133,30 +137,36 @@ Useful options:
 
 Tip: if you change preprocessing filters, rebuild the cache and retrain so the checkpoint vocabularies still match.
 
-### 2) Latent PCA + KMeans analysis
+### 2) Cluster the latent space
 
-First build the clustered latent cache once:
+First build a cluster cache. K-means is simple and fast; UMAP + HDBSCAN is better for the curved arc geometry:
 
-`python src/data_analysis/routes_kmeans_original.py --n-clusters 6 --cluster-cache-path data/routes_kmeans_original.pt`
+```bash
+# K-means (6 clusters, all routes)
+python src/data_analysis/routes_cluster.py --method kmeans --n-clusters 6
 
-Then run PCA or t-SNE on that cached clustered data:
+# HDBSCAN with UMAP pre-reduction (recommended for manifold data)
+python src/data_analysis/routes_cluster.py \
+  --method hdbscan --pre-reduce --pre-reduce-method umap --pre-reduce-dims 5 \
+  --hdbscan-min-cluster-size 50 --cluster-cache-path data/routes_hdbscan_umap.pt
 
-`python src/data_analysis/routes_pca_kmeans.py --cluster-cache-path data/routes_kmeans_original.pt --show`
+# Filter by grade/angle before clustering (e.g. V6 at 40°)
+python src/data_analysis/routes_cluster.py \
+  --method kmeans --n-clusters 6 --min-grade 22 --max-grade 22 --min-angle 40 --max-angle 40 \
+  --cluster-cache-path data/routes_v6_40deg_kmeans.pt
+```
 
-`python src/data_analysis/routes_tsne_kmeans.py --cluster-cache-path data/routes_kmeans_original.pt --show`
+### 3) Visualize clustered latents
 
-Common filters:
+Visualization reads the precomputed cluster cache — it does not reload the model. PCA, UMAP, and t-SNE projections are all available:
 
-- `--max-routes`
-- `--disable-click-visualizer`
+```bash
+python src/data_analysis/routes_visualize.py --method pca  --cluster-cache-path data/routes_kmeans_original.pt --show
+python src/data_analysis/routes_visualize.py --method umap --cluster-cache-path data/routes_hdbscan_umap.pt --show
+python src/data_analysis/routes_visualize.py --method tsne --cluster-cache-path data/routes_kmeans_original.pt --show
+```
 
-### 3) Clustered latent cache
-
-The PCA and t-SNE analysis scripts now read from a precomputed clustered latent cache. This keeps clustering consistent across views and avoids reclustering from scratch each time.
-
-Default cache path:
-
-`data/routes_kmeans_original.pt`
+Common options: `--max-routes`, `--disable-click-visualizer`.
 
 ### 4) Route visualization
 
@@ -168,8 +178,9 @@ Run:
 
 ## Current status
 
-- End-to-end flow is in place (data → train → latent analysis → visualization).
-- PCA and t-SNE views share a precomputed clustered latent cache.
+- End-to-end flow is in place (data → train → cluster → visualize).
+- Clustering and visualization are separated into two scripts (`routes_cluster.py`, `routes_visualize.py`) sharing a precomputed cache — clustering is done once and all projection methods read the same labels.
+- Supports K-means and HDBSCAN clustering, with optional UMAP/PCA pre-reduction; PCA, UMAP, and t-SNE visualization.
 - Preprocessing filters by route quality and ascensionist count by default.
 - Adversarial disentanglement (GRL) added to prevent grade/angle from dominating z.
 - Free bits (λ=0.5 nats/dim) added to prevent posterior collapse.
