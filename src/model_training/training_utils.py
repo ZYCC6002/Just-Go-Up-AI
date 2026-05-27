@@ -19,6 +19,14 @@ FEATURE_KEYS = [
 	"orientation_sin",
 	"orientation_cos",
 	"size",
+	# New per-hold move and style features (available for both encoder and decoder)
+	"delta_x_prev",
+	"delta_y_prev",
+	"grip_category_id",
+	# Note: dist_to_nearest is intentionally omitted here — it is encoder-only
+	# (requires the full hold sequence, unavailable during autoregressive decoding).
+	# The encoder reads it directly from the encoder_batch (which includes it via
+	# collate_hold_token_batch), but decoder_input_batch is built from FEATURE_KEYS only.
 ]
 
 

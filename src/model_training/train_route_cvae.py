@@ -111,6 +111,11 @@ def _build_model(
         latent_dim=latent_dim,
         use_cond_adaln=decoder_use_cond_adaln,
         z_memory_tokens=decoder_z_memory_tokens,
+        # Sync grip-category and delta embedding dims with encoder
+        grip_category_vocab_size=enc_cfg.grip_category_vocab_size,
+        grip_category_embed_dim=enc_cfg.grip_category_embed_dim,
+        delta_embed_dim=enc_cfg.delta_embed_dim,
+        use_dist_to_nearest=False,  # decoder never uses full-sequence dist feature
         x_min=enc_cfg.x_min,
         x_max=enc_cfg.x_max,
         y_min=enc_cfg.y_min,

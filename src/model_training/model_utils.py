@@ -100,9 +100,15 @@ def normalize_size(size: torch.Tensor) -> torch.Tensor:
 class HoldTokenEmbedder(nn.Module):
     """Embeds all per-hold features into a d_model token.
 
-    Both encoder and decoder use identical per-hold feature embeddings.
-    This module owns those shared parameters so they are defined once.
+    Both encoder and decoder use per-hold feature embeddings.
     Accepts any config object that provides the expected attribute names.
+
+    New features vs. original:
+    - type_embed_dim raised to 32 (most style-discriminating feature)
+    - grip_category_id: per-hold grip-feel category (jug/sloper/crimp/pinch/foot_type/unknown)
+    - delta_x_prev, delta_y_prev: move vector from the previous hold (y-sorted sequence)
+    - dist_to_nearest: distance to the nearest other hold (encoder-only; set
+      use_dist_to_nearest=False on the decoder config to skip this feature)
     """
 
     def __init__(self, cfg: Any) -> None:
@@ -118,6 +124,16 @@ class HoldTokenEmbedder(nn.Module):
         self.role_embedding = nn.Embedding(cfg.role_vocab_size, cfg.role_embed_dim)
         self.hole_embedding = nn.Embedding(cfg.hole_id_vocab_size, cfg.hole_id_embed_dim)
 
+        # Optional grip category (vocab_size=0 disables it for backward compatibility)
+        grip_cat_size = getattr(cfg, "grip_category_vocab_size", 0)
+        grip_cat_dim = getattr(cfg, "grip_category_embed_dim", 8)
+        if grip_cat_size > 0:
+            self.grip_category_embedding: nn.Embedding | None = nn.Embedding(grip_cat_size, grip_cat_dim)
+            self._grip_cat_dim = grip_cat_dim
+        else:
+            self.grip_category_embedding = None
+            self._grip_cat_dim = 0
+
         # Sinusoidal positional embeddings for x/y
         self.x_embedding = ScalarSinusoidalEmbedding(cfg.x_embed_dim)
         self.y_embedding = ScalarSinusoidalEmbedding(cfg.y_embed_dim)
@@ -127,6 +143,21 @@ class HoldTokenEmbedder(nn.Module):
         self.orientation_sin_projection = nn.Linear(1, cfg.orientation_sin_embed_dim)
         self.orientation_cos_projection = nn.Linear(1, cfg.orientation_cos_embed_dim)
         self.size_projection = nn.Linear(1, cfg.size_embed_dim)
+
+        # Move-delta projections (delta from previous hold in y-sorted sequence)
+        delta_dim = getattr(cfg, "delta_embed_dim", 8)
+        self.delta_x_projection = nn.Linear(1, delta_dim)
+        self.delta_y_projection = nn.Linear(1, delta_dim)
+        self._delta_dim = delta_dim
+
+        # Nearest-neighbour distance (encoder-only; requires full hold set)
+        use_dist = getattr(cfg, "use_dist_to_nearest", True)
+        if use_dist:
+            self.dist_projection: nn.Linear | None = nn.Linear(1, delta_dim)
+            self._dist_dim = delta_dim
+        else:
+            self.dist_projection = None
+            self._dist_dim = 0
 
         token_input_dim = (
             cfg.type_embed_dim
@@ -139,6 +170,9 @@ class HoldTokenEmbedder(nn.Module):
             + cfg.orientation_sin_embed_dim
             + cfg.orientation_cos_embed_dim
             + cfg.size_embed_dim
+            + self._grip_cat_dim    # 0 if disabled
+            + self._delta_dim * 2   # delta_x + delta_y
+            + self._dist_dim        # 0 if disabled
         )
         self.token_projection = nn.Sequential(
             nn.Linear(token_input_dim, cfg.d_model),
@@ -166,14 +200,32 @@ class HoldTokenEmbedder(nn.Module):
         )
         size_emb = self.size_projection(normalize_size(batch["size"]).unsqueeze(-1))
 
-        token_concat = torch.cat(
-            [
-                type_emb, function_emb, role_emb, hole_emb,
-                x_emb, y_emb,
-                depth_emb, orientation_sin_emb, orientation_cos_emb, size_emb,
-            ],
-            dim=-1,
+        # Move-delta features
+        delta_x_emb = self.delta_x_projection(
+            batch["delta_x_prev"].to(torch.float32).unsqueeze(-1)
         )
+        delta_y_emb = self.delta_y_projection(
+            batch["delta_y_prev"].to(torch.float32).unsqueeze(-1)
+        )
+
+        parts = [
+            type_emb, function_emb, role_emb, hole_emb,
+            x_emb, y_emb,
+            depth_emb, orientation_sin_emb, orientation_cos_emb, size_emb,
+            delta_x_emb, delta_y_emb,
+        ]
+
+        # Optional: grip category
+        if self.grip_category_embedding is not None and "grip_category_id" in batch:
+            parts.append(self.grip_category_embedding(batch["grip_category_id"]))
+
+        # Optional: nearest-neighbour distance (encoder-only)
+        if self.dist_projection is not None and "dist_to_nearest" in batch:
+            parts.append(
+                self.dist_projection(batch["dist_to_nearest"].to(torch.float32).unsqueeze(-1))
+            )
+
+        token_concat = torch.cat(parts, dim=-1)
         return self.token_projection(token_concat)
 
 
@@ -257,6 +309,12 @@ def build_model_from_checkpoint(
         latent_dim=latent_dim,
         use_cond_adaln=bool(ckpt_args.get("decoder_use_cond_adaln", True)),
         z_memory_tokens=int(ckpt_args.get("decoder_z_memory_tokens", 4)),
+        # Match encoder embedding dims (stored in checkpoint args for backward compat)
+        type_embed_dim=int(ckpt_args.get("type_embed_dim", 32)),
+        grip_category_vocab_size=enc_cfg.grip_category_vocab_size,
+        grip_category_embed_dim=enc_cfg.grip_category_embed_dim,
+        delta_embed_dim=enc_cfg.delta_embed_dim,
+        use_dist_to_nearest=False,  # decoder never uses full-sequence dist feature
         x_min=enc_cfg.x_min,
         x_max=enc_cfg.x_max,
         y_min=enc_cfg.y_min,

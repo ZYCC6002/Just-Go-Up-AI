@@ -29,7 +29,7 @@ class RouteVAEDecoderConfig:
     z_memory_tokens: int = 4
 
     # Per-feature embedding sizes (must match encoder)
-    type_embed_dim: int = 16
+    type_embed_dim: int = 32          # increased from 16 to match encoder
     function_embed_dim: int = 8
     role_embed_dim: int = 8
     hole_id_embed_dim: int = 16
@@ -39,6 +39,17 @@ class RouteVAEDecoderConfig:
     orientation_sin_embed_dim: int = 8
     orientation_cos_embed_dim: int = 8
     size_embed_dim: int = 8
+
+    # Grip category embedding (per-hold style abstraction)
+    grip_category_vocab_size: int = 0    # 0 = disabled (backward compat with old vocabs)
+    grip_category_embed_dim: int = 8
+
+    # Move delta embeddings (decoder uses delta_x_prev and delta_y_prev)
+    delta_embed_dim: int = 8
+
+    # Nearest-neighbour distance: disabled for decoder (requires full sequence, unavailable
+    # during autoregressive generation; only the encoder gets this feature)
+    use_dist_to_nearest: bool = False
 
     # Decoder transformer sizes
     d_model: int = 128

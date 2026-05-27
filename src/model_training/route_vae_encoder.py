@@ -25,7 +25,7 @@ class RouteVAEEncoderConfig:
     hole_id_vocab_size: int
 
     # Per-feature embedding sizes
-    type_embed_dim: int = 16
+    type_embed_dim: int = 32          # increased from 16: most style-discriminating feature
     function_embed_dim: int = 8
     role_embed_dim: int = 8
     hole_id_embed_dim: int = 16
@@ -35,6 +35,16 @@ class RouteVAEEncoderConfig:
     orientation_sin_embed_dim: int = 8
     orientation_cos_embed_dim: int = 8
     size_embed_dim: int = 8
+
+    # Grip category embedding (per-hold style abstraction)
+    grip_category_vocab_size: int = 0    # 0 = disabled (backward compat with old vocabs)
+    grip_category_embed_dim: int = 8
+
+    # Move delta embeddings (per-hold, encoder + decoder)
+    delta_embed_dim: int = 8             # used for delta_x_prev, delta_y_prev, dist_to_nearest
+
+    # Nearest-neighbour distance feature (encoder-only; requires full sequence)
+    use_dist_to_nearest: bool = True
 
     # Transformer sizes
     d_model: int = 128
@@ -64,7 +74,12 @@ class RouteTransformerEncoder(nn.Module):
     Expected token-level inputs (each [B, L], except padding_mask):
     - type_encoded_id, function_encoded_id, role_encoded_id, hole_encoded_id
     - x, y, depth, orientation_sin, orientation_cos, size
+    - delta_x_prev, delta_y_prev, dist_to_nearest  (new move-size features)
+    - grip_category_id                              (new grip-category feature)
     - padding_mask: bool [B, L], True for padded tokens
+
+    Expected route-level inputs:
+    - shape_desc: float [B, 9]  (route shape descriptor, prepended as CLS token)
     """
 
     def __init__(self, cfg: RouteVAEEncoderConfig) -> None:
@@ -72,6 +87,13 @@ class RouteTransformerEncoder(nn.Module):
         self.cfg = cfg
 
         self.hold_embedder = HoldTokenEmbedder(cfg)
+
+        # Shape descriptor MLP: projects [9] route-level stats → d_model CLS token
+        self.shape_token_mlp = nn.Sequential(
+            nn.Linear(9, cfg.d_model),
+            nn.GELU(),
+            nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps),
+        )
 
         # Disable nested-tensor path for MPS compatibility.
         encoder_layer = nn.TransformerEncoderLayer(
@@ -158,12 +180,22 @@ class RouteTransformerEncoder(nn.Module):
 
         Returns:
             {
-              "token_embeddings": [B, L, d_model],
-              "route_embedding":  [B, d_model],  # mean pooled
+              "token_embeddings": [B, L, d_model],   # per-hold (excludes shape token)
+              "route_embedding":  [B, d_model],       # shape-token output (position 0)
             }
         """
-        padding_mask = batch["padding_mask"].bool()
-        tokens = self.hold_embedder.embed(batch)
+        padding_mask = batch["padding_mask"].bool()   # [B, L]
+        tokens = self.hold_embedder.embed(batch)       # [B, L, d_model]
+
+        # Build and prepend shape token (route-level CLS)
+        shape_desc = batch["shape_desc"].to(tokens.dtype)           # [B, 9]
+        shape_token = self.shape_token_mlp(shape_desc).unsqueeze(1) # [B, 1, d_model]
+        tokens = torch.cat([shape_token, tokens], dim=1)            # [B, L+1, d_model]
+
+        # Extend padding mask: shape token is always non-padded
+        batch_size = tokens.shape[0]
+        cls_pad = torch.zeros((batch_size, 1), dtype=torch.bool, device=tokens.device)
+        padding_mask = torch.cat([cls_pad, padding_mask], dim=1)    # [B, L+1]
 
         cond_emb: torch.Tensor | None = None
         if self.cfg.use_condition:
@@ -175,31 +207,46 @@ class RouteTransformerEncoder(nn.Module):
             else:
                 tokens = tokens + cond_emb.unsqueeze(1)
 
-        encoded = self.encoder(tokens, src_key_padding_mask=padding_mask)
+        encoded = self.encoder(tokens, src_key_padding_mask=padding_mask)  # [B, L+1, d_model]
 
         if self.post_encoder_adaln is not None and cond_emb is not None:
             encoded = self.post_encoder_adaln(encoded, cond_emb)
         encoded = self.final_norm(encoded)
 
-        route_embedding = self.masked_mean_pool(encoded, padding_mask)
-        return {"token_embeddings": encoded, "route_embedding": route_embedding}
+        # Route embedding = shape/CLS token at position 0
+        route_embedding = encoded[:, 0, :]      # [B, d_model]
+        # Token embeddings = hold tokens only (exclude shape token)
+        token_embeddings = encoded[:, 1:, :]    # [B, L, d_model]
+
+        return {"token_embeddings": token_embeddings, "route_embedding": route_embedding}
 
 
 def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
     """Pad variable-length hold-token samples into a batch.
 
-    Each sample is a dict with 1-D tensors of length L_i for these keys:
-    type_encoded_id, function_encoded_id, role_encoded_id, hole_encoded_id,
-    x, y, depth, orientation_sin, orientation_cos, size.
+    Each sample is a dict with 1-D tensors of length L_i for most keys, plus
+    a special sample-level key `shape_desc` with shape [9] that is stacked
+    (not padded).
     """
     if not samples:
         raise ValueError("samples must be non-empty")
 
-    CATEGORICAL_KEYS = {"type_encoded_id", "function_encoded_id", "role_encoded_id", "hole_encoded_id"}
+    CATEGORICAL_KEYS = {
+        "type_encoded_id", "function_encoded_id", "role_encoded_id",
+        "hole_encoded_id", "grip_category_id",
+    }
+    # Core per-hold keys always present
     FEATURE_KEYS = [
         "type_encoded_id", "function_encoded_id", "role_encoded_id", "hole_encoded_id",
         "x", "y", "depth", "orientation_sin", "orientation_cos", "size",
     ]
+    # Optional per-hold features — include only if present in this batch's samples
+    for optional_key in ("delta_x_prev", "delta_y_prev", "dist_to_nearest", "grip_category_id"):
+        if optional_key in samples[0]:
+            FEATURE_KEYS = FEATURE_KEYS + [optional_key]
+
+    # shape_desc is a per-sample tensor [9], not per-hold — stacked separately
+    SAMPLE_LEVEL_KEYS = {"shape_desc"}
 
     lengths = [int(s["type_encoded_id"].shape[0]) for s in samples]
     max_len = max(lengths)
@@ -220,10 +267,19 @@ def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.T
         padding_mask[i, :length] = False
     batch["padding_mask"] = padding_mask
 
+    # Cast types
     for key in CATEGORICAL_KEYS:
-        batch[key] = batch[key].long()
-    for key in ["x", "y", "depth", "orientation_sin", "orientation_cos", "size"]:
-        batch[key] = batch[key].to(torch.float32)
+        if key in batch:
+            batch[key] = batch[key].long()
+    for key in ["x", "y", "depth", "orientation_sin", "orientation_cos", "size",
+                "delta_x_prev", "delta_y_prev", "dist_to_nearest"]:
+        if key in batch:
+            batch[key] = batch[key].to(torch.float32)
+
+    # Stack sample-level tensors (not per-hold, so no padding needed)
+    for key in SAMPLE_LEVEL_KEYS:
+        if key in samples[0]:
+            batch[key] = torch.stack([s[key] for s in samples], dim=0)
 
     return batch
 
