@@ -33,6 +33,34 @@ Categorical features (type, function, role, hole_id) each get their own learned 
 
 Coordinates use sinusoidal positional encoding on normalised values, providing multi-scale spatial representation across both fine-grained proximity and coarse board zones.
 
+### Encoder feature improvements
+
+**Problem solved**: The original encoder embedded each hold in isolation — it had no signal about how far apart holds are, or what the overall route shape looks like. Without these signals, the latent space had no way to distinguish a "deadpoint jug route" from a "technical footwork route" even when grade and angle were identical.
+
+**Hold sequence ordering**: Holds are sorted bottom-to-top by y-coordinate before encoding, creating a canonical climbing sequence. This makes the transformer's attention over the sequence correspond to the actual movement order on the wall.
+
+**Move delta features** (`delta_x_prev`, `delta_y_prev`): The horizontal and vertical distance from each hold to the previous one in the sorted sequence. These give the encoder a direct signal for move size — large deltas indicate dynamic/reachy moves; small deltas indicate technical, close-distance footwork. Available to both encoder and decoder (only prior context required).
+
+**Nearest-neighbour distance** (`dist_to_nearest`): The distance from each hold to the closest other hold on the route. This captures local density — a cluster of foot holds near a hand hold has a very different nearest-neighbour profile than an isolated deadpoint target.
+
+**Type embedding capacity** (`type_embed_dim` 16→32): The hold type is the most style-discriminating categorical feature, so its embedding dimension was doubled to give the model more representational capacity for distinguishing jug routes from crimp routes from sloper routes.
+
+**Route-level shape descriptor (CLS token)**: A 9-dimensional vector is computed from the full hold set and prepended to the hold sequence as a learned "shape token." The transformer attends to this token at every layer, giving each per-hold representation access to global route context. The 9 dimensions are:
+
+| Dim | Feature | Style signal |
+|-----|---------|-------------|
+| 0 | x-spread (std of x coords) | Compression / wide traverses |
+| 1 | y-spread (std of y coords) | Long vertical routes |
+| 2 | foot fraction (holds with foot role) | Technical footwork density |
+| 3 | hand count norm (hand holds / 20) | Endurance / route length |
+| 4 | jug fraction | Power / pump routes |
+| 5 | sloper fraction | Friction / balance routes |
+| 6 | crimp fraction | Crimp-intensive routes |
+| 7 | pinch fraction | Pinch-dominant routes |
+| 8 | mean pairwise move norm | Dynamic / reachy vs. technical |
+
+The shape token's output at position 0 is used as the `route_embedding` passed to the VAE bottleneck, replacing the previous masked mean-pool. This means the bottleneck encodes a global shape summary rather than an average of per-hold states.
+
 ---
 
 ## Model selection and considerations
@@ -63,7 +91,7 @@ KL annealing: KL pressure is increased gradually during training so the model fi
 
 Free bits (minimum KL per dimension): Each latent dimension's KL is clamped from below at a minimum threshold (λ = 0.5 nats) before summing. This prevents any dimension from fully collapsing to the prior — the encoder is forced to keep every z dimension active. With latent_dim=16 and λ=0.5, z must carry at least 8 nats of information, making the collapsed solution infeasible. Controlled by `--free-bits` (default 0.5).
 
-AdaLN conditioning: Adaptive LayerNorm injects angle and grade into the decoder without routing them through z. This is a necessary but not sufficient step — without free bits, the encoder still finds it useful to collapse z.
+Post-only AdaLN: Adaptive LayerNorm injects angle and grade into the decoder **after** the transformer stack (not before it). An earlier design applied AdaLN both before and after — this gave the decoder a powerful shortcut to satisfy reconstruction without ever reading z through cross-attention. Removing the pre-decoder AdaLN weakened this shortcut enough that the decoder must attend to z to reconstruct routes accurately, which keeps z informative.
 
 Adversarial disentanglement: A small MLP adversary head is trained alongside the model to predict normalised grade and angle from z. A gradient reversal layer (GRL) sits between z and the adversary: the adversary's own weights are updated normally (it learns to predict grade/angle), but the gradient that flows back through z into the encoder is negated. This causes the encoder to actively hide grade/angle information from z, freeing the latent dimensions to capture style instead. Free bits are required for this to be effective — without them, z collapses to noise before the adversary can apply any pressure. Controlled by `--grade-adversary-weight` (default 0.5).
 
@@ -145,6 +173,25 @@ Run:
 - Preprocessing filters by route quality and ascensionist count by default.
 - Adversarial disentanglement (GRL) added to prevent grade/angle from dominating z.
 - Free bits (λ=0.5 nats/dim) added to prevent posterior collapse.
+- Encoder feature improvements (delta moves, grip category, shape CLS token) added to capture style signals beyond hold position.
+- Post-only AdaLN in decoder removes the conditioning shortcut that caused posterior collapse in earlier runs.
+
+### Latent space quality (current model)
+
+After the encoder feature improvements and architectural fixes, PCA on 5,000 extracted latents shows:
+
+| Metric | Before | After |
+|--------|--------|-------|
+| PC1 explained variance | 73% | 42.5% |
+| Effective dimensionality (95% variance) | ~1–2 dims | ~4 dims |
+| t-SNE cluster structure | Scattered islands | Contiguous regions |
+
+With grade and angle held constant (V6 @ 40°, n=256 routes), the 6 KMeans clusters differentiate on style axes rather than difficulty:
+
+- **Foot-type hold density** (0% vs 41% foot-type holds across clusters) — technical footwork vs. power route
+- **Move size** (mean pairwise move norm 0.558 vs 0.612) — tight/compressed vs. dynamic/reachy
+- **Route length** (8.4 vs 13.8 mean holds) — short power problems vs. sustained endurance routes
+- **Grip composition** (jug-dominant vs. mixed hand/foot) — juggy pull routes vs. coordinated movement routes
 
 ---
 

@@ -40,10 +40,6 @@ class RouteVAEDecoderConfig:
     orientation_cos_embed_dim: int = 8
     size_embed_dim: int = 8
 
-    # Grip category embedding (per-hold style abstraction)
-    grip_category_vocab_size: int = 0    # 0 = disabled (backward compat with old vocabs)
-    grip_category_embed_dim: int = 8
-
     # Move delta embeddings (decoder uses delta_x_prev and delta_y_prev)
     delta_embed_dim: int = 8
 

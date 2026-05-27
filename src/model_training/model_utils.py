@@ -105,7 +105,6 @@ class HoldTokenEmbedder(nn.Module):
 
     New features vs. original:
     - type_embed_dim raised to 32 (most style-discriminating feature)
-    - grip_category_id: per-hold grip-feel category (jug/sloper/crimp/pinch/foot_type/unknown)
     - delta_x_prev, delta_y_prev: move vector from the previous hold (y-sorted sequence)
     - dist_to_nearest: distance to the nearest other hold (encoder-only; set
       use_dist_to_nearest=False on the decoder config to skip this feature)
@@ -123,16 +122,6 @@ class HoldTokenEmbedder(nn.Module):
         self.function_embedding = nn.Embedding(cfg.function_vocab_size, cfg.function_embed_dim)
         self.role_embedding = nn.Embedding(cfg.role_vocab_size, cfg.role_embed_dim)
         self.hole_embedding = nn.Embedding(cfg.hole_id_vocab_size, cfg.hole_id_embed_dim)
-
-        # Optional grip category (vocab_size=0 disables it for backward compatibility)
-        grip_cat_size = getattr(cfg, "grip_category_vocab_size", 0)
-        grip_cat_dim = getattr(cfg, "grip_category_embed_dim", 8)
-        if grip_cat_size > 0:
-            self.grip_category_embedding: nn.Embedding | None = nn.Embedding(grip_cat_size, grip_cat_dim)
-            self._grip_cat_dim = grip_cat_dim
-        else:
-            self.grip_category_embedding = None
-            self._grip_cat_dim = 0
 
         # Sinusoidal positional embeddings for x/y
         self.x_embedding = ScalarSinusoidalEmbedding(cfg.x_embed_dim)
@@ -170,7 +159,6 @@ class HoldTokenEmbedder(nn.Module):
             + cfg.orientation_sin_embed_dim
             + cfg.orientation_cos_embed_dim
             + cfg.size_embed_dim
-            + self._grip_cat_dim    # 0 if disabled
             + self._delta_dim * 2   # delta_x + delta_y
             + self._dist_dim        # 0 if disabled
         )
@@ -214,10 +202,6 @@ class HoldTokenEmbedder(nn.Module):
             depth_emb, orientation_sin_emb, orientation_cos_emb, size_emb,
             delta_x_emb, delta_y_emb,
         ]
-
-        # Optional: grip category
-        if self.grip_category_embedding is not None and "grip_category_id" in batch:
-            parts.append(self.grip_category_embedding(batch["grip_category_id"]))
 
         # Optional: nearest-neighbour distance (encoder-only)
         if self.dist_projection is not None and "dist_to_nearest" in batch:
@@ -311,8 +295,6 @@ def build_model_from_checkpoint(
         z_memory_tokens=int(ckpt_args.get("decoder_z_memory_tokens", 4)),
         # Match encoder embedding dims (stored in checkpoint args for backward compat)
         type_embed_dim=int(ckpt_args.get("type_embed_dim", 32)),
-        grip_category_vocab_size=enc_cfg.grip_category_vocab_size,
-        grip_category_embed_dim=enc_cfg.grip_category_embed_dim,
         delta_embed_dim=enc_cfg.delta_embed_dim,
         use_dist_to_nearest=False,  # decoder never uses full-sequence dist feature
         x_min=enc_cfg.x_min,

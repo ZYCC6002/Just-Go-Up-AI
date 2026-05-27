@@ -36,10 +36,6 @@ class RouteVAEEncoderConfig:
     orientation_cos_embed_dim: int = 8
     size_embed_dim: int = 8
 
-    # Grip category embedding (per-hold style abstraction)
-    grip_category_vocab_size: int = 0    # 0 = disabled (backward compat with old vocabs)
-    grip_category_embed_dim: int = 8
-
     # Move delta embeddings (per-hold, encoder + decoder)
     delta_embed_dim: int = 8             # used for delta_x_prev, delta_y_prev, dist_to_nearest
 
@@ -75,7 +71,6 @@ class RouteTransformerEncoder(nn.Module):
     - type_encoded_id, function_encoded_id, role_encoded_id, hole_encoded_id
     - x, y, depth, orientation_sin, orientation_cos, size
     - delta_x_prev, delta_y_prev, dist_to_nearest  (new move-size features)
-    - grip_category_id                              (new grip-category feature)
     - padding_mask: bool [B, L], True for padded tokens
 
     Expected route-level inputs:
@@ -232,8 +227,7 @@ def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.T
         raise ValueError("samples must be non-empty")
 
     CATEGORICAL_KEYS = {
-        "type_encoded_id", "function_encoded_id", "role_encoded_id",
-        "hole_encoded_id", "grip_category_id",
+        "type_encoded_id", "function_encoded_id", "role_encoded_id", "hole_encoded_id",
     }
     # Core per-hold keys always present
     FEATURE_KEYS = [
@@ -241,7 +235,7 @@ def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.T
         "x", "y", "depth", "orientation_sin", "orientation_cos", "size",
     ]
     # Optional per-hold features — include only if present in this batch's samples
-    for optional_key in ("delta_x_prev", "delta_y_prev", "dist_to_nearest", "grip_category_id"):
+    for optional_key in ("delta_x_prev", "delta_y_prev", "dist_to_nearest"):
         if optional_key in samples[0]:
             FEATURE_KEYS = FEATURE_KEYS + [optional_key]
 

@@ -15,25 +15,6 @@ from model_training.route_vae_encoder import RouteVAEEncoderConfig
 
 UNKNOWN_TOKEN = "<UNK>"
 
-# ---------------------------------------------------------------------------
-# Grip category mapping
-# ---------------------------------------------------------------------------
-# Maps the 5 Kilter hold types to grip-feel categories. Each type gets its
-# own category (jug and sloper are NOT merged) so the model can distinguish
-# juggy pump routes from sloper balance routes.
-_GRIP_CATEGORY: dict[str, str] = {
-    "jug":    "jug",        # open-hand, pulling-dominant
-    "sloper": "sloper",     # open-hand, friction/balance-dominant
-    "crimp":  "crimp",
-    "pinch":  "pinch",
-    "foot":   "foot_type",  # hold physically designed for feet (vs. role=foot)
-}
-_GRIP_CATEGORY_DEFAULT = "unknown"
-
-
-def _extract_grip_category(type_name: str) -> str:
-    return _GRIP_CATEGORY.get(type_name, _GRIP_CATEGORY_DEFAULT)
-
 
 @dataclass
 class CategoricalVocab:
@@ -58,16 +39,13 @@ class RouteVocabBundle:
     function_vocab: CategoricalVocab
     role_vocab: CategoricalVocab
     hole_vocab: CategoricalVocab
-    grip_category_vocab: CategoricalVocab
 
     def to_transformer_config(self, **overrides: Any) -> RouteVAEEncoderConfig:
-        grip_vocab = getattr(self, "grip_category_vocab", None)
         base = dict(
             type_vocab_size=self.type_vocab.size,
             function_vocab_size=self.function_vocab.size,
             role_vocab_size=self.role_vocab.size,
             hole_id_vocab_size=self.hole_vocab.size,
-            grip_category_vocab_size=grip_vocab.size if grip_vocab is not None else 0,
         )
         base.update(overrides)
         return RouteVAEEncoderConfig(**base)
@@ -165,14 +143,6 @@ def _encode_route_tokens(route_tokens: list[RawHoldToken], vocabs: RouteVocabBun
     role_ids = [vocabs.role_vocab.encode(tok.role_id) for tok in route_tokens]
     hole_ids = [vocabs.hole_vocab.encode(tok.hole_id) for tok in route_tokens]
 
-    # Grip category (per-hold)
-    grip_vocab = getattr(vocabs, "grip_category_vocab", None)
-    grip_category_ids = (
-        [grip_vocab.encode(_extract_grip_category(tok.type_name)) for tok in route_tokens]
-        if grip_vocab is not None
-        else []
-    )
-
     orientation_pairs = [_orientation_to_sin_cos(tok.orientation_deg) for tok in route_tokens]
     orientation_sin = [p[0] for p in orientation_pairs]
     orientation_cos = [p[1] for p in orientation_pairs]
@@ -250,8 +220,6 @@ def _encode_route_tokens(route_tokens: list[RawHoldToken], vocabs: RouteVocabBun
         # Route-level descriptor (special: shape [9], not [L])
         "shape_desc":        shape_desc,
     }
-    if grip_category_ids:
-        result["grip_category_id"] = torch.tensor(grip_category_ids, dtype=torch.long)
 
     return result
 
@@ -383,20 +351,17 @@ def build_training_samples_from_db(
     all_functions: list[str] = []
     all_roles: list[int] = []
     all_holes: list[int] = []
-    all_grip_categories: list[str] = []
     for _climb, tokens, _coverage in raw_routes:
         all_types.extend(tok.type_name for tok in tokens)
         all_functions.extend(tok.function_name for tok in tokens)
         all_roles.extend(tok.role_id for tok in tokens)
         all_holes.extend(tok.hole_id for tok in tokens)
-        all_grip_categories.extend(_extract_grip_category(tok.type_name) for tok in tokens)
 
     vocabs = RouteVocabBundle(
         type_vocab=_build_vocab(all_types, include_unknown=True),
         function_vocab=_build_vocab(all_functions, include_unknown=True),
         role_vocab=_build_vocab(all_roles, include_unknown=False),
         hole_vocab=_build_vocab(all_holes, include_unknown=False),
-        grip_category_vocab=_build_vocab(all_grip_categories, include_unknown=True),
     )
 
     samples: list[RouteSample] = []
