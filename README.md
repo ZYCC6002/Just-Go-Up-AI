@@ -162,9 +162,9 @@ python src/data_analysis/routes_cluster.py \
 Visualization reads the precomputed cluster cache — it does not reload the model. PCA, UMAP, and t-SNE projections are all available:
 
 ```bash
-python src/data_analysis/routes_visualize.py --method pca  --cluster-cache-path data/routes_kmeans_original.pt --show
+python src/data_analysis/routes_visualize.py --method pca  --cluster-cache-path data/routes_hdbscan_umap.pt --show
 python src/data_analysis/routes_visualize.py --method umap --cluster-cache-path data/routes_hdbscan_umap.pt --show
-python src/data_analysis/routes_visualize.py --method tsne --cluster-cache-path data/routes_kmeans_original.pt --show
+python src/data_analysis/routes_visualize.py --method tsne --cluster-cache-path data/routes_hdbscan_umap.pt --show
 ```
 
 Common options: `--max-routes`, `--disable-click-visualizer`.

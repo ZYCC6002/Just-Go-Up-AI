@@ -76,7 +76,7 @@ class RouteTransformerDecoder(nn.Module):
     Angle/grade conditioning is injected via AdaLN modulation.
 
     Expected teacher-forcing input keys (shifted-right with BOS at position 0):
-    - type_encoded_id, function_encoded_id, role_encoded_id, hole_encoded_id
+    - type_encoded_id, role_encoded_id, hole_encoded_id
     - x, y, depth, orientation_sin, orientation_cos, size
     - padding_mask (bool, True for padded tokens)
     """

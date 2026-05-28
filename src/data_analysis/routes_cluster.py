@@ -132,7 +132,6 @@ def _extract_latent_matrix(
 ) -> np.ndarray:
     eos_ids = DecoderEOSIds(
         type_eos_id=model.decoder.type_eos_id,
-        function_eos_id=model.decoder.function_eos_id,
         role_eos_id=model.decoder.role_eos_id,
         hole_eos_id=model.decoder.hole_eos_id,
     )

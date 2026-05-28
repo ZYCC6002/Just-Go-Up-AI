@@ -70,7 +70,7 @@ class RouteTransformerEncoder(nn.Module):
     """Transformer encoder over hold tokens with per-feature embeddings.
 
     Expected token-level inputs (each [B, L], except padding_mask):
-    - type_encoded_id, function_encoded_id, role_encoded_id, hole_encoded_id
+    - type_encoded_id, role_encoded_id, hole_encoded_id
     - x, y, depth, orientation_sin, orientation_cos, size
     - delta_x_prev, delta_y_prev, dist_to_nearest  (new move-size features)
     - padding_mask: bool [B, L], True for padded tokens
