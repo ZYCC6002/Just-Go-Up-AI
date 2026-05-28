@@ -207,7 +207,11 @@ class RouteTransformerEncoder(nn.Module):
         encoded = self.encoder(tokens, src_key_padding_mask=padding_mask)  # [B, L+1, d_model]
 
         if self.post_encoder_adaln is not None and cond_emb is not None:
-            encoded = self.post_encoder_adaln(encoded, cond_emb)
+            # Apply only to hold tokens (1:), not the CLS token (0).
+            # CLS → route_embedding → z: conditioning it here injects grade/angle
+            # directly into z, making the adversary fight a hard-coded signal.
+            hold_enc = self.post_encoder_adaln(encoded[:, 1:, :], cond_emb)
+            encoded = torch.cat([encoded[:, :1, :], hold_enc], dim=1)
         encoded = self.final_norm(encoded)
 
         # Route embedding = shape/CLS token at position 0

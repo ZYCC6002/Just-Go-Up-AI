@@ -148,8 +148,7 @@ python src/data_analysis/routes_cluster.py --method kmeans --n-clusters 6
 # HDBSCAN with UMAP pre-reduction (recommended for manifold data)
 python src/data_analysis/routes_cluster.py \
   --method hdbscan --pre-reduce --pre-reduce-method umap --pre-reduce-dims 5 \
-  --hdbscan-min-cluster-size 200 --hdbscan-min-samples 15 \
-  --cluster-cache-path data/routes_hdbscan_umap.pt
+  --hdbscan-min-cluster-size 200 --hdbscan-min-samples 15
 
 # Filter by grade/angle before clustering (e.g. V6 at 40°)
 python src/data_analysis/routes_cluster.py \
@@ -162,9 +161,9 @@ python src/data_analysis/routes_cluster.py \
 Visualization reads the precomputed cluster cache — it does not reload the model. PCA, UMAP, and t-SNE projections are all available:
 
 ```bash
-python src/data_analysis/routes_visualize.py --method pca  --cluster-cache-path data/routes_hdbscan_umap.pt --show
-python src/data_analysis/routes_visualize.py --method umap --cluster-cache-path data/routes_hdbscan_umap.pt --show
-python src/data_analysis/routes_visualize.py --method tsne --cluster-cache-path data/routes_hdbscan_umap.pt --show
+python src/data_analysis/routes_visualize.py --method pca  --cluster-cache-path data/routes_clustered.pt --show
+python src/data_analysis/routes_visualize.py --method umap --cluster-cache-path data/routes_clustered.pt --show
+python src/data_analysis/routes_visualize.py --method tsne --cluster-cache-path data/routes_clustered.pt --show
 ```
 
 Common options: `--max-routes`, `--disable-click-visualizer`.

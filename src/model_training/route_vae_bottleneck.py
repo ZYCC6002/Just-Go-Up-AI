@@ -29,53 +29,57 @@ class _GradientReversal(torch.autograd.Function):
 KILTER_LISTED_ANGLES: list[float] = [0., 5., 10., 15., 20., 25., 30., 35., 40., 45., 50., 55., 60., 65., 70.]
 
 
-class PerAngleGradeAdversaryHead(nn.Module):
-    """Predicts normalised grade at every listed wall angle from z via a GRL.
+class GradeAngleAdversaryHead(nn.Module):
+    """Predicts grade and angle from z via a GRL to push both out of z.
 
-    Replaces the old GradeAngleAdversaryHead which predicted a single (grade,
-    angle) pair.  Key changes:
-    - Output shape [B, num_listed_angles] instead of [B, 2].
-    - Predicts grade only (not angle): since the encoder never sees angle as
-      input, angle is structurally absent from z — predicting it is redundant.
-    - Supplies up to 15× more supervision per route, applying much stronger
-      pressure to push grade information out of z across the full angle range.
+    With encoder_use_condition=True the encoder sees grade and angle via AdaLN,
+    so both can leak into z.  Both heads share a trunk that operates on
+    GRL-reversed z.
 
-    Loss is computed only over angles with known grade data (NaN elsewhere),
-    so routes with fewer angle variants contribute less signal per step but are
-    not penalised.
+    Grade is predicted at the route's own stored angle (the angle z was encoded
+    at) rather than at all listed angles.  The per-angle multi-target design
+    was motivated by encoder_use_condition=False where z was angle-agnostic and
+    grades at all angles were valid targets for the same z; with conditioning,
+    z encodes one specific (route, angle) pair, so only that angle's grade is
+    directly in z.
 
-    Args:
-        latent_dim:         Dimension of z.
-        num_listed_angles:  Number of output heads (one per listed angle).
-                            Default 15 matches Kilter Board Original.
-        hidden_dim:         Hidden layer width.
+    Returns:
+        grade_pred: [B]  normalised grade in [0, 1]
+        angle_pred: [B]  normalised angle in [0, 1]
     """
 
-    def __init__(
-        self,
-        latent_dim: int,
-        num_listed_angles: int = len(KILTER_LISTED_ANGLES),
-        hidden_dim: int = 64,
-    ) -> None:
+    def __init__(self, latent_dim: int, hidden_dim: int = 64) -> None:
         super().__init__()
-        self.num_listed_angles = num_listed_angles
-        self.mlp = nn.Sequential(
+        self.trunk = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, num_listed_angles),
+        )
+        self.grade_head = nn.Sequential(
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
+        )
+        self.angle_head = nn.Sequential(
+            nn.Linear(hidden_dim, 1),
             nn.Sigmoid(),
         )
 
-    def forward(self, z: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, alpha: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
         """Args:
             z:     latent vector [B, latent_dim]
-            alpha: GRL scale factor (ramp during training to stabilise early epochs)
+            alpha: GRL scale factor
         Returns:
-            [B, num_listed_angles] predicted grades in [0, 1]
+            (grade_pred [B], angle_pred [B]) both in [0, 1]
         """
         alpha_t = torch.tensor(alpha, dtype=z.dtype, device=z.device)
         z_r = _GradientReversal.apply(z, alpha_t)
-        return self.mlp(z_r)
+        h = self.trunk(z_r)
+        grade_pred = self.grade_head(h).squeeze(-1)
+        angle_pred = self.angle_head(h).squeeze(-1)
+        return grade_pred, angle_pred
+
+
+# Kept for reference / downstream scripts that may import it.
+PerAngleGradeAdversaryHead = GradeAngleAdversaryHead
 
 
 @dataclass
@@ -227,7 +231,8 @@ class RouteConditionalVAE(nn.Module):
 
 __all__ = [
 	"KILTER_LISTED_ANGLES",
-	"PerAngleGradeAdversaryHead",
+	"GradeAngleAdversaryHead",
+	"PerAngleGradeAdversaryHead",  # alias for backward compat
 	"RouteVAEBottleneckConfig",
 	"RouteVAEBottleneck",
 	"RouteConditionalVAE",

@@ -354,7 +354,7 @@ def main() -> None:
     parser.add_argument("--db-path", type=str, default=str(PROJECT_ROOT / "data/raw/kilter_database.sqlite"))
     parser.add_argument("--cache-path", type=str, default=str(PROJECT_ROOT / "data/preprocessed_routes_cache.pt"))
     parser.add_argument("--checkpoint-path", type=str, default=str(PROJECT_ROOT / "data/route_cvae.pt"))
-    parser.add_argument("--cluster-cache-path", type=str, default=str(PROJECT_ROOT / "data/routes_kmeans_original.pt"))
+    parser.add_argument("--cluster-cache-path", type=str, default=str(PROJECT_ROOT / "data/routes_clustered.pt"))
     parser.add_argument("--metadata-source", type=str, default="kilter_board_csv")
     parser.add_argument("--metadata-product-id", type=int, default=1)
 

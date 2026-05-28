@@ -25,8 +25,7 @@ from model_training.model_utils import (
     select_device,
 )
 from model_training.route_vae_bottleneck import (
-    KILTER_LISTED_ANGLES,
-    PerAngleGradeAdversaryHead,
+    GradeAngleAdversaryHead,
     RouteConditionalVAE,
     RouteVAEBottleneck,
     RouteVAEBottleneckConfig,
@@ -215,35 +214,6 @@ def _load_or_build_samples_and_vocabs(args: argparse.Namespace) -> tuple[list[An
     return samples, vocabs
 
 
-def _build_per_angle_grade_targets(
-    batch_samples: list[Any],
-    *,
-    device: torch.device,
-    grade_min: float,
-    grade_max: float,
-    listed_angles: list[float] = KILTER_LISTED_ANGLES,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build grade target and validity mask tensors for the per-angle adversary.
-
-    Returns:
-        grade_targets: [B, num_angles] normalised grades in [0, 1]; NaN where unknown.
-        valid_mask:    [B, num_angles] bool, True where a grade is known.
-    """
-    B = len(batch_samples)
-    A = len(listed_angles)
-    grade_range = max(grade_max - grade_min, 1e-6)
-
-    grade_targets = torch.full((B, A), float("nan"), dtype=torch.float32, device=device)
-    for i, sample in enumerate(batch_samples):
-        angle_grades: dict[float, float] = getattr(sample, "angle_grades", {})
-        for j, angle in enumerate(listed_angles):
-            if angle in angle_grades:
-                g_norm = (float(angle_grades[angle]) - grade_min) / grade_range
-                grade_targets[i, j] = max(0.0, min(1.0, g_norm))
-
-    valid_mask = ~torch.isnan(grade_targets)
-    return grade_targets, valid_mask
-
 
 def _compute_batch_losses(
     model: RouteConditionalVAE,
@@ -255,7 +225,7 @@ def _compute_batch_losses(
     numeric_weight: float,
     ignore_index: int = -100,
     sample_latent: bool = True,
-    adversary: PerAngleGradeAdversaryHead | None = None,
+    adversary: GradeAngleAdversaryHead | None = None,
     grade_adversary_weight: float = 0.0,
     grade_adversary_alpha: float = 1.0,
     angle_min: float = 0.0,
@@ -312,13 +282,25 @@ def _compute_batch_losses(
             grade_max=grade_max,
         )
 
-        adv_pred = adversary(out["z"], alpha=grade_adversary_alpha)  # [B, num_angles]
+        grade_pred, angle_pred = adversary(out["z"], alpha=grade_adversary_alpha)
 
-        if valid_mask.any():
-            adversary_loss = F.mse_loss(adv_pred[valid_mask], grade_targets[valid_mask])
+        # Grade target: route's own grade at its stored angle — exactly what z encodes.
+        # With encoder_use_condition=True, z = f(route, angle_A), so grade_A is the
+        # directly inferable signal; multi-angle targets for other angles are weaker
+        # (only correlated via route difficulty, not directly in z).
+        grade_range = max(grade_max - grade_min, 1e-6)
+        grade_norm = ((prepared["grade"].to(torch.float32) - grade_min) / grade_range).clamp(0.0, 1.0)
+        grade_known = prepared["grade_missing"] < 0.5  # True where grade is not missing
+        if grade_known.any():
+            grade_adv_loss = F.mse_loss(grade_pred[grade_known], grade_norm[grade_known])
         else:
-            # No grade data in this batch (shouldn't happen with full dataset).
-            adversary_loss = adv_pred.sum() * 0.0
+            grade_adv_loss = grade_pred.sum() * 0.0
+
+        angle_range = max(angle_max - angle_min, 1e-6)
+        angle_norm = ((prepared["angle"].to(torch.float32) - angle_min) / angle_range).clamp(0.0, 1.0)
+        angle_adv_loss = F.mse_loss(angle_pred, angle_norm)
+
+        adversary_loss = grade_adv_loss + angle_adv_loss
 
         adversary_loss_val = float(adversary_loss.detach().cpu())
         if adversary_in_total:
@@ -350,7 +332,7 @@ def _run_epoch(
     numeric_weight: float,
     grad_clip_norm: float,
     sample_latent: bool,
-    adversary: PerAngleGradeAdversaryHead | None = None,
+    adversary: GradeAngleAdversaryHead | None = None,
     adversary_optimizer: AdamW | None = None,
     grade_adversary_weight: float = 0.0,
     grade_adversary_alpha: float = 1.0,
@@ -531,12 +513,12 @@ def main() -> None:
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    adversary: PerAngleGradeAdversaryHead | None = None
+    adversary: GradeAngleAdversaryHead | None = None
     adversary_optimizer: AdamW | None = None
     if args.grade_adversary_weight > 0.0:
-        adversary = PerAngleGradeAdversaryHead(args.latent_dim).to(device)
+        adversary = GradeAngleAdversaryHead(args.latent_dim).to(device)
         adversary_optimizer = AdamW(adversary.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        print(f"Per-angle grade adversary enabled (weight={args.grade_adversary_weight}, alpha={args.grade_adversary_alpha})")
+        print(f"Grade+angle adversary enabled (weight={args.grade_adversary_weight}, alpha={args.grade_adversary_alpha})")
 
     best_val = math.inf
     start_epoch = 1
