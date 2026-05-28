@@ -105,6 +105,10 @@ def _build_model(
     decoder_d_model: int,
     decoder_num_layers: int,
     decoder_dim_feedforward: int,
+    use_absolute_pos: bool = True,
+    use_type_feature: bool = True,
+    shape_desc_dim: int = 9,
+    route_pool_mode: str = "cls",
 ) -> tuple[RouteConditionalVAE, DecoderEOSIds, dict[str, float]]:
     if encoder_d_model % encoder_nhead != 0:
         raise ValueError(
@@ -121,6 +125,10 @@ def _build_model(
     )
     enc_cfg.use_condition = encoder_use_condition
     enc_cfg.use_cond_adaln = encoder_use_cond_adaln
+    enc_cfg.use_absolute_pos = use_absolute_pos
+    enc_cfg.use_type_feature = use_type_feature
+    enc_cfg.shape_desc_dim = shape_desc_dim
+    enc_cfg.route_pool_mode = route_pool_mode
 
     dec_cfg = RouteVAEDecoderConfig(
         type_vocab_size=enc_cfg.type_vocab_size,
@@ -135,6 +143,8 @@ def _build_model(
         # Sync delta embedding dim with encoder
         delta_embed_dim=enc_cfg.delta_embed_dim,
         use_knn_features=False,  # decoder never uses full-sequence knn features
+        use_absolute_pos=use_absolute_pos,
+        use_type_feature=use_type_feature,
         x_min=enc_cfg.x_min,
         x_max=enc_cfg.x_max,
         y_min=enc_cfg.y_min,
@@ -407,6 +417,22 @@ def main() -> None:
     parser.add_argument("--kl-beta", type=float, default=0.1)
     parser.add_argument("--encoder-use-condition", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--encoder-use-cond-adaln", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--use-absolute-pos", action=argparse.BooleanOptionalAction, default=True,
+        help="Include absolute x/y sinusoidal embeddings in hold tokens. "
+             "Set --no-use-absolute-pos to ablate (keep only deltas + knn for spatial info).",
+    )
+    parser.add_argument(
+        "--use-type-feature", action=argparse.BooleanOptionalAction, default=True,
+        help="Include hold-type categorical embedding and type fractions in shape_desc. "
+             "Set --no-use-type-feature to ablate (forces z to encode geometry, not hold type).",
+    )
+    parser.add_argument(
+        "--route-pool-mode", type=str, default="attention", choices=["attention", "cls"],
+        help="Pooling strategy for the route embedding fed to the bottleneck. "
+             "'attention' = learned query attends over hold tokens (recommended; avoids shape_desc shortcut). "
+             "'cls' = shape/CLS token (fast; risks shortcutting via pre-computed shape_desc stats).",
+    )
     # Encoder architecture (saved in checkpoint — must be restored exactly for resume/inference)
     parser.add_argument("--encoder-d-model", type=int, default=256,
                         help="Encoder transformer model dimension. Must be divisible by --encoder-nhead.")
@@ -466,6 +492,12 @@ def main() -> None:
     )
     print(f"Routes: total={len(samples)} train={len(train_samples)} val={len(val_samples)} test={len(test_samples)}")
 
+    # Auto-detect shape_desc_dim from data so the model always matches the cache.
+    shape_desc_dim = int(samples[0].tokens["shape_desc"].shape[0])
+    print(f"shape_desc_dim={shape_desc_dim} (auto-detected from cache)")
+    # Save back so it is persisted in the checkpoint args.
+    args.shape_desc_dim = shape_desc_dim
+
     model, eos_ids, norm_ranges = _build_model(
         vocabs, device,
         latent_dim=args.latent_dim,
@@ -480,6 +512,10 @@ def main() -> None:
         decoder_d_model=args.decoder_d_model,
         decoder_num_layers=args.decoder_num_layers,
         decoder_dim_feedforward=args.decoder_dim_feedforward,
+        use_absolute_pos=args.use_absolute_pos,
+        use_type_feature=args.use_type_feature,
+        shape_desc_dim=shape_desc_dim,
+        route_pool_mode=args.route_pool_mode,
     )
 
     max_seq_len = model.decoder.cfg.max_seq_len

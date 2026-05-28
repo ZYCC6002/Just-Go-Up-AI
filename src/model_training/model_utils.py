@@ -117,14 +117,31 @@ class HoldTokenEmbedder(nn.Module):
         self.y_min: float = cfg.y_min
         self.y_max: float = cfg.y_max
 
+        # Optional features — controlled by config flags so ablations don't need
+        # architecture changes, only a flag flip and cache rebuild.
+        use_abs = getattr(cfg, "use_absolute_pos", True)
+        use_type = getattr(cfg, "use_type_feature", True)
+
         # Categorical embeddings
-        self.type_embedding = nn.Embedding(cfg.type_vocab_size, cfg.type_embed_dim)
+        if use_type:
+            self.type_embedding: nn.Embedding | None = nn.Embedding(cfg.type_vocab_size, cfg.type_embed_dim)
+            self._type_dim = cfg.type_embed_dim
+        else:
+            self.type_embedding = None
+            self._type_dim = 0
+
         self.role_embedding = nn.Embedding(cfg.role_vocab_size, cfg.role_embed_dim)
         self.hole_embedding = nn.Embedding(cfg.hole_id_vocab_size, cfg.hole_id_embed_dim)
 
-        # Sinusoidal positional embeddings for x/y
-        self.x_embedding = ScalarSinusoidalEmbedding(cfg.x_embed_dim)
-        self.y_embedding = ScalarSinusoidalEmbedding(cfg.y_embed_dim)
+        # Sinusoidal positional embeddings for x/y (absolute board coordinates)
+        if use_abs:
+            self.x_embedding: ScalarSinusoidalEmbedding | None = ScalarSinusoidalEmbedding(cfg.x_embed_dim)
+            self.y_embedding: ScalarSinusoidalEmbedding | None = ScalarSinusoidalEmbedding(cfg.y_embed_dim)
+            self._xy_dim = cfg.x_embed_dim + cfg.y_embed_dim
+        else:
+            self.x_embedding = None
+            self.y_embedding = None
+            self._xy_dim = 0
 
         # Numeric scalar projections
         self.depth_projection = nn.Linear(1, cfg.depth_embed_dim)
@@ -149,17 +166,16 @@ class HoldTokenEmbedder(nn.Module):
             self._knn_dim = 0
 
         token_input_dim = (
-            cfg.type_embed_dim
+            self._type_dim                  # 0 if use_type_feature=False
             + cfg.role_embed_dim
             + cfg.hole_id_embed_dim
-            + cfg.x_embed_dim
-            + cfg.y_embed_dim
+            + self._xy_dim                  # 0 if use_absolute_pos=False
             + cfg.depth_embed_dim
             + cfg.orientation_sin_embed_dim
             + cfg.orientation_cos_embed_dim
             + cfg.size_embed_dim
-            + self._delta_dim * 2   # delta_x + delta_y
-            + self._knn_dim         # 0 if disabled
+            + self._delta_dim * 2           # delta_x + delta_y
+            + self._knn_dim                 # 0 if disabled
         )
         self.token_projection = nn.Sequential(
             nn.Linear(token_input_dim, cfg.d_model),
@@ -170,12 +186,8 @@ class HoldTokenEmbedder(nn.Module):
 
     def embed(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Embed a batch of hold tokens to [B, L, d_model]."""
-        type_emb = self.type_embedding(batch["type_encoded_id"])
         role_emb = self.role_embedding(batch["role_encoded_id"])
         hole_emb = self.hole_embedding(batch["hole_encoded_id"])
-
-        x_emb = self.x_embedding(normalize_minmax(batch["x"], self.x_min, self.x_max))
-        y_emb = self.y_embedding(normalize_minmax(batch["y"], self.y_min, self.y_max))
 
         depth_emb = self.depth_projection(normalize_depth(batch["depth"]).unsqueeze(-1))
         orientation_sin_emb = self.orientation_sin_projection(
@@ -194,12 +206,23 @@ class HoldTokenEmbedder(nn.Module):
             batch["delta_y_prev"].to(torch.float32).unsqueeze(-1)
         )
 
-        parts = [
-            type_emb, role_emb, hole_emb,
-            x_emb, y_emb,
+        parts: list[torch.Tensor] = []
+
+        # Optional: hold type categorical embedding
+        if self.type_embedding is not None:
+            parts.append(self.type_embedding(batch["type_encoded_id"]))
+
+        parts.extend([role_emb, hole_emb])
+
+        # Optional: absolute board coordinates (x/y sinusoidal)
+        if self.x_embedding is not None:
+            parts.append(self.x_embedding(normalize_minmax(batch["x"], self.x_min, self.x_max)))
+            parts.append(self.y_embedding(normalize_minmax(batch["y"], self.y_min, self.y_max)))
+
+        parts.extend([
             depth_emb, orientation_sin_emb, orientation_cos_emb, size_emb,
             delta_x_emb, delta_y_emb,
-        ]
+        ])
 
         # Optional: k-NN neighbourhood features (encoder-only; [B, L, 9] → [B, L, knn_embed_dim])
         if self.knn_projection is not None and "knn_features" in batch:
@@ -283,6 +306,13 @@ def build_model_from_checkpoint(
     )
     enc_cfg.use_condition = bool(ckpt_args.get("encoder_use_condition", True))
     enc_cfg.use_cond_adaln = bool(ckpt_args.get("encoder_use_cond_adaln", True))
+    enc_cfg.use_absolute_pos = bool(ckpt_args.get("use_absolute_pos", True))
+    enc_cfg.use_type_feature = bool(ckpt_args.get("use_type_feature", True))
+    enc_cfg.shape_desc_dim = int(ckpt_args.get("shape_desc_dim", 9))
+    # Default to "cls" for old checkpoints that pre-date attention pooling —
+    # those checkpoints have no pool_query / pool_attn weights, so "attention"
+    # would cause a strict load_state_dict failure.
+    enc_cfg.route_pool_mode = str(ckpt_args.get("route_pool_mode", "cls"))
 
     latent_dim = int(
         latent_dim_override if latent_dim_override is not None
@@ -302,6 +332,8 @@ def build_model_from_checkpoint(
         type_embed_dim=int(ckpt_args.get("type_embed_dim", 32)),
         delta_embed_dim=enc_cfg.delta_embed_dim,
         use_knn_features=False,  # decoder never uses full-sequence knn features
+        use_absolute_pos=enc_cfg.use_absolute_pos,
+        use_type_feature=enc_cfg.use_type_feature,
         x_min=enc_cfg.x_min,
         x_max=enc_cfg.x_max,
         y_min=enc_cfg.y_min,

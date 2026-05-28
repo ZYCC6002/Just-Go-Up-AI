@@ -29,7 +29,7 @@ Quality filters: Only publicly available routes are used. Routes are also filter
 
 Per-Hold Token Construction: Each hold is embedded as a single token by independently embedding all features and concatenating before projection.
 
-Categorical features (type, function, role, hole_id) each get their own learned embedding table, allowing the model to learn dense geometric relationships between categories from co-occurrence in routes.
+Categorical features (type, role, hole_id) each get their own learned embedding table, allowing the model to learn dense geometric relationships between categories from co-occurrence in routes.
 
 Coordinates use sinusoidal positional encoding on normalised values, providing multi-scale spatial representation across both fine-grained proximity and coarse board zones.
 

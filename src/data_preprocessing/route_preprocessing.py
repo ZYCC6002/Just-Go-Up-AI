@@ -239,11 +239,14 @@ def _encode_route_tokens(
     foot_fraction   = n_foot / n_total
     hand_count_norm = min(n_hand / 20.0, 1.0)  # 20 hand holds ≈ "many" (endurance signal)
 
-    # Per-type fractions — separate jug vs sloper so juggy and sloper routes are distinguishable
-    jug_frac    = sum(1 for t in route_tokens if t.type_name == "jug")    / n_total
-    sloper_frac = sum(1 for t in route_tokens if t.type_name == "sloper") / n_total
-    crimp_frac  = sum(1 for t in route_tokens if t.type_name == "crimp")  / n_total
-    pinch_frac  = sum(1 for t in route_tokens if t.type_name == "pinch")  / n_total
+    # Per-type fractions — commented out for shape-only experiment.
+    # With these in shape_desc the encoder shortcuts to hold-type clustering;
+    # removing them forces z to encode spatial/geometric route structure instead.
+    # Restore by uncommenting and updating shape_desc below (9D → 5D change).
+    # jug_frac    = sum(1 for t in route_tokens if t.type_name == "jug")    / n_total
+    # sloper_frac = sum(1 for t in route_tokens if t.type_name == "sloper") / n_total
+    # crimp_frac  = sum(1 for t in route_tokens if t.type_name == "crimp")  / n_total
+    # pinch_frac  = sum(1 for t in route_tokens if t.type_name == "pinch")  / n_total
 
     # Mean pairwise distance between hand holds (deadpoint/reachy vs technical)
     hand_coords = np.array(
@@ -262,9 +265,10 @@ def _encode_route_tokens(
 
     shape_desc = torch.tensor(
         [x_std, y_std, foot_fraction, hand_count_norm,
-         jug_frac, sloper_frac, crimp_frac, pinch_frac, mean_move_norm],
+         # jug_frac, sloper_frac, crimp_frac, pinch_frac,  # shape-only experiment
+         mean_move_norm],
         dtype=torch.float32,
-    )  # shape [9]
+    )  # shape [5] (shape-only experiment); restore above lines for [9]
 
     result: dict[str, torch.Tensor] = {
         "type_encoded_id":   torch.tensor(type_ids, dtype=torch.long),

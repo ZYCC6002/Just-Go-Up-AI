@@ -45,6 +45,10 @@ class RouteVAEDecoderConfig:
     # unavailable during autoregressive generation; only the encoder gets this feature)
     use_knn_features: bool = False
 
+    # Ablation flags — must match encoder (and the preprocessed cache).
+    use_absolute_pos: bool = True
+    use_type_feature: bool = True
+
     # Decoder transformer sizes
     # d_model is deliberately kept at 128 (encoder uses 256).
     # The decoder's job is conditional generation given z + angle/grade — it doesn't

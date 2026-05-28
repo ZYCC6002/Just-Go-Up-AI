@@ -41,6 +41,22 @@ class RouteVAEEncoderConfig:
     use_knn_features: bool = True
     knn_embed_dim: int = 16
 
+    # Ablation flags — set False to remove the feature from the token embedding.
+    # These must match whatever the preprocessed cache was built with.
+    use_absolute_pos: bool = True   # if False, x/y sinusoidal embeddings are dropped
+    use_type_feature: bool = True   # if False, hold-type embedding is dropped
+
+    # Route-level shape descriptor dimension — auto-detected from data at training time
+    # so it stays consistent with whatever route_preprocessing.py produced.
+    shape_desc_dim: int = 9
+
+    # Pooling strategy for the route embedding fed to the bottleneck.
+    # "attention" — learned query attends over hold token outputs via multi-head attention;
+    #               the model decides which holds are style-discriminating (recommended).
+    # "cls"       — shape/CLS token at position 0; fast but risks shortcutting via shape_desc
+    #               pre-computed stats (kept for backward compat with old checkpoints only).
+    route_pool_mode: str = "attention"
+
     # Transformer sizes
     d_model: int = 256            # increased from 128: 32 dims/head, richer per-hold representations
     nhead: int = 8                # 8 heads × 32 dims = d_model; heads can specialise (spatial, type, sequential)
@@ -85,9 +101,10 @@ class RouteTransformerEncoder(nn.Module):
 
         self.hold_embedder = HoldTokenEmbedder(cfg)
 
-        # Shape descriptor MLP: projects [9] route-level stats → d_model CLS token
+        # Shape descriptor MLP: projects shape_desc → d_model CLS token.
+        # Dimension is cfg.shape_desc_dim (9 full / 5 shape-only experiment).
         self.shape_token_mlp = nn.Sequential(
-            nn.Linear(9, cfg.d_model),
+            nn.Linear(cfg.shape_desc_dim, cfg.d_model),
             nn.GELU(),
             nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps),
         )
@@ -130,6 +147,24 @@ class RouteTransformerEncoder(nn.Module):
             self.pre_encoder_adaln = None
             self.post_encoder_adaln = None
 
+        # Attention pooling: a single learned query attends over hold token outputs.
+        # The model learns which holds (and which feature dimensions) are most
+        # style-discriminating, producing a soft weighted route summary.
+        # Only instantiated when route_pool_mode == "attention" (skipped for "cls" so
+        # old checkpoints without these weights still load cleanly).
+        pool_mode = getattr(cfg, "route_pool_mode", "attention")
+        if pool_mode == "attention":
+            self.pool_query = nn.Parameter(torch.randn(cfg.d_model) * 0.02)
+            self.pool_attn = nn.MultiheadAttention(
+                embed_dim=cfg.d_model,
+                num_heads=cfg.nhead,
+                dropout=0.0,   # no dropout on the pooling step — we want stable weights
+                batch_first=True,
+            )
+        else:
+            self.pool_query: nn.Parameter | None = None  # type: ignore[assignment]
+            self.pool_attn: nn.MultiheadAttention | None = None
+
     def _build_condition_embedding(
         self,
         *,
@@ -154,7 +189,7 @@ class RouteTransformerEncoder(nn.Module):
 
     @staticmethod
     def masked_mean_pool(token_embeddings: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
-        """Mean pool over non-padded tokens.
+        """Mean pool over non-padded tokens (utility; not used by default pooling path).
 
         Args:
             token_embeddings: [B, L, D]
@@ -214,10 +249,26 @@ class RouteTransformerEncoder(nn.Module):
             encoded = torch.cat([encoded[:, :1, :], hold_enc], dim=1)
         encoded = self.final_norm(encoded)
 
-        # Route embedding = shape/CLS token at position 0
-        route_embedding = encoded[:, 0, :]      # [B, d_model]
-        # Token embeddings = hold tokens only (exclude shape token)
+        # Token embeddings = hold tokens only (exclude shape token at position 0)
         token_embeddings = encoded[:, 1:, :]    # [B, L, d_model]
+
+        # Route embedding: learned attention pool over hold tokens.
+        # A single trainable query attends over all hold token outputs; the model
+        # learns which holds matter most for style encoding.  The shape/CLS token
+        # is deliberately excluded (hold tokens only) to prevent shortcutting via
+        # pre-computed shape_desc statistics.
+        # Falls back to CLS only for old checkpoints that were saved without pool_query.
+        hold_padding = padding_mask[:, 1:]  # [B, L] — padding mask for hold tokens only
+        if self.pool_attn is not None:
+            q = self.pool_query.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1)  # [B, 1, d_model]
+            route_embedding, _ = self.pool_attn(
+                q, token_embeddings, token_embeddings,
+                key_padding_mask=hold_padding,
+            )
+            route_embedding = route_embedding.squeeze(1)  # [B, d_model]
+        else:
+            # "cls" fallback for backward-compat with pre-attention-pool checkpoints
+            route_embedding = encoded[:, 0, :]  # [B, d_model]
 
         return {"token_embeddings": token_embeddings, "route_embedding": route_embedding}
 
