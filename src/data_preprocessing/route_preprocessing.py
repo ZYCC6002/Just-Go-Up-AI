@@ -44,14 +44,12 @@ class CategoricalVocab:
 @dataclass
 class RouteVocabBundle:
     type_vocab: CategoricalVocab
-    function_vocab: CategoricalVocab
     role_vocab: CategoricalVocab
     hole_vocab: CategoricalVocab
 
     def to_transformer_config(self, **overrides: Any) -> RouteVAEEncoderConfig:
         base = dict(
             type_vocab_size=self.type_vocab.size,
-            function_vocab_size=self.function_vocab.size,
             role_vocab_size=self.role_vocab.size,
             hole_id_vocab_size=self.hole_vocab.size,
         )
@@ -67,7 +65,6 @@ class RawHoldToken:
     x: float
     y: float
     type_name: str
-    function_name: str
     depth: float
     orientation_deg: float
     size: float
@@ -116,7 +113,6 @@ def _extract_hold_token(hold: HoldPlacement) -> RawHoldToken | None:
             x=float(hold.x),
             y=float(hold.y),
             type_name=UNKNOWN_TOKEN,
-            function_name=UNKNOWN_TOKEN,
             depth=0.0,
             orientation_deg=0.0,
             size=2.0,
@@ -131,7 +127,6 @@ def _extract_hold_token(hold: HoldPlacement) -> RawHoldToken | None:
         x=float(hold.x),
         y=float(hold.y),
         type_name=str(md.type) if md.type else UNKNOWN_TOKEN,
-        function_name=str(md.function) if md.function else UNKNOWN_TOKEN,
         depth=float(md.depth if md.depth is not None else 0),
         orientation_deg=float(md.orientation if md.orientation is not None else 0),
         size=float(md.size if md.size is not None else 2),
@@ -161,7 +156,6 @@ def _encode_route_tokens(
 
     # Categorical features
     type_ids = [vocabs.type_vocab.encode(tok.type_name) for tok in route_tokens]
-    function_ids = [vocabs.function_vocab.encode(tok.function_name) for tok in route_tokens]
     role_ids = [vocabs.role_vocab.encode(tok.role_id) for tok in route_tokens]
     hole_ids = [vocabs.hole_vocab.encode(tok.hole_id) for tok in route_tokens]
 
@@ -176,24 +170,56 @@ def _encode_route_tokens(
     # Half-diagonal (~"cross-board move") serves as the upper bound for mean_move_norm.
     board_diag = math.sqrt(board_x_span ** 2 + board_y_span ** 2)
 
-    # --- Delta features (move from previous hold in y-sorted sequence) ---
-    # Normalised by board span so values are in roughly [-1, 1] / [0, 1] regardless
-    # of which physical board size a route was set on.
-    delta_x_raw = [0.0] + [xs[i] - xs[i - 1] for i in range(1, len(xs))]
-    delta_y_raw = [0.0] + [ys[i] - ys[i - 1] for i in range(1, len(ys))]
-    delta_x_prev = [dx / board_x_span for dx in delta_x_raw]
-    delta_y_prev = [dy / board_y_span for dy in delta_y_raw]
+    # --- Delta features (move between consecutive HAND holds in y-sorted sequence) ---
+    # Foot holds receive delta = 0 — they are not part of the hand-sequence moves.
+    # Normalised by board span so values are in roughly [-1, 1] regardless of board size.
+    delta_x_prev = [0.0] * len(route_tokens)
+    delta_y_prev = [0.0] * len(route_tokens)
+    last_hand_x: float | None = None
+    last_hand_y: float | None = None
+    for i, tok in enumerate(route_tokens):
+        if not _is_foot_hold(tok):
+            if last_hand_x is not None:
+                delta_x_prev[i] = (tok.x - last_hand_x) / board_x_span
+                delta_y_prev[i] = (tok.y - last_hand_y) / board_y_span
+            last_hand_x = tok.x
+            last_hand_y = tok.y
+        # foot holds: delta stays 0.0
 
-    # --- Nearest-neighbour distance (encoder-only; requires full sequence) ---
-    # Normalised by board diagonal → [0, 1] for any realistic board size.
-    if len(xs) >= 2:
-        coords = np.array(list(zip(xs, ys)), dtype=np.float32)
-        diffs = coords[:, None, :] - coords[None, :, :]   # [N, N, 2]
-        dists_mat = np.sqrt((diffs ** 2).sum(axis=-1))     # [N, N]
+    # --- k-NN neighbourhood features (encoder-only; requires full sequence) ---
+    # For each hold: distances + bearing angles to k=3 nearest other holds.
+    # Distances normalised by board diagonal; bearings encoded as (sin, cos).
+    # Shape: [N, K*3] = [N, 9]
+    K = 3
+    N = len(route_tokens)
+    if N >= 2:
+        coords = np.array(list(zip(xs, ys)), dtype=np.float32)       # [N, 2]
+        diffs = coords[None, :, :] - coords[:, None, :]               # [N, N, 2] i→j vectors
+        dists_mat = np.sqrt((diffs ** 2).sum(axis=-1))                # [N, N]
         np.fill_diagonal(dists_mat, np.inf)
-        dist_to_nearest = (dists_mat.min(axis=1) / board_diag).tolist()
+
+        k_actual = min(K, N - 1)
+        sorted_idx = np.argsort(dists_mat, axis=1)[:, :k_actual]     # [N, k_actual]
+        knn_dists = dists_mat[np.arange(N)[:, None], sorted_idx] / board_diag  # normalised [0,1]
+
+        knn_dx = diffs[np.arange(N)[:, None], sorted_idx, 0]         # [N, k_actual]
+        knn_dy = diffs[np.arange(N)[:, None], sorted_idx, 1]
+        knn_sin = np.sin(np.arctan2(knn_dy, knn_dx))
+        knn_cos = np.cos(np.arctan2(knn_dy, knn_dx))
+
+        def _pad_k(arr: np.ndarray, target_k: int) -> np.ndarray:
+            if arr.shape[1] < target_k:
+                pad = np.zeros((arr.shape[0], target_k - arr.shape[1]), dtype=arr.dtype)
+                return np.concatenate([arr, pad], axis=1)
+            return arr
+
+        knn_features = np.concatenate([
+            _pad_k(knn_dists, K),  # [N, K] — neighbour distances
+            _pad_k(knn_sin,   K),  # [N, K] — bearing sines
+            _pad_k(knn_cos,   K),  # [N, K] — bearing cosines
+        ], axis=1).astype(np.float32)  # [N, K*3 = 9]
     else:
-        dist_to_nearest = [0.0] * len(route_tokens)
+        knn_features = np.zeros((N, K * 3), dtype=np.float32)
 
     # --- Route-level shape descriptor [9] ---
     n_total = max(len(route_tokens), 1)
@@ -242,7 +268,6 @@ def _encode_route_tokens(
 
     result: dict[str, torch.Tensor] = {
         "type_encoded_id":   torch.tensor(type_ids, dtype=torch.long),
-        "function_encoded_id": torch.tensor(function_ids, dtype=torch.long),
         "role_encoded_id":   torch.tensor(role_ids, dtype=torch.long),
         "hole_encoded_id":   torch.tensor(hole_ids, dtype=torch.long),
         "x":                 torch.tensor(xs, dtype=torch.float32),
@@ -251,10 +276,11 @@ def _encode_route_tokens(
         "orientation_sin":   torch.tensor(orientation_sin, dtype=torch.float32),
         "orientation_cos":   torch.tensor(orientation_cos, dtype=torch.float32),
         "size":              torch.tensor([tok.size for tok in route_tokens], dtype=torch.float32),
-        # New per-hold features
+        # Per-hold move features
         "delta_x_prev":      torch.tensor(delta_x_prev, dtype=torch.float32),
         "delta_y_prev":      torch.tensor(delta_y_prev, dtype=torch.float32),
-        "dist_to_nearest":   torch.tensor(dist_to_nearest, dtype=torch.float32),
+        # k-NN neighbourhood features (encoder-only, 2D: [L, K*3=9])
+        "knn_features":      torch.tensor(knn_features, dtype=torch.float32),
         # Route-level descriptor (special: shape [9], not [L])
         "shape_desc":        shape_desc,
     }
@@ -443,18 +469,15 @@ def build_training_samples_from_db(
         raise ValueError("No routes matched preprocessing filters.")
 
     all_types: list[str] = []
-    all_functions: list[str] = []
     all_roles: list[int] = []
     all_holes: list[int] = []
     for _climb, tokens, _coverage in raw_routes:
         all_types.extend(tok.type_name for tok in tokens)
-        all_functions.extend(tok.function_name for tok in tokens)
         all_roles.extend(tok.role_id for tok in tokens)
         all_holes.extend(tok.hole_id for tok in tokens)
 
     vocabs = RouteVocabBundle(
         type_vocab=_build_vocab(all_types, include_unknown=True),
-        function_vocab=_build_vocab(all_functions, include_unknown=True),
         role_vocab=_build_vocab(all_roles, include_unknown=False),
         hole_vocab=_build_vocab(all_holes, include_unknown=False),
     )

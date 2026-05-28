@@ -20,13 +20,11 @@ class RouteVAEEncoderConfig:
 
     # Feature vocab sizes (set based on preprocessing vocabularies)
     type_vocab_size: int
-    function_vocab_size: int
     role_vocab_size: int
     hole_id_vocab_size: int
 
     # Per-feature embedding sizes
     type_embed_dim: int = 32          # increased from 16: most style-discriminating feature
-    function_embed_dim: int = 8
     role_embed_dim: int = 8
     hole_id_embed_dim: int = 16
     x_embed_dim: int = 16
@@ -37,19 +35,20 @@ class RouteVAEEncoderConfig:
     size_embed_dim: int = 8
 
     # Move delta embeddings (per-hold, encoder + decoder)
-    delta_embed_dim: int = 8             # used for delta_x_prev, delta_y_prev, dist_to_nearest
+    delta_embed_dim: int = 8             # used for delta_x_prev, delta_y_prev
 
-    # Nearest-neighbour distance feature (encoder-only; requires full sequence)
-    use_dist_to_nearest: bool = True
+    # k-NN neighbourhood features (encoder-only; requires full sequence)
+    use_knn_features: bool = True
+    knn_embed_dim: int = 16
 
     # Transformer sizes
-    d_model: int = 128
-    nhead: int = 8
-    num_layers: int = 4
-    dim_feedforward: int = 256
+    d_model: int = 256            # increased from 128: 32 dims/head, richer per-hold representations
+    nhead: int = 8                # 8 heads × 32 dims = d_model; heads can specialise (spatial, type, sequential)
+    num_layers: int = 6           # increased from 4: allows hold→pair→regional→route hierarchy
+    dim_feedforward: int = 1024   # 4× d_model (standard ratio); was 256 = 2×, which bottlenecked feature synthesis
     dropout: float = 0.1
     layer_norm_eps: float = 1e-5
-    condition_hidden_dim: int = 64
+    condition_hidden_dim: int = 128  # scaled with d_model (was 64)
     use_condition: bool = True
     use_cond_adaln: bool = True
 
@@ -230,17 +229,20 @@ def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.T
         raise ValueError("samples must be non-empty")
 
     CATEGORICAL_KEYS = {
-        "type_encoded_id", "function_encoded_id", "role_encoded_id", "hole_encoded_id",
+        "type_encoded_id", "role_encoded_id", "hole_encoded_id",
     }
     # Core per-hold keys always present
     FEATURE_KEYS = [
-        "type_encoded_id", "function_encoded_id", "role_encoded_id", "hole_encoded_id",
+        "type_encoded_id", "role_encoded_id", "hole_encoded_id",
         "x", "y", "depth", "orientation_sin", "orientation_cos", "size",
     ]
-    # Optional per-hold features — include only if present in this batch's samples
-    for optional_key in ("delta_x_prev", "delta_y_prev", "dist_to_nearest"):
+    # Optional 1-D per-hold features — include only if present in this batch's samples
+    for optional_key in ("delta_x_prev", "delta_y_prev"):
         if optional_key in samples[0]:
             FEATURE_KEYS = FEATURE_KEYS + [optional_key]
+
+    # knn_features is [L, 9] per sample — 2D, handled separately below
+    has_knn = "knn_features" in samples[0]
 
     # shape_desc is a per-sample tensor [9], not per-hold — stacked separately
     SAMPLE_LEVEL_KEYS = {"shape_desc"}
@@ -253,6 +255,13 @@ def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.T
         if tensor.shape[0] == target_len:
             return tensor
         pad = torch.zeros(target_len - tensor.shape[0], dtype=tensor.dtype, device=tensor.device)
+        return torch.cat([tensor, pad], dim=0)
+
+    def _pad_2d(tensor: torch.Tensor, target_len: int) -> torch.Tensor:
+        """Pad a [L, D] tensor to [target_len, D] by appending zero rows."""
+        if tensor.shape[0] == target_len:
+            return tensor
+        pad = torch.zeros(target_len - tensor.shape[0], tensor.shape[1], dtype=tensor.dtype, device=tensor.device)
         return torch.cat([tensor, pad], dim=0)
 
     batch: dict[str, torch.Tensor] = {}
@@ -269,9 +278,15 @@ def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.T
         if key in batch:
             batch[key] = batch[key].long()
     for key in ["x", "y", "depth", "orientation_sin", "orientation_cos", "size",
-                "delta_x_prev", "delta_y_prev", "dist_to_nearest"]:
+                "delta_x_prev", "delta_y_prev"]:
         if key in batch:
             batch[key] = batch[key].to(torch.float32)
+
+    # knn_features: [L, 9] per sample → [B, max_len, 9]
+    if has_knn:
+        batch["knn_features"] = torch.stack(
+            [_pad_2d(s["knn_features"], max_len) for s in samples], dim=0
+        ).to(torch.float32)
 
     # Stack sample-level tensors (not per-hold, so no padding needed)
     for key in SAMPLE_LEVEL_KEYS:

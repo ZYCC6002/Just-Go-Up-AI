@@ -119,7 +119,6 @@ class HoldTokenEmbedder(nn.Module):
 
         # Categorical embeddings
         self.type_embedding = nn.Embedding(cfg.type_vocab_size, cfg.type_embed_dim)
-        self.function_embedding = nn.Embedding(cfg.function_vocab_size, cfg.function_embed_dim)
         self.role_embedding = nn.Embedding(cfg.role_vocab_size, cfg.role_embed_dim)
         self.hole_embedding = nn.Embedding(cfg.hole_id_vocab_size, cfg.hole_id_embed_dim)
 
@@ -139,18 +138,18 @@ class HoldTokenEmbedder(nn.Module):
         self.delta_y_projection = nn.Linear(1, delta_dim)
         self._delta_dim = delta_dim
 
-        # Nearest-neighbour distance (encoder-only; requires full hold set)
-        use_dist = getattr(cfg, "use_dist_to_nearest", True)
-        if use_dist:
-            self.dist_projection: nn.Linear | None = nn.Linear(1, delta_dim)
-            self._dist_dim = delta_dim
+        # k-NN neighbourhood features (encoder-only; requires full hold set)
+        use_knn = getattr(cfg, "use_knn_features", True)
+        knn_embed_dim = getattr(cfg, "knn_embed_dim", 16)
+        if use_knn:
+            self.knn_projection: nn.Linear | None = nn.Linear(9, knn_embed_dim)
+            self._knn_dim = knn_embed_dim
         else:
-            self.dist_projection = None
-            self._dist_dim = 0
+            self.knn_projection = None
+            self._knn_dim = 0
 
         token_input_dim = (
             cfg.type_embed_dim
-            + cfg.function_embed_dim
             + cfg.role_embed_dim
             + cfg.hole_id_embed_dim
             + cfg.x_embed_dim
@@ -160,7 +159,7 @@ class HoldTokenEmbedder(nn.Module):
             + cfg.orientation_cos_embed_dim
             + cfg.size_embed_dim
             + self._delta_dim * 2   # delta_x + delta_y
-            + self._dist_dim        # 0 if disabled
+            + self._knn_dim         # 0 if disabled
         )
         self.token_projection = nn.Sequential(
             nn.Linear(token_input_dim, cfg.d_model),
@@ -172,7 +171,6 @@ class HoldTokenEmbedder(nn.Module):
     def embed(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Embed a batch of hold tokens to [B, L, d_model]."""
         type_emb = self.type_embedding(batch["type_encoded_id"])
-        function_emb = self.function_embedding(batch["function_encoded_id"])
         role_emb = self.role_embedding(batch["role_encoded_id"])
         hole_emb = self.hole_embedding(batch["hole_encoded_id"])
 
@@ -188,7 +186,7 @@ class HoldTokenEmbedder(nn.Module):
         )
         size_emb = self.size_projection(normalize_size(batch["size"]).unsqueeze(-1))
 
-        # Move-delta features
+        # Move-delta features (hand-hold sequence deltas)
         delta_x_emb = self.delta_x_projection(
             batch["delta_x_prev"].to(torch.float32).unsqueeze(-1)
         )
@@ -197,16 +195,16 @@ class HoldTokenEmbedder(nn.Module):
         )
 
         parts = [
-            type_emb, function_emb, role_emb, hole_emb,
+            type_emb, role_emb, hole_emb,
             x_emb, y_emb,
             depth_emb, orientation_sin_emb, orientation_cos_emb, size_emb,
             delta_x_emb, delta_y_emb,
         ]
 
-        # Optional: nearest-neighbour distance (encoder-only)
-        if self.dist_projection is not None and "dist_to_nearest" in batch:
+        # Optional: k-NN neighbourhood features (encoder-only; [B, L, 9] → [B, L, knn_embed_dim])
+        if self.knn_projection is not None and "knn_features" in batch:
             parts.append(
-                self.dist_projection(batch["dist_to_nearest"].to(torch.float32).unsqueeze(-1))
+                self.knn_projection(batch["knn_features"].to(torch.float32))
             )
 
         token_concat = torch.cat(parts, dim=-1)
@@ -277,7 +275,12 @@ def build_model_from_checkpoint(
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     ckpt_args: dict[str, Any] = dict(ckpt.get("args", {}))
 
-    enc_cfg = vocabs.to_transformer_config()
+    enc_cfg = vocabs.to_transformer_config(
+        d_model=int(ckpt_args.get("encoder_d_model", 256)),
+        nhead=int(ckpt_args.get("encoder_nhead", 8)),
+        num_layers=int(ckpt_args.get("encoder_num_layers", 6)),
+        dim_feedforward=int(ckpt_args.get("encoder_dim_feedforward", 1024)),
+    )
     enc_cfg.use_condition = bool(ckpt_args.get("encoder_use_condition", True))
     enc_cfg.use_cond_adaln = bool(ckpt_args.get("encoder_use_cond_adaln", True))
 
@@ -287,16 +290,18 @@ def build_model_from_checkpoint(
     )
     dec_cfg = RouteVAEDecoderConfig(
         type_vocab_size=enc_cfg.type_vocab_size,
-        function_vocab_size=enc_cfg.function_vocab_size,
         role_vocab_size=enc_cfg.role_vocab_size,
         hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
         latent_dim=latent_dim,
         use_cond_adaln=bool(ckpt_args.get("decoder_use_cond_adaln", True)),
         z_memory_tokens=int(ckpt_args.get("decoder_z_memory_tokens", 4)),
+        d_model=int(ckpt_args.get("decoder_d_model", 128)),
+        num_layers=int(ckpt_args.get("decoder_num_layers", 4)),
+        dim_feedforward=int(ckpt_args.get("decoder_dim_feedforward", 512)),
         # Match encoder embedding dims (stored in checkpoint args for backward compat)
         type_embed_dim=int(ckpt_args.get("type_embed_dim", 32)),
         delta_embed_dim=enc_cfg.delta_embed_dim,
-        use_dist_to_nearest=False,  # decoder never uses full-sequence dist feature
+        use_knn_features=False,  # decoder never uses full-sequence knn features
         x_min=enc_cfg.x_min,
         x_max=enc_cfg.x_max,
         y_min=enc_cfg.y_min,
@@ -321,7 +326,6 @@ def build_model_from_checkpoint(
 
     eos_ids = DecoderEOSIds(
         type_eos_id=model.decoder.type_eos_id,
-        function_eos_id=model.decoder.function_eos_id,
         role_eos_id=model.decoder.role_eos_id,
         hole_eos_id=model.decoder.hole_eos_id,
     )

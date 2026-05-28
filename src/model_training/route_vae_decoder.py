@@ -18,7 +18,6 @@ class RouteVAEDecoderConfig:
 
     # Feature vocab sizes
     type_vocab_size: int
-    function_vocab_size: int
     role_vocab_size: int
     hole_id_vocab_size: int
 
@@ -30,7 +29,6 @@ class RouteVAEDecoderConfig:
 
     # Per-feature embedding sizes (must match encoder)
     type_embed_dim: int = 32          # increased from 16 to match encoder
-    function_embed_dim: int = 8
     role_embed_dim: int = 8
     hole_id_embed_dim: int = 16
     x_embed_dim: int = 16
@@ -43,24 +41,28 @@ class RouteVAEDecoderConfig:
     # Move delta embeddings (decoder uses delta_x_prev and delta_y_prev)
     delta_embed_dim: int = 8
 
-    # Nearest-neighbour distance: disabled for decoder (requires full sequence, unavailable
-    # during autoregressive generation; only the encoder gets this feature)
-    use_dist_to_nearest: bool = False
+    # k-NN neighbourhood features: disabled for decoder (requires full sequence,
+    # unavailable during autoregressive generation; only the encoder gets this feature)
+    use_knn_features: bool = False
 
     # Decoder transformer sizes
+    # d_model is deliberately kept at 128 (encoder uses 256).
+    # The decoder's job is conditional generation given z + angle/grade — it doesn't
+    # need the same representational richness as the style encoder. Keeping it lighter
+    # also speeds up the autoregressive training inner loop.
     d_model: int = 128
     nhead: int = 8
     num_layers: int = 4
-    dim_feedforward: int = 256
+    dim_feedforward: int = 512   # 4× d_model (standard ratio); was 256 = 2×
     dropout: float = 0.1
     layer_norm_eps: float = 1e-5
     max_seq_len: int = 128
 
     # Input normalization ranges (keep consistent with encoder)
-    x_min: float = 0.0
-    x_max: float = 140.0
-    y_min: float = 0.0
-    y_max: float = 160.0
+    x_min: float = -20.0
+    x_max: float = 164.0
+    y_min: float = 4.0
+    y_max: float = 176.0
     angle_min: float = 0.0
     angle_max: float = 70.0
     grade_min: float = 10.0
@@ -85,7 +87,6 @@ class RouteTransformerDecoder(nn.Module):
 
         # EOS ids for each categorical output head (base vocab + 1 EOS slot each).
         self.type_eos_id = cfg.type_vocab_size
-        self.function_eos_id = cfg.function_vocab_size
         self.role_eos_id = cfg.role_vocab_size
         self.hole_eos_id = cfg.hole_id_vocab_size
 
@@ -147,9 +148,8 @@ class RouteTransformerDecoder(nn.Module):
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=cfg.num_layers)
         self.final_norm = nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps)
 
-        # Output heads: 4 categorical (base vocab + EOS) + 6 numeric
+        # Output heads: 3 categorical (base vocab + EOS) + 6 numeric
         self.type_head = nn.Linear(cfg.d_model, cfg.type_vocab_size + 1)
-        self.function_head = nn.Linear(cfg.d_model, cfg.function_vocab_size + 1)
         self.role_head = nn.Linear(cfg.d_model, cfg.role_vocab_size + 1)
         self.hole_head = nn.Linear(cfg.d_model, cfg.hole_id_vocab_size + 1)
         self.x_head = nn.Linear(cfg.d_model, 1)
@@ -250,7 +250,6 @@ class RouteTransformerDecoder(nn.Module):
         return {
             "hidden_states": decoded,
             "type_logits": self.type_head(decoded),
-            "function_logits": self.function_head(decoded),
             "role_logits": self.role_head(decoded),
             "hole_logits": self.hole_head(decoded),
             "x_pred": torch.sigmoid(self.x_head(decoded).squeeze(-1)),

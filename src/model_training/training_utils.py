@@ -10,7 +10,6 @@ from .route_vae_encoder import collate_hold_token_batch
 
 FEATURE_KEYS = [
 	"type_encoded_id",
-	"function_encoded_id",
 	"role_encoded_id",
 	"hole_encoded_id",
 	"x",
@@ -19,10 +18,10 @@ FEATURE_KEYS = [
 	"orientation_sin",
 	"orientation_cos",
 	"size",
-	# New per-hold move features (available for both encoder and decoder)
+	# Per-hold move features (available for both encoder and decoder)
 	"delta_x_prev",
 	"delta_y_prev",
-	# Note: dist_to_nearest is intentionally omitted here — it is encoder-only
+	# Note: knn_features is intentionally omitted here — it is encoder-only
 	# (requires the full hold sequence, unavailable during autoregressive decoding).
 	# The encoder reads it directly from the encoder_batch (which includes it via
 	# collate_hold_token_batch), but decoder_input_batch is built from FEATURE_KEYS only.
@@ -32,7 +31,6 @@ FEATURE_KEYS = [
 @dataclass(frozen=True)
 class DecoderEOSIds:
 	type_eos_id: int
-	function_eos_id: int
 	role_eos_id: int
 	hole_eos_id: int
 
@@ -97,7 +95,6 @@ def prepare_teacher_forcing_batch(
 
 	categorical_targets = {
 		"type_target": _build_cat_target("type_encoded_id", eos_ids.type_eos_id),
-		"function_target": _build_cat_target("function_encoded_id", eos_ids.function_eos_id),
 		"role_target": _build_cat_target("role_encoded_id", eos_ids.role_eos_id),
 		"hole_target": _build_cat_target("hole_encoded_id", eos_ids.hole_eos_id),
 	}

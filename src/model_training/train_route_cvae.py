@@ -97,24 +97,45 @@ def _build_model(
     latent_dim: int,
     encoder_use_condition: bool,
     encoder_use_cond_adaln: bool,
+    encoder_d_model: int,
+    encoder_nhead: int,
+    encoder_num_layers: int,
+    encoder_dim_feedforward: int,
     decoder_use_cond_adaln: bool,
     decoder_z_memory_tokens: int,
+    decoder_d_model: int,
+    decoder_num_layers: int,
+    decoder_dim_feedforward: int,
 ) -> tuple[RouteConditionalVAE, DecoderEOSIds, dict[str, float]]:
-    enc_cfg = vocabs.to_transformer_config()
+    if encoder_d_model % encoder_nhead != 0:
+        raise ValueError(
+            f"--encoder-d-model ({encoder_d_model}) must be divisible by --encoder-nhead ({encoder_nhead})"
+        )
+    if decoder_d_model % 8 != 0:
+        raise ValueError(f"--decoder-d-model ({decoder_d_model}) must be divisible by nhead=8")
+
+    enc_cfg = vocabs.to_transformer_config(
+        d_model=encoder_d_model,
+        nhead=encoder_nhead,
+        num_layers=encoder_num_layers,
+        dim_feedforward=encoder_dim_feedforward,
+    )
     enc_cfg.use_condition = encoder_use_condition
     enc_cfg.use_cond_adaln = encoder_use_cond_adaln
 
     dec_cfg = RouteVAEDecoderConfig(
         type_vocab_size=enc_cfg.type_vocab_size,
-        function_vocab_size=enc_cfg.function_vocab_size,
         role_vocab_size=enc_cfg.role_vocab_size,
         hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
         latent_dim=latent_dim,
         use_cond_adaln=decoder_use_cond_adaln,
         z_memory_tokens=decoder_z_memory_tokens,
+        d_model=decoder_d_model,
+        num_layers=decoder_num_layers,
+        dim_feedforward=decoder_dim_feedforward,
         # Sync delta embedding dim with encoder
         delta_embed_dim=enc_cfg.delta_embed_dim,
-        use_dist_to_nearest=False,  # decoder never uses full-sequence dist feature
+        use_knn_features=False,  # decoder never uses full-sequence knn features
         x_min=enc_cfg.x_min,
         x_max=enc_cfg.x_max,
         y_min=enc_cfg.y_min,
@@ -135,9 +156,19 @@ def _build_model(
         decoder=RouteTransformerDecoder(dec_cfg),
     ).to(device)
 
+    total_params = sum(p.numel() for p in model.parameters())
+    print(
+        f"Encoder: d_model={enc_cfg.d_model} nhead={enc_cfg.nhead} "
+        f"layers={enc_cfg.num_layers} ffn={enc_cfg.dim_feedforward}"
+    )
+    print(
+        f"Decoder: d_model={dec_cfg.d_model} nhead={dec_cfg.nhead} "
+        f"layers={dec_cfg.num_layers} ffn={dec_cfg.dim_feedforward}"
+    )
+    print(f"Total parameters: {total_params:,}")
+
     eos_ids = DecoderEOSIds(
         type_eos_id=model.decoder.type_eos_id,
-        function_eos_id=model.decoder.function_eos_id,
         role_eos_id=model.decoder.role_eos_id,
         hole_eos_id=model.decoder.hole_eos_id,
     )
@@ -252,7 +283,7 @@ def _compute_batch_losses(
             cat_targets[f"{feat}_target"].reshape(-1),
             ignore_index=ignore_index,
         )
-        for feat in ("type", "function", "role", "hole")
+        for feat in ("type", "role", "hole")
     )
 
     num_targets = prepared["numeric_targets"]
@@ -394,8 +425,24 @@ def main() -> None:
     parser.add_argument("--kl-beta", type=float, default=0.1)
     parser.add_argument("--encoder-use-condition", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--encoder-use-cond-adaln", action=argparse.BooleanOptionalAction, default=True)
+    # Encoder architecture (saved in checkpoint — must be restored exactly for resume/inference)
+    parser.add_argument("--encoder-d-model", type=int, default=256,
+                        help="Encoder transformer model dimension. Must be divisible by --encoder-nhead.")
+    parser.add_argument("--encoder-nhead", type=int, default=8,
+                        help="Number of encoder attention heads. encoder-d-model / encoder-nhead = dims per head.")
+    parser.add_argument("--encoder-num-layers", type=int, default=6,
+                        help="Number of encoder transformer layers.")
+    parser.add_argument("--encoder-dim-feedforward", type=int, default=1024,
+                        help="Encoder FFN hidden dim. Recommended: 4 × encoder-d-model.")
     parser.add_argument("--decoder-use-cond-adaln", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--decoder-z-memory-tokens", type=int, default=4)
+    # Decoder architecture
+    parser.add_argument("--decoder-d-model", type=int, default=128,
+                        help="Decoder transformer model dimension (kept smaller than encoder).")
+    parser.add_argument("--decoder-num-layers", type=int, default=4,
+                        help="Number of decoder transformer layers.")
+    parser.add_argument("--decoder-dim-feedforward", type=int, default=512,
+                        help="Decoder FFN hidden dim. Recommended: 4 × decoder-d-model.")
     parser.add_argument("--kl-warmup-epochs", type=int, default=None,
                         help="Linear KL warmup epochs. Defaults to 40%% of total epochs.")
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
@@ -442,8 +489,15 @@ def main() -> None:
         latent_dim=args.latent_dim,
         encoder_use_condition=args.encoder_use_condition,
         encoder_use_cond_adaln=args.encoder_use_cond_adaln,
+        encoder_d_model=args.encoder_d_model,
+        encoder_nhead=args.encoder_nhead,
+        encoder_num_layers=args.encoder_num_layers,
+        encoder_dim_feedforward=args.encoder_dim_feedforward,
         decoder_use_cond_adaln=args.decoder_use_cond_adaln,
         decoder_z_memory_tokens=args.decoder_z_memory_tokens,
+        decoder_d_model=args.decoder_d_model,
+        decoder_num_layers=args.decoder_num_layers,
+        decoder_dim_feedforward=args.decoder_dim_feedforward,
     )
 
     max_seq_len = model.decoder.cfg.max_seq_len
