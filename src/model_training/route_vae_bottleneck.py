@@ -127,51 +127,51 @@ def kl_divergence_loss(
 	mu: torch.Tensor,
 	logvar: torch.Tensor,
 	*,
+	kl_beta: float,
 	reduction: Literal["mean", "sum", "none"] = "mean",
 	free_bits: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-	"""KL divergence to N(0, I) for diagonal Gaussian posterior.
+	"""KL divergence to N(0, I) for diagonal Gaussian posterior with free-bits.
 
-	Per sample KL:
+	Per-sample KL:
 	  KL(q(z|x) || p(z)) = -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
 
+	Free-bits uses a single piecewise-linear term per dimension:
+	  loss_i = kl_beta * KL_i + relu(free_bits - KL_i)
+
+	Gradient direction w.r.t. KL_i:
+	  KL_i < free_bits  →  net slope (kl_beta - 1) < 0  →  gradient INCREASES KL_i (escapes collapse)
+	  KL_i ≥ free_bits  →  net slope kl_beta > 0         →  gradient DECREASES KL_i (standard β-VAE)
+
+	The equilibrium is at KL_i = free_bits for every dimension.
+
 	Returns:
-		(raw_kl, floor_penalty): two tensors reduced by `reduction`.
-		  raw_kl:       The actual per-sample KL (no floor applied).
-		                Scale by kl_beta before adding to total loss.
-		  floor_penalty: relu(free_bits - kl_per_dim) summed over dims.
-		                Add to total loss WITHOUT a kl_beta scale factor.
-		                When KL_i < free_bits the gradient is (kl_beta - 1) × dKL,
-		                which is upward when kl_beta < 1, actively pushing collapsed
-		                dims back above the floor. The old clamp approach gave
-		                gradient = 0 for collapsed dims, so they stayed stuck.
+		(unified_kl, raw_kl): two tensors reduced by `reduction`.
+		  unified_kl: loss contribution — add to total with weight 1.0, no external scaling needed.
+		  raw_kl:     unweighted per-sample KL, for logging / kl_excess diagnostics only.
 
 	Args:
-		mu:        Mean of the posterior [B, D].
-		logvar:    Log-variance of the posterior [B, D].
+		mu:        Posterior mean [B, D].
+		logvar:    Posterior log-variance [B, D].
+		kl_beta:   β-VAE weighting applied inside the unified term.
 		reduction: How to reduce over the batch dimension.
-		free_bits: Minimum KL per latent dimension (nats). When > 0, an
-		           unweighted relu penalty is added for each dim below this
-		           floor. Recommended value: 0.5 nats/dim.
+		free_bits: Per-dimension KL floor (nats). Recommended: 0.5–1.0.
 	"""
-	# Per-sample, per-dimension KL: [B, D]
+	# [B, D]
 	kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
-	kl_per_sample = kl_per_dim.sum(dim=-1)  # [B]
+	raw_per_sample = kl_per_dim.sum(dim=-1)  # [B], diagnostics only
 
+	# Unified term — kl_beta and free-bits handled together.
 	if free_bits > 0.0:
-		# relu(free_bits - KL_i): positive when dim i is below the floor.
-		# Entering the loss unscaled (weight 1.0, not kl_beta) means the net
-		# gradient for a collapsed dim is (kl_beta - 1) × dKL/dparams, which
-		# is upward when kl_beta < 1 — actively recovering collapsed dims.
-		floor_per_sample = torch.relu(free_bits - kl_per_dim).sum(dim=-1)  # [B]
+		unified_per_sample = (kl_beta * kl_per_dim + torch.relu(free_bits - kl_per_dim)).sum(dim=-1)
 	else:
-		floor_per_sample = torch.zeros_like(kl_per_sample)
+		unified_per_sample = kl_beta * raw_per_sample
 
 	if reduction == "none":
-		return kl_per_sample, floor_per_sample
+		return unified_per_sample, raw_per_sample
 	if reduction == "sum":
-		return kl_per_sample.sum(), floor_per_sample.sum()
-	return kl_per_sample.mean(), floor_per_sample.mean()
+		return unified_per_sample.sum(), raw_per_sample.sum()
+	return unified_per_sample.mean(), raw_per_sample.mean()
 
 
 class RouteConditionalVAE(nn.Module):
