@@ -273,15 +273,6 @@ def _compute_batch_losses(
 
     adversary_loss_val = 0.0
     if adversary is not None and grade_adversary_weight > 0.0:
-        # Build per-angle grade targets from each sample's full angle_grades dict.
-        # valid_mask is True where climb_stats has quality-filtered grade data.
-        grade_targets, valid_mask = _build_per_angle_grade_targets(
-            batch_samples,
-            device=device,
-            grade_min=grade_min,
-            grade_max=grade_max,
-        )
-
         grade_pred, angle_pred = adversary(out["z"], alpha=grade_adversary_alpha)
 
         # Grade target: route's own grade at its stored angle — exactly what z encodes.
