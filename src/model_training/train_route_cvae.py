@@ -43,6 +43,7 @@ class EpochMetrics:
     categorical_loss: float
     numeric_loss: float
     kl_loss: float
+    kl_floor_penalty: float
     adversary_loss: float
     num_batches: int
 
@@ -293,8 +294,10 @@ def _compute_batch_losses(
         for feat in ("x", "y", "depth", "orientation_sin", "orientation_cos", "size")
     )
 
-    kl_loss = kl_divergence_loss(out["mu"], out["logvar"], reduction="mean", free_bits=free_bits)
-    total = categorical_loss + numeric_weight * numeric_loss + kl_beta * kl_loss
+    kl_loss, kl_floor_penalty = kl_divergence_loss(out["mu"], out["logvar"], reduction="mean", free_bits=free_bits)
+    # kl_beta scales only the actual KL; floor penalty enters unweighted so that
+    # collapsed dims (KL < free_bits) get an upward gradient = (kl_beta-1)×dKL.
+    total = categorical_loss + numeric_weight * numeric_loss + kl_beta * kl_loss + kl_floor_penalty
 
     adversary_loss_val = 0.0
     if adversary is not None and grade_adversary_weight > 0.0:
@@ -325,6 +328,7 @@ def _compute_batch_losses(
         "categorical": float(categorical_loss.detach().cpu()),
         "numeric": float(numeric_loss.detach().cpu()),
         "kl": float(kl_loss.detach().cpu()),
+        "kl_floor_penalty": float(kl_floor_penalty.detach().cpu()),
         "adversary": adversary_loss_val,
     }
     return total, stats
@@ -357,7 +361,7 @@ def _run_epoch(
     if adversary is not None:
         adversary.train(is_train)
 
-    loss_sum = cat_sum = num_sum = kl_sum = adv_sum = 0.0
+    loss_sum = cat_sum = num_sum = kl_sum = floor_pen_sum = adv_sum = 0.0
     batches = 0
 
     for batch_samples in iter_minibatches(samples, batch_size, shuffle=is_train):
@@ -391,16 +395,18 @@ def _run_epoch(
         cat_sum += stats["categorical"]
         num_sum += stats["numeric"]
         kl_sum += stats["kl"]
+        floor_pen_sum += stats["kl_floor_penalty"]
         adv_sum += stats["adversary"]
         batches += 1
 
     if batches == 0:
-        return EpochMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0)
+        return EpochMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)
     return EpochMetrics(
         total_loss=loss_sum / batches,
         categorical_loss=cat_sum / batches,
         numeric_loss=num_sum / batches,
         kl_loss=kl_sum / batches,
+        kl_floor_penalty=floor_pen_sum / batches,
         adversary_loss=adv_sum / batches,
         num_batches=batches,
     )
@@ -542,6 +548,10 @@ def main() -> None:
         model.load_state_dict(resume_ckpt["model_state_dict"])
         if "optimizer_state_dict" in resume_ckpt:
             optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+        if adversary is not None and "adversary_state_dict" in resume_ckpt:
+            adversary.load_state_dict(resume_ckpt["adversary_state_dict"])
+        if adversary_optimizer is not None and "adversary_optimizer_state_dict" in resume_ckpt:
+            adversary_optimizer.load_state_dict(resume_ckpt["adversary_optimizer_state_dict"])
         start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
         best_val = float(resume_ckpt.get("best_val", math.inf))
         print(f"Resumed from {resume_path} (next_epoch={start_epoch}, best_val={best_val:.4f})")
@@ -587,20 +597,30 @@ def main() -> None:
 
         train_recon = train_m.categorical_loss + args.numeric_weight * train_m.numeric_loss
         val_recon = val_m.categorical_loss + args.numeric_weight * val_m.numeric_loss
-        train_wkl = kl_beta * train_m.kl_loss
-        val_wkl = kl_beta * val_m.kl_loss
+        kl_floor = args.free_bits * args.latent_dim  # forced minimum; not meaningful signal
+        train_wkl = kl_beta * max(train_m.kl_loss - kl_floor, 0.0)
+        val_wkl = kl_beta * max(val_m.kl_loss - kl_floor, 0.0)
+        # Checkpoint criterion excludes adversary loss: a well-disentangled model has HIGH
+        # adversary loss (encoder won), which would wrongly inflate val_total and prevent saving.
+        val_save_loss = val_recon + kl_beta * val_m.kl_loss + val_m.kl_floor_penalty
 
         adv_str = (
             f" adv={train_m.adversary_loss:.4f}"
             if args.grade_adversary_weight > 0.0
             else ""
         )
+        train_kl_excess = max(train_m.kl_loss - kl_floor, 0.0)
+        val_kl_excess = max(val_m.kl_loss - kl_floor, 0.0)
         print(
             f"Epoch {epoch:03d} | kl_beta={kl_beta:.6f} "
             f"train total={train_m.total_loss:.4f} recon={train_recon:.4f} w_kl={train_wkl:.4f} "
-            f"cat={train_m.categorical_loss:.4f} num={train_m.numeric_loss:.4f} kl={train_m.kl_loss:.4f}{adv_str} | "
+            f"floor_pen={train_m.kl_floor_penalty:.4f} "
+            f"cat={train_m.categorical_loss:.4f} num={train_m.numeric_loss:.4f} "
+            f"kl={train_m.kl_loss:.4f}(+{train_kl_excess:.4f}){adv_str} | "
             f"val total={val_m.total_loss:.4f} recon={val_recon:.4f} w_kl={val_wkl:.4f} "
-            f"cat={val_m.categorical_loss:.4f} num={val_m.numeric_loss:.4f} kl={val_m.kl_loss:.4f}"
+            f"floor_pen={val_m.kl_floor_penalty:.4f} "
+            f"cat={val_m.categorical_loss:.4f} num={val_m.numeric_loss:.4f} "
+            f"kl={val_m.kl_loss:.4f}(+{val_kl_excess:.4f})"
         )
 
         epoch_history.append(epoch)
@@ -611,18 +631,20 @@ def main() -> None:
         train_kl_history.append(train_wkl)
         val_kl_history.append(val_wkl)
 
-        if val_m.total_loss < best_val:
-            best_val = val_m.total_loss
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "best_val": best_val,
-                    "args": vars(args),
-                },
-                checkpoint_path,
-            )
+        if val_save_loss < best_val:
+            best_val = val_save_loss
+            checkpoint = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "best_val": best_val,
+                "args": vars(args),
+            }
+            if adversary is not None:
+                checkpoint["adversary_state_dict"] = adversary.state_dict()
+            if adversary_optimizer is not None:
+                checkpoint["adversary_optimizer_state_dict"] = adversary_optimizer.state_dict()
+            torch.save(checkpoint, checkpoint_path)
             print(f"Saved checkpoint: {checkpoint_path}")
 
         if args.early_stop_delta is not None and len(val_total_history) >= 2:
@@ -670,9 +692,11 @@ def main() -> None:
             **norm_ranges,
         )
     test_recon = test_m.categorical_loss + args.numeric_weight * test_m.numeric_loss
-    test_wkl = args.kl_beta * test_m.kl_loss
+    kl_floor = args.free_bits * args.latent_dim
+    test_wkl = args.kl_beta * max(test_m.kl_loss - kl_floor, 0.0)
     print(
         f"Test | total={test_m.total_loss:.4f} recon={test_recon:.4f} w_kl={test_wkl:.4f} "
+        f"floor_pen={test_m.kl_floor_penalty:.4f} "
         f"cat={test_m.categorical_loss:.4f} num={test_m.numeric_loss:.4f} kl={test_m.kl_loss:.4f}"
     )
 
