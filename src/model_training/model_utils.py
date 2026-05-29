@@ -304,7 +304,6 @@ def build_model_from_checkpoint(
         num_layers=int(ckpt_args.get("encoder_num_layers", 6)),
         dim_feedforward=int(ckpt_args.get("encoder_dim_feedforward", 1024)),
     )
-    enc_cfg.use_condition = bool(ckpt_args.get("encoder_use_condition", True))
     enc_cfg.use_cond_adaln = bool(ckpt_args.get("encoder_use_cond_adaln", True))
     enc_cfg.use_absolute_pos = bool(ckpt_args.get("use_absolute_pos", True))
     enc_cfg.use_type_feature = bool(ckpt_args.get("use_type_feature", True))

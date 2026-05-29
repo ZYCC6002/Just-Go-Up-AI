@@ -106,16 +106,10 @@ def build_condition_tensors(
 	samples: list[Any],
 	*,
 	device: torch.device | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-	"""Create angle/grade/grade_missing tensors from sample metadata.
-
-	Each sample is expected to provide:
-	- `angle` (float)
-	- `grade` (float | None)
-	"""
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Create angle and grade tensors from sample metadata."""
 	angles = []
 	grades = []
-	grade_missing = []
 
 	def _read(sample: Any, key: str, default: Any = None) -> Any:
 		if isinstance(sample, dict):
@@ -123,19 +117,12 @@ def build_condition_tensors(
 		return getattr(sample, key, default)
 
 	for sample in samples:
-		grade_value = _read(sample, "grade", None)
 		angles.append(float(_read(sample, "angle", 0.0)))
-		if grade_value is None:
-			grades.append(0.0)
-			grade_missing.append(1.0)
-		else:
-			grades.append(float(grade_value))
-			grade_missing.append(0.0)
+		grades.append(float(_read(sample, "grade", 0.0)))
 
 	angle_t = torch.tensor(angles, dtype=torch.float32, device=device)
 	grade_t = torch.tensor(grades, dtype=torch.float32, device=device)
-	grade_missing_t = torch.tensor(grade_missing, dtype=torch.float32, device=device)
-	return angle_t, grade_t, grade_missing_t
+	return angle_t, grade_t
 
 
 def prepare_cvae_training_batch(
@@ -171,7 +158,7 @@ def prepare_cvae_training_batch(
 		ignore_index=ignore_index,
 	)
 
-	angle, grade, grade_missing = build_condition_tensors(samples, device=device)
+	angle, grade = build_condition_tensors(samples, device=device)
 
 	batch_size, seq_len = target_batch["padding_mask"].shape
 
@@ -205,7 +192,6 @@ def prepare_cvae_training_batch(
 		"numeric_targets": numeric_targets,
 		"angle": angle,
 		"grade": grade,
-		"grade_missing": grade_missing,
 		"valid_numeric_mask": valid_numeric_mask,
 	}
 

@@ -119,7 +119,7 @@ class RouteTransformerDecoder(nn.Module):
             nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
         )
         self.grade_mlp = nn.Sequential(
-            nn.Linear(2, cfg.condition_hidden_dim),  # [grade, grade_missing]
+            nn.Linear(1, cfg.condition_hidden_dim),
             nn.GELU(),
             nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
         )
@@ -179,22 +179,13 @@ class RouteTransformerDecoder(nn.Module):
         *,
         angle: torch.Tensor,
         grade: torch.Tensor,
-        grade_missing: torch.Tensor | None,
     ) -> torch.Tensor:
         """Build route-level condition embedding for AdaLN from angle/grade."""
-        if grade_missing is None:
-            grade_missing = torch.zeros_like(grade, dtype=torch.float32)
-        else:
-            grade_missing = grade_missing.to(torch.float32)
-
         angle_emb = self.angle_mlp(
             normalize_minmax(angle, self.cfg.angle_min, self.cfg.angle_max).unsqueeze(-1)
         )
         grade_emb = self.grade_mlp(
-            torch.stack([
-                normalize_minmax(grade, self.cfg.grade_min, self.cfg.grade_max),
-                grade_missing,
-            ], dim=-1)
+            normalize_minmax(grade, self.cfg.grade_min, self.cfg.grade_max).unsqueeze(-1)
         )
         return self.condition_fusion(torch.cat([angle_emb, grade_emb], dim=-1))
 
@@ -222,7 +213,6 @@ class RouteTransformerDecoder(nn.Module):
         z: torch.Tensor,
         angle: torch.Tensor,
         grade: torch.Tensor,
-        grade_missing: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Teacher-forcing forward pass.
 
@@ -231,13 +221,12 @@ class RouteTransformerDecoder(nn.Module):
             z:     latent vector [B, latent_dim]
             angle: route angle condition [B]
             grade: route grade condition [B]
-            grade_missing: optional mask [B] (1.0 if grade missing)
         """
         padding_mask = batch["padding_mask"].bool()
         tgt = self._build_decoder_tokens(batch)
 
         memory = self._build_condition_memory(z=z)
-        cond_emb = self._build_condition_embedding(angle=angle, grade=grade, grade_missing=grade_missing)
+        cond_emb = self._build_condition_embedding(angle=angle, grade=grade)
 
         tgt_mask = self._causal_mask(tgt.shape[1], tgt.device)
         decoded = self.decoder(

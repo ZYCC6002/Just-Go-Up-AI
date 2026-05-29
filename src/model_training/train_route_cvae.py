@@ -94,7 +94,6 @@ def _build_model(
     device: torch.device,
     *,
     latent_dim: int,
-    encoder_use_condition: bool,
     encoder_use_cond_adaln: bool,
     encoder_d_model: int,
     encoder_nhead: int,
@@ -123,7 +122,6 @@ def _build_model(
         num_layers=encoder_num_layers,
         dim_feedforward=encoder_dim_feedforward,
     )
-    enc_cfg.use_condition = encoder_use_condition
     enc_cfg.use_cond_adaln = encoder_use_cond_adaln
     enc_cfg.use_absolute_pos = use_absolute_pos
     enc_cfg.use_type_feature = use_type_feature
@@ -253,7 +251,6 @@ def _compute_batch_losses(
         decoder_batch=prepared["decoder_input_batch"],
         angle=prepared["angle"],
         grade=prepared["grade"],
-        grade_missing=prepared["grade_missing"],
         sample_latent=sample_latent,
     )
 
@@ -286,16 +283,10 @@ def _compute_batch_losses(
         grade_pred, angle_pred = adversary(out["z"], alpha=grade_adversary_alpha)
 
         # Grade target: route's own grade at its stored angle — exactly what z encodes.
-        # With encoder_use_condition=True, z = f(route, angle_A), so grade_A is the
-        # directly inferable signal; multi-angle targets for other angles are weaker
-        # (only correlated via route difficulty, not directly in z).
+        # z = f(route, angle_A), so grade_A is the directly inferable signal.
         grade_range = max(grade_max - grade_min, 1e-6)
         grade_norm = ((prepared["grade"].to(torch.float32) - grade_min) / grade_range).clamp(0.0, 1.0)
-        grade_known = prepared["grade_missing"] < 0.5  # True where grade is not missing
-        if grade_known.any():
-            grade_adv_loss = F.mse_loss(grade_pred[grade_known], grade_norm[grade_known])
-        else:
-            grade_adv_loss = grade_pred.sum() * 0.0
+        grade_adv_loss = F.mse_loss(grade_pred, grade_norm)
 
         angle_range = max(angle_max - angle_min, 1e-6)
         angle_norm = ((prepared["angle"].to(torch.float32) - angle_min) / angle_range).clamp(0.0, 1.0)
@@ -415,7 +406,6 @@ def main() -> None:
     parser.add_argument("--latent-dim", type=int, default=32)
     parser.add_argument("--numeric-weight", type=float, default=0.25)
     parser.add_argument("--kl-beta", type=float, default=0.1)
-    parser.add_argument("--encoder-use-condition", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--encoder-use-cond-adaln", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--use-absolute-pos", action=argparse.BooleanOptionalAction, default=True,
@@ -501,7 +491,6 @@ def main() -> None:
     model, eos_ids, norm_ranges = _build_model(
         vocabs, device,
         latent_dim=args.latent_dim,
-        encoder_use_condition=args.encoder_use_condition,
         encoder_use_cond_adaln=args.encoder_use_cond_adaln,
         encoder_d_model=args.encoder_d_model,
         encoder_nhead=args.encoder_nhead,

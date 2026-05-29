@@ -65,7 +65,6 @@ class RouteVAEEncoderConfig:
     dropout: float = 0.1
     layer_norm_eps: float = 1e-5
     condition_hidden_dim: int = 128  # scaled with d_model (was 64)
-    use_condition: bool = True
     use_cond_adaln: bool = True
 
     # Input normalization ranges — derived from actual hole positions for
@@ -134,18 +133,16 @@ class RouteTransformerEncoder(nn.Module):
             )
         self.final_norm = nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps)
 
-        # Condition embedding: [angle, grade, grade_missing] -> d_model
+        # Condition embedding: [angle, grade] -> d_model
         self.cond_mlp = nn.Sequential(
-            nn.Linear(3, cfg.condition_hidden_dim),
+            nn.Linear(2, cfg.condition_hidden_dim),
             nn.GELU(),
             nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
         )
         if cfg.use_cond_adaln:
             self.pre_encoder_adaln = ConditionAdaLayerNorm(cfg.d_model, cfg.d_model, cfg.layer_norm_eps)
-            self.post_encoder_adaln = ConditionAdaLayerNorm(cfg.d_model, cfg.d_model, cfg.layer_norm_eps)
         else:
             self.pre_encoder_adaln = None
-            self.post_encoder_adaln = None
 
         # Attention pooling: a single learned query attends over hold token outputs.
         # The model learns which holds (and which feature dimensions) are most
@@ -170,18 +167,11 @@ class RouteTransformerEncoder(nn.Module):
         *,
         angle: torch.Tensor,
         grade: torch.Tensor,
-        grade_missing: torch.Tensor | None,
     ) -> torch.Tensor:
-        if grade_missing is None:
-            grade_missing = torch.zeros_like(grade, dtype=torch.float32)
-        else:
-            grade_missing = grade_missing.to(torch.float32)
-
         cond_input = torch.stack(
             [
                 normalize_minmax(angle, self.cfg.angle_min, self.cfg.angle_max),
                 normalize_minmax(grade, self.cfg.grade_min, self.cfg.grade_max),
-                grade_missing,
             ],
             dim=-1,
         )
@@ -206,7 +196,6 @@ class RouteTransformerEncoder(nn.Module):
         *,
         angle: torch.Tensor,
         grade: torch.Tensor,
-        grade_missing: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Encode hold-token sequences.
 
@@ -230,23 +219,11 @@ class RouteTransformerEncoder(nn.Module):
         padding_mask = torch.cat([cls_pad, padding_mask], dim=1)    # [B, L+1]
 
         cond_emb: torch.Tensor | None = None
-        if self.cfg.use_condition:
-            cond_emb = self._build_condition_embedding(
-                angle=angle, grade=grade, grade_missing=grade_missing
-            )
-            if self.pre_encoder_adaln is not None:
-                tokens = self.pre_encoder_adaln(tokens, cond_emb)
-            else:
-                tokens = tokens + cond_emb.unsqueeze(1)
+        if self.pre_encoder_adaln is not None:
+            cond_emb = self._build_condition_embedding(angle=angle, grade=grade)
+            tokens = self.pre_encoder_adaln(tokens, cond_emb)
 
         encoded = self.encoder(tokens, src_key_padding_mask=padding_mask)  # [B, L+1, d_model]
-
-        if self.post_encoder_adaln is not None and cond_emb is not None:
-            # Apply only to hold tokens (1:), not the CLS token (0).
-            # CLS → route_embedding → z: conditioning it here injects grade/angle
-            # directly into z, making the adversary fight a hard-coded signal.
-            hold_enc = self.post_encoder_adaln(encoded[:, 1:, :], cond_emb)
-            encoded = torch.cat([encoded[:, :1, :], hold_enc], dim=1)
         encoded = self.final_norm(encoded)
 
         # Token embeddings = hold tokens only (exclude shape token at position 0)

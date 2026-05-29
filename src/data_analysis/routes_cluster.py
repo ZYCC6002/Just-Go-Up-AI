@@ -143,7 +143,6 @@ def _extract_latent_matrix(
                 prepared["encoder_batch"],
                 angle=prepared["angle"],
                 grade=prepared["grade"],
-                grade_missing=prepared["grade_missing"],
             )
             bottleneck_out = model.bottleneck(enc_out["route_embedding"], sample_latent=False)
             latents.append(bottleneck_out["z"].detach().cpu().numpy())

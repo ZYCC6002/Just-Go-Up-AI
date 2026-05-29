@@ -199,14 +199,12 @@ class RouteConditionalVAE(nn.Module):
 		decoder_batch: dict[str, torch.Tensor],
 		angle: torch.Tensor,
 		grade: torch.Tensor,
-		grade_missing: torch.Tensor | None = None,
 		sample_latent: bool = True,
 	) -> dict[str, torch.Tensor]:
 		enc_out = self.encoder(
 			encoder_batch,
 			angle=angle,
 			grade=grade,
-			grade_missing=grade_missing,
 		)
 
 		bottleneck_out = self.bottleneck(enc_out["route_embedding"], sample_latent=sample_latent)
@@ -216,7 +214,6 @@ class RouteConditionalVAE(nn.Module):
 			z=bottleneck_out["z"],
 			angle=angle,
 			grade=grade,
-			grade_missing=grade_missing,
 		)
 
 		return {
