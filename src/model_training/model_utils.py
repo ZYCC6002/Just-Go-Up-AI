@@ -323,7 +323,6 @@ def build_model_from_checkpoint(
         hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
         latent_dim=latent_dim,
         use_cond_adaln=bool(ckpt_args.get("decoder_use_cond_adaln", True)),
-        z_memory_tokens=int(ckpt_args.get("decoder_z_memory_tokens", 4)),
         d_model=int(ckpt_args.get("decoder_d_model", 128)),
         num_layers=int(ckpt_args.get("decoder_num_layers", 4)),
         dim_feedforward=int(ckpt_args.get("decoder_dim_feedforward", 512)),

@@ -25,7 +25,6 @@ class RouteVAEDecoderConfig:
     latent_dim: int
     condition_hidden_dim: int = 64
     use_cond_adaln: bool = True
-    z_memory_tokens: int = 4
 
     # Per-feature embedding sizes (must match encoder)
     type_embed_dim: int = 32          # increased from 16 to match encoder
@@ -101,16 +100,10 @@ class RouteTransformerDecoder(nn.Module):
         # Learned BOS anchor token
         self.bos_embedding = nn.Parameter(torch.randn(cfg.d_model) * 0.02)
 
-        # Latent memory tokens (cross-attention keys/values)
-        if cfg.z_memory_tokens < 1:
-            raise ValueError("z_memory_tokens must be >= 1")
-        self.z_memory_tokens = cfg.z_memory_tokens
-        self.z_mlp = nn.Sequential(
-            nn.Linear(cfg.latent_dim, cfg.condition_hidden_dim),
-            nn.GELU(),
-            nn.Linear(cfg.condition_hidden_dim, cfg.d_model * cfg.z_memory_tokens),
-        )
-        self.z_memory_positional = nn.Parameter(torch.randn(cfg.z_memory_tokens, cfg.d_model) * 0.02)
+        # Project z into a single d_model-dim memory token for cross-attention.
+        # The cross-attention's internal K/V projections do the rest of the work;
+        # no MLP expansion or multi-token positional tricks needed.
+        self.z_proj = nn.Linear(cfg.latent_dim, cfg.d_model)
 
         # Angle/grade condition pathway for AdaLN
         self.angle_mlp = nn.Sequential(
@@ -169,10 +162,8 @@ class RouteTransformerDecoder(nn.Module):
         return torch.triu(mask, diagonal=1)
 
     def _build_condition_memory(self, *, z: torch.Tensor) -> torch.Tensor:
-        """Expand z into memory tokens for cross-attention. Returns [B, z_memory_tokens, d_model]."""
-        batch_size = z.shape[0]
-        z_tokens = self.z_mlp(z.to(torch.float32)).view(batch_size, self.z_memory_tokens, self.cfg.d_model)
-        return z_tokens + self.z_memory_positional.unsqueeze(0)
+        """Project z to a single d_model memory token for cross-attention. Returns [B, 1, d_model]."""
+        return self.z_proj(z.to(torch.float32)).unsqueeze(1)
 
     def _build_condition_embedding(
         self,

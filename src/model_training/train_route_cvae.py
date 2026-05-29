@@ -100,7 +100,6 @@ def _build_model(
     encoder_num_layers: int,
     encoder_dim_feedforward: int,
     decoder_use_cond_adaln: bool,
-    decoder_z_memory_tokens: int,
     decoder_d_model: int,
     decoder_num_layers: int,
     decoder_dim_feedforward: int,
@@ -134,7 +133,6 @@ def _build_model(
         hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
         latent_dim=latent_dim,
         use_cond_adaln=decoder_use_cond_adaln,
-        z_memory_tokens=decoder_z_memory_tokens,
         d_model=decoder_d_model,
         num_layers=decoder_num_layers,
         dim_feedforward=decoder_dim_feedforward,
@@ -433,7 +431,6 @@ def main() -> None:
     parser.add_argument("--encoder-dim-feedforward", type=int, default=1024,
                         help="Encoder FFN hidden dim. Recommended: 4 × encoder-d-model.")
     parser.add_argument("--decoder-use-cond-adaln", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--decoder-z-memory-tokens", type=int, default=4)
     # Decoder architecture
     parser.add_argument("--decoder-d-model", type=int, default=128,
                         help="Decoder transformer model dimension (kept smaller than encoder).")
@@ -465,8 +462,6 @@ def main() -> None:
         args.kl_warmup_epochs = max(1, int(math.ceil(0.40 * args.epochs)))
     if args.kl_warmup_epochs < 0:
         raise ValueError("--kl-warmup-epochs must be >= 0")
-    if args.decoder_z_memory_tokens < 1:
-        raise ValueError("--decoder-z-memory-tokens must be >= 1")
     if args.early_stop_delta is not None and args.early_stop_delta < 0:
         raise ValueError("--early-stop-delta must be >= 0")
     if args.early_stop_patience < 1:
@@ -497,7 +492,6 @@ def main() -> None:
         encoder_num_layers=args.encoder_num_layers,
         encoder_dim_feedforward=args.encoder_dim_feedforward,
         decoder_use_cond_adaln=args.decoder_use_cond_adaln,
-        decoder_z_memory_tokens=args.decoder_z_memory_tokens,
         decoder_d_model=args.decoder_d_model,
         decoder_num_layers=args.decoder_num_layers,
         decoder_dim_feedforward=args.decoder_dim_feedforward,
