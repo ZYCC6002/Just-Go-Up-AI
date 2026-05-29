@@ -14,17 +14,13 @@ FEATURE_KEYS = [
 	"hole_encoded_id",
 	"x",
 	"y",
-	"depth",
 	"orientation_sin",
 	"orientation_cos",
 	"size",
-	# Per-hold move features (available for both encoder and decoder)
-	"delta_x_prev",
-	"delta_y_prev",
-	# Note: knn_features is intentionally omitted here — it is encoder-only
-	# (requires the full hold sequence, unavailable during autoregressive decoding).
-	# The encoder reads it directly from the encoder_batch (which includes it via
-	# collate_hold_token_batch), but decoder_input_batch is built from FEATURE_KEYS only.
+	# depth excluded: physical hold property, not reconstructed by decoder
+	# delta_x_prev / delta_y_prev excluded: derivable from predicted x/y; teacher-forcing
+	# with ground-truth delta creates a train/inference mismatch
+	# knn_features excluded: requires full sequence, unavailable during autoregressive generation
 ]
 
 
@@ -173,7 +169,6 @@ def prepare_cvae_training_batch(
 	numeric_targets = {
 		"x_target": _shift_numeric_target("x", 0.0, 140.0),
 		"y_target": _shift_numeric_target("y", 0.0, 160.0),
-		"depth_target": _shift_numeric_target("depth", 0.0, 3.0),
 		"orientation_sin_target": _shift_numeric_target("orientation_sin", -1.0, 1.0),
 		"orientation_cos_target": _shift_numeric_target("orientation_cos", -1.0, 1.0),
 		"size_target": _shift_numeric_target("size", 2.0, 5.0),

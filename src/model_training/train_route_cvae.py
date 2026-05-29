@@ -136,9 +136,7 @@ def _build_model(
         d_model=decoder_d_model,
         num_layers=decoder_num_layers,
         dim_feedforward=decoder_dim_feedforward,
-        # Sync delta embedding dim with encoder
-        delta_embed_dim=enc_cfg.delta_embed_dim,
-        use_knn_features=False,  # decoder never uses full-sequence knn features
+        use_knn_features=False,    # decoder never uses full-sequence knn features
         use_absolute_pos=use_absolute_pos,
         use_type_feature=use_type_feature,
         x_min=enc_cfg.x_min,
@@ -266,7 +264,7 @@ def _compute_batch_losses(
     mask = prepared["valid_numeric_mask"]
     numeric_loss = sum(
         masked_mse(out[f"{feat}_pred"], num_targets[f"{feat}_target"], mask)
-        for feat in ("x", "y", "depth", "orientation_sin", "orientation_cos", "size")
+        for feat in ("x", "y", "orientation_sin", "orientation_cos", "size")
     )
 
     # kl_unified is a single term: add to total with weight 1.0 — kl_beta and free-bits are baked in.

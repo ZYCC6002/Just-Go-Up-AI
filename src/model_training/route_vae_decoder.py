@@ -37,9 +37,6 @@ class RouteVAEDecoderConfig:
     orientation_cos_embed_dim: int = 8
     size_embed_dim: int = 8
 
-    # Move delta embeddings (decoder uses delta_x_prev and delta_y_prev)
-    delta_embed_dim: int = 8
-
     # k-NN neighbourhood features: disabled for decoder (requires full sequence,
     # unavailable during autoregressive generation; only the encoder gets this feature)
     use_knn_features: bool = False
@@ -80,7 +77,7 @@ class RouteTransformerDecoder(nn.Module):
 
     Expected teacher-forcing input keys (shifted-right with BOS at position 0):
     - type_encoded_id, role_encoded_id, hole_encoded_id
-    - x, y, depth, orientation_sin, orientation_cos, size
+    - x, y, orientation_sin, orientation_cos, size
     - padding_mask (bool, True for padded tokens)
     """
 
@@ -93,7 +90,10 @@ class RouteTransformerDecoder(nn.Module):
         self.role_eos_id = cfg.role_vocab_size
         self.hole_eos_id = cfg.hole_id_vocab_size
 
-        self.hold_embedder = HoldTokenEmbedder(cfg)
+        # Depth and delta features excluded: depth is a physical hold property not reconstructed
+        # by the decoder; delta is derivable from predicted x/y and teacher-forcing with
+        # ground-truth delta creates a train/inference mismatch.
+        self.hold_embedder = HoldTokenEmbedder(cfg, use_delta=False, use_depth=False)
 
         # Learned sequence position embedding
         self.sequence_position_embedding = nn.Embedding(cfg.max_seq_len, cfg.d_model)
@@ -145,13 +145,12 @@ class RouteTransformerDecoder(nn.Module):
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=cfg.num_layers)
         self.final_norm = nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps)
 
-        # Output heads: 3 categorical (base vocab + EOS) + 6 numeric
+        # Output heads: 3 categorical (base vocab + EOS) + 5 numeric
         self.type_head = nn.Linear(cfg.d_model, cfg.type_vocab_size + 1)
         self.role_head = nn.Linear(cfg.d_model, cfg.role_vocab_size + 1)
         self.hole_head = nn.Linear(cfg.d_model, cfg.hole_id_vocab_size + 1)
         self.x_head = nn.Linear(cfg.d_model, 1)
         self.y_head = nn.Linear(cfg.d_model, 1)
-        self.depth_head = nn.Linear(cfg.d_model, 1)
         self.orientation_sin_head = nn.Linear(cfg.d_model, 1)
         self.orientation_cos_head = nn.Linear(cfg.d_model, 1)
         self.size_head = nn.Linear(cfg.d_model, 1)
@@ -238,7 +237,6 @@ class RouteTransformerDecoder(nn.Module):
             "hole_logits": self.hole_head(decoded),
             "x_pred": torch.sigmoid(self.x_head(decoded).squeeze(-1)),
             "y_pred": torch.sigmoid(self.y_head(decoded).squeeze(-1)),
-            "depth_pred": torch.sigmoid(self.depth_head(decoded).squeeze(-1)),
             "orientation_sin_pred": torch.sigmoid(self.orientation_sin_head(decoded).squeeze(-1)),
             "orientation_cos_pred": torch.sigmoid(self.orientation_cos_head(decoded).squeeze(-1)),
             "size_pred": torch.sigmoid(self.size_head(decoded).squeeze(-1)),

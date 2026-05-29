@@ -110,15 +110,13 @@ class HoldTokenEmbedder(nn.Module):
       use_dist_to_nearest=False on the decoder config to skip this feature)
     """
 
-    def __init__(self, cfg: Any) -> None:
+    def __init__(self, cfg: Any, *, use_delta: bool = True, use_depth: bool = True) -> None:
         super().__init__()
         self.x_min: float = cfg.x_min
         self.x_max: float = cfg.x_max
         self.y_min: float = cfg.y_min
         self.y_max: float = cfg.y_max
 
-        # Optional features — controlled by config flags so ablations don't need
-        # architecture changes, only a flag flip and cache rebuild.
         use_abs = getattr(cfg, "use_absolute_pos", True)
         use_type = getattr(cfg, "use_type_feature", True)
 
@@ -143,17 +141,28 @@ class HoldTokenEmbedder(nn.Module):
             self.y_embedding = None
             self._xy_dim = 0
 
-        # Numeric scalar projections
-        self.depth_projection = nn.Linear(1, cfg.depth_embed_dim)
+        # Depth (encoder only — not reconstructed by decoder)
+        if use_depth:
+            self.depth_projection: nn.Linear | None = nn.Linear(1, cfg.depth_embed_dim)
+            self._depth_dim = cfg.depth_embed_dim
+        else:
+            self.depth_projection = None
+            self._depth_dim = 0
+
         self.orientation_sin_projection = nn.Linear(1, cfg.orientation_sin_embed_dim)
         self.orientation_cos_projection = nn.Linear(1, cfg.orientation_cos_embed_dim)
         self.size_projection = nn.Linear(1, cfg.size_embed_dim)
 
-        # Move-delta projections (delta from previous hold in y-sorted sequence)
+        # Move-delta projections (encoder only — derivable from predicted x/y in decoder)
         delta_dim = getattr(cfg, "delta_embed_dim", 8)
-        self.delta_x_projection = nn.Linear(1, delta_dim)
-        self.delta_y_projection = nn.Linear(1, delta_dim)
-        self._delta_dim = delta_dim
+        if use_delta:
+            self.delta_x_projection: nn.Linear | None = nn.Linear(1, delta_dim)
+            self.delta_y_projection: nn.Linear | None = nn.Linear(1, delta_dim)
+            self._delta_dim = delta_dim
+        else:
+            self.delta_x_projection = None
+            self.delta_y_projection = None
+            self._delta_dim = 0
 
         # k-NN neighbourhood features (encoder-only; requires full hold set)
         use_knn = getattr(cfg, "use_knn_features", True)
@@ -166,16 +175,16 @@ class HoldTokenEmbedder(nn.Module):
             self._knn_dim = 0
 
         token_input_dim = (
-            self._type_dim                  # 0 if use_type_feature=False
+            self._type_dim      # 0 if use_type_feature=False
             + cfg.role_embed_dim
             + cfg.hole_id_embed_dim
-            + self._xy_dim                  # 0 if use_absolute_pos=False
-            + cfg.depth_embed_dim
+            + self._xy_dim      # 0 if use_absolute_pos=False
+            + self._depth_dim   # 0 if use_depth=False
             + cfg.orientation_sin_embed_dim
             + cfg.orientation_cos_embed_dim
             + cfg.size_embed_dim
-            + self._delta_dim * 2           # delta_x + delta_y
-            + self._knn_dim                 # 0 if disabled
+            + self._delta_dim * 2   # 0 if use_delta=False
+            + self._knn_dim         # 0 if use_knn_features=False
         )
         self.token_projection = nn.Sequential(
             nn.Linear(token_input_dim, cfg.d_model),
@@ -189,7 +198,6 @@ class HoldTokenEmbedder(nn.Module):
         role_emb = self.role_embedding(batch["role_encoded_id"])
         hole_emb = self.hole_embedding(batch["hole_encoded_id"])
 
-        depth_emb = self.depth_projection(normalize_depth(batch["depth"]).unsqueeze(-1))
         orientation_sin_emb = self.orientation_sin_projection(
             batch["orientation_sin"].to(torch.float32).unsqueeze(-1)
         )
@@ -197,14 +205,6 @@ class HoldTokenEmbedder(nn.Module):
             batch["orientation_cos"].to(torch.float32).unsqueeze(-1)
         )
         size_emb = self.size_projection(normalize_size(batch["size"]).unsqueeze(-1))
-
-        # Move-delta features (hand-hold sequence deltas)
-        delta_x_emb = self.delta_x_projection(
-            batch["delta_x_prev"].to(torch.float32).unsqueeze(-1)
-        )
-        delta_y_emb = self.delta_y_projection(
-            batch["delta_y_prev"].to(torch.float32).unsqueeze(-1)
-        )
 
         parts: list[torch.Tensor] = []
 
@@ -219,10 +219,16 @@ class HoldTokenEmbedder(nn.Module):
             parts.append(self.x_embedding(normalize_minmax(batch["x"], self.x_min, self.x_max)))
             parts.append(self.y_embedding(normalize_minmax(batch["y"], self.y_min, self.y_max)))
 
-        parts.extend([
-            depth_emb, orientation_sin_emb, orientation_cos_emb, size_emb,
-            delta_x_emb, delta_y_emb,
-        ])
+        # Optional: depth (encoder only — physical hold property, not reconstructed by decoder)
+        if self.depth_projection is not None:
+            parts.append(self.depth_projection(normalize_depth(batch["depth"]).unsqueeze(-1)))
+
+        parts.extend([orientation_sin_emb, orientation_cos_emb, size_emb])
+
+        # Optional: move-delta features (encoder only)
+        if self.delta_x_projection is not None:
+            parts.append(self.delta_x_projection(batch["delta_x_prev"].to(torch.float32).unsqueeze(-1)))
+            parts.append(self.delta_y_projection(batch["delta_y_prev"].to(torch.float32).unsqueeze(-1)))
 
         # Optional: k-NN neighbourhood features (encoder-only; [B, L, 9] → [B, L, knn_embed_dim])
         if self.knn_projection is not None and "knn_features" in batch:
@@ -328,8 +334,7 @@ def build_model_from_checkpoint(
         dim_feedforward=int(ckpt_args.get("decoder_dim_feedforward", 512)),
         # Match encoder embedding dims (stored in checkpoint args for backward compat)
         type_embed_dim=int(ckpt_args.get("type_embed_dim", 32)),
-        delta_embed_dim=enc_cfg.delta_embed_dim,
-        use_knn_features=False,  # decoder never uses full-sequence knn features
+        use_knn_features=False,    # decoder never uses full-sequence knn features
         use_absolute_pos=enc_cfg.use_absolute_pos,
         use_type_feature=enc_cfg.use_type_feature,
         x_min=enc_cfg.x_min,
