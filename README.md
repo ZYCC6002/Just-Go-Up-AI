@@ -152,8 +152,7 @@ python src/data_analysis/routes_cluster.py \
 
 # Filter by grade/angle before clustering (e.g. V6 at 40°)
 python src/data_analysis/routes_cluster.py \
-  --method kmeans --n-clusters 6 --min-grade 22 --max-grade 22 --min-angle 40 --max-angle 40 \
-  --cluster-cache-path data/routes_v6_40deg_kmeans.pt
+  --method kmeans --n-clusters 6 --min-grade 22 --max-grade 22 --min-angle 40 --max-angle 40
 ```
 
 ### 3) Visualize clustered latents

@@ -33,8 +33,9 @@ class GradeAngleAdversaryHead(nn.Module):
     """Predicts grade and angle from z via a GRL to push both out of z.
 
     With encoder_use_condition=True the encoder sees grade and angle via AdaLN,
-    so both can leak into z.  Both heads share a trunk that operates on
-    GRL-reversed z.
+    so both can leak into z.  Grade and angle have **separate** trunks so each
+    can independently probe z for its signal, and asymmetric loss weighting in
+    the training loop can target angle more aggressively than grade.
 
     Grade is predicted at the route's own stored angle (the angle z was encoded
     at) rather than at all listed angles.  The per-angle multi-target design
@@ -43,25 +44,32 @@ class GradeAngleAdversaryHead(nn.Module):
     z encodes one specific (route, angle) pair, so only that angle's grade is
     directly in z.
 
+    Args:
+        latent_dim:  dimensionality of z
+        hidden_dim:  width of each trunk's hidden layers (default 128)
+        depth:       number of hidden layers per trunk (default 2)
+
     Returns:
         grade_pred: [B]  normalised grade in [0, 1]
         angle_pred: [B]  normalised angle in [0, 1]
     """
 
-    def __init__(self, latent_dim: int, hidden_dim: int = 64) -> None:
+    def __init__(self, latent_dim: int, hidden_dim: int = 128, depth: int = 2) -> None:
         super().__init__()
-        self.trunk = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.GELU(),
-        )
-        self.grade_head = nn.Sequential(
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid(),
-        )
-        self.angle_head = nn.Sequential(
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid(),
-        )
+        # Independent trunks — each specialises on its own target signal,
+        # preventing gradient interference between the two adversary objectives.
+        self.grade_trunk = self._mlp(latent_dim, hidden_dim, depth)
+        self.grade_head = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
+        self.angle_trunk = self._mlp(latent_dim, hidden_dim, depth)
+        self.angle_head = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
+
+    @staticmethod
+    def _mlp(in_dim: int, hidden_dim: int, depth: int) -> nn.Sequential:
+        """Build a depth-layer MLP with GELU activations."""
+        layers: list[nn.Module] = [nn.Linear(in_dim, hidden_dim), nn.GELU()]
+        for _ in range(depth - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
+        return nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor, alpha: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
         """Args:
@@ -72,9 +80,8 @@ class GradeAngleAdversaryHead(nn.Module):
         """
         alpha_t = torch.tensor(alpha, dtype=z.dtype, device=z.device)
         z_r = _GradientReversal.apply(z, alpha_t)
-        h = self.trunk(z_r)
-        grade_pred = self.grade_head(h).squeeze(-1)
-        angle_pred = self.angle_head(h).squeeze(-1)
+        grade_pred = self.grade_head(self.grade_trunk(z_r)).squeeze(-1)
+        angle_pred = self.angle_head(self.angle_trunk(z_r)).squeeze(-1)
         return grade_pred, angle_pred
 
 

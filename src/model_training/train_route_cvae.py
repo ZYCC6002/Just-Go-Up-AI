@@ -41,9 +41,15 @@ class EpochMetrics:
     total_loss: float
     categorical_loss: float
     numeric_loss: float
-    kl_raw: float          # unweighted KL — for kl=X(+Y) diagnostics, not the loss contribution
-    adversary_loss: float
+    kl_raw: float            # unweighted KL — for kl=X(+Y) diagnostics, not the loss contribution
+    grade_adv_loss: float    # MSE of adversary predicting grade from z; good ≥ Var(grade_norm)
+    angle_adv_loss: float    # MSE of adversary predicting angle from z; good ≥ Var(angle_norm)
     num_batches: int
+
+    @property
+    def adversary_loss(self) -> float:
+        """Combined (unweighted) adversary loss — sum of grade + angle MSE."""
+        return self.grade_adv_loss + self.angle_adv_loss
 
 
 def _compute_kl_beta(*, epoch: int, target_kl_beta: float, kl_warmup_epochs: int) -> float:
@@ -232,6 +238,7 @@ def _compute_batch_losses(
     adversary: GradeAngleAdversaryHead | None = None,
     grade_adversary_weight: float = 0.0,
     grade_adversary_alpha: float = 1.0,
+    angle_adversary_scale: float = 1.0,
     angle_min: float = 0.0,
     angle_max: float = 70.0,
     grade_min: float = 10.0,
@@ -274,7 +281,8 @@ def _compute_batch_losses(
     )
     total = categorical_loss + numeric_weight * numeric_loss + kl_unified
 
-    adversary_loss_val = 0.0
+    grade_adv_val = 0.0
+    angle_adv_val = 0.0
     if adversary is not None and grade_adversary_weight > 0.0:
         grade_pred, angle_pred = adversary(out["z"], alpha=grade_adversary_alpha)
 
@@ -288,12 +296,19 @@ def _compute_batch_losses(
         angle_norm = ((prepared["angle"].to(torch.float32) - angle_min) / angle_range).clamp(0.0, 1.0)
         angle_adv_loss = F.mse_loss(angle_pred, angle_norm)
 
-        adversary_loss = grade_adv_loss + angle_adv_loss
+        # angle_adversary_scale amplifies the angle term so the encoder receives a
+        # proportionally stronger reversed gradient for angle than grade.  The total
+        # adversary contribution to `total` is therefore:
+        #   grade_adversary_weight * (grade_adv + angle_adversary_scale * angle_adv)
+        # → effective grade weight = grade_adversary_weight × 1
+        # → effective angle weight = grade_adversary_weight × angle_adversary_scale
+        adversary_loss = grade_adv_loss + angle_adversary_scale * angle_adv_loss
 
-        adversary_loss_val = float(adversary_loss.detach().cpu())
+        grade_adv_val = float(grade_adv_loss.detach().cpu())
+        angle_adv_val = float(angle_adv_loss.detach().cpu())
         if adversary_in_total:
             # Training only: GRL on z reverses this term's gradient for encoder/bottleneck —
-            # adversary head learns to predict grade; encoder learns to prevent prediction.
+            # adversary head learns to predict grade/angle; encoder learns to prevent prediction.
             # Excluded from validation total: a better-disentangled model has HIGHER adversary
             # loss (encoder won), which would wrongly make val_total look worse.
             total = total + grade_adversary_weight * adversary_loss
@@ -303,7 +318,8 @@ def _compute_batch_losses(
         "categorical": float(categorical_loss.detach().cpu()),
         "numeric": float(numeric_loss.detach().cpu()),
         "kl_raw": float(kl_raw.detach().cpu()),
-        "adversary": adversary_loss_val,
+        "grade_adv": grade_adv_val,
+        "angle_adv": angle_adv_val,
     }
     return total, stats
 
@@ -324,6 +340,7 @@ def _run_epoch(
     adversary_optimizer: AdamW | None = None,
     grade_adversary_weight: float = 0.0,
     grade_adversary_alpha: float = 1.0,
+    angle_adversary_scale: float = 1.0,
     angle_min: float = 0.0,
     angle_max: float = 70.0,
     grade_min: float = 10.0,
@@ -335,7 +352,7 @@ def _run_epoch(
     if adversary is not None:
         adversary.train(is_train)
 
-    loss_sum = cat_sum = num_sum = kl_raw_sum = adv_sum = 0.0
+    loss_sum = cat_sum = num_sum = kl_raw_sum = grade_adv_sum = angle_adv_sum = 0.0
     batches = 0
 
     for batch_samples in iter_minibatches(samples, batch_size, shuffle=is_train):
@@ -353,6 +370,7 @@ def _run_epoch(
                 adversary=adversary,
                 grade_adversary_weight=grade_adversary_weight,
                 grade_adversary_alpha=grade_adversary_alpha,
+                angle_adversary_scale=angle_adversary_scale,
                 angle_min=angle_min, angle_max=angle_max,
                 grade_min=grade_min, grade_max=grade_max,
                 free_bits=free_bits,
@@ -370,17 +388,19 @@ def _run_epoch(
         cat_sum += stats["categorical"]
         num_sum += stats["numeric"]
         kl_raw_sum += stats["kl_raw"]
-        adv_sum += stats["adversary"]
+        grade_adv_sum += stats["grade_adv"]
+        angle_adv_sum += stats["angle_adv"]
         batches += 1
 
     if batches == 0:
-        return EpochMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0)
+        return EpochMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)
     return EpochMetrics(
         total_loss=loss_sum / batches,
         categorical_loss=cat_sum / batches,
         numeric_loss=num_sum / batches,
         kl_raw=kl_raw_sum / batches,
-        adversary_loss=adv_sum / batches,
+        grade_adv_loss=grade_adv_sum / batches,
+        angle_adv_loss=angle_adv_sum / batches,
         num_batches=batches,
     )
 
@@ -447,9 +467,20 @@ def main() -> None:
     parser.add_argument("--early-stop-delta", type=float, default=None)
     parser.add_argument("--early-stop-patience", type=int, default=1)
     parser.add_argument("--grade-adversary-weight", type=float, default=0.0,
-                        help="Weight for grade/angle adversarial disentanglement loss (0 = disabled).")
+                        help="Overall weight applied to the adversary loss term in the total "
+                             "(0 = disabled).  Scales both grade and angle adversary losses.")
     parser.add_argument("--grade-adversary-alpha", type=float, default=1.0,
                         help="Gradient reversal layer scale factor for the adversary head.")
+    parser.add_argument("--angle-adversary-scale", type=float, default=1.0,
+                        help="Additional multiplier applied to the angle adversary loss inside the "
+                             "combined loss: adversary_loss = grade_adv + angle_adversary_scale × angle_adv. "
+                             "Effective angle weight = grade_adversary_weight × angle_adversary_scale. "
+                             "Set > 1 to suppress angle more aggressively than grade.")
+    parser.add_argument("--adversary-hidden-dim", type=int, default=128,
+                        help="Width of each hidden layer in the grade/angle adversary MLP trunks.")
+    parser.add_argument("--adversary-depth", type=int, default=2,
+                        help="Number of hidden layers in each adversary trunk (grade and angle have "
+                             "separate trunks of this depth).")
     parser.add_argument("--free-bits", type=float, default=0.0,
                         help="Minimum KL per latent dimension (nats). Prevents posterior collapse by "
                              "clamping each dimension's KL from below before summing. "
@@ -524,9 +555,46 @@ def main() -> None:
     adversary: GradeAngleAdversaryHead | None = None
     adversary_optimizer: AdamW | None = None
     if args.grade_adversary_weight > 0.0:
-        adversary = GradeAngleAdversaryHead(args.latent_dim).to(device)
+        adversary = GradeAngleAdversaryHead(
+            args.latent_dim,
+            hidden_dim=args.adversary_hidden_dim,
+            depth=args.adversary_depth,
+        ).to(device)
         adversary_optimizer = AdamW(adversary.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        print(f"Grade+angle adversary enabled (weight={args.grade_adversary_weight}, alpha={args.grade_adversary_alpha})")
+        adv_params = sum(p.numel() for p in adversary.parameters())
+        print(
+            f"Grade+angle adversary enabled  weight={args.grade_adversary_weight}  "
+            f"alpha={args.grade_adversary_alpha}  angle_scale={args.angle_adversary_scale}"
+        )
+        print(
+            f"  Adversary: hidden_dim={args.adversary_hidden_dim}  depth={args.adversary_depth}  "
+            f"params={adv_params:,}  (separate grade/angle trunks)"
+        )
+        print(
+            f"  Effective weights — grade: {args.grade_adversary_weight:.1f}  "
+            f"angle: {args.grade_adversary_weight * args.angle_adversary_scale:.1f}"
+        )
+
+        # Empirical chance levels: Var(target_norm) over training set = MSE of the mean predictor.
+        # Val adversary losses should stay AT OR ABOVE these values for good disentanglement.
+        import numpy as np
+        grade_min_r, grade_max_r = norm_ranges["grade_min"], norm_ranges["grade_max"]
+        angle_min_r, angle_max_r = norm_ranges["angle_min"], norm_ranges["angle_max"]
+        grade_norms_all = [
+            ((float(s.grade) - grade_min_r) / max(grade_max_r - grade_min_r, 1e-6))
+            for s in train_samples if s.grade is not None
+        ]
+        angle_norms_all = [
+            ((float(s.angle) - angle_min_r) / max(angle_max_r - angle_min_r, 1e-6))
+            for s in train_samples
+        ]
+        grade_chance = float(np.var(np.clip(grade_norms_all, 0, 1)))
+        angle_chance = float(np.var(np.clip(angle_norms_all, 0, 1)))
+        print(
+            f"  Chance levels (Var of norm. targets in train set): "
+            f"grade={grade_chance:.4f}  angle={angle_chance:.4f}  combined={grade_chance + angle_chance:.4f}"
+        )
+        print(f"  → val grade_adv should be ≥ {grade_chance:.4f}, val angle_adv should be ≥ {angle_chance:.4f}")
 
     best_val = math.inf
     start_epoch = 1
@@ -542,13 +610,15 @@ def main() -> None:
         if "optimizer_state_dict" in resume_ckpt:
             optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
         if adversary is not None and "adversary_state_dict" in resume_ckpt:
-            adversary.load_state_dict(resume_ckpt["adversary_state_dict"])
+            try:
+                adversary.load_state_dict(resume_ckpt["adversary_state_dict"])
+            except RuntimeError:
+                print("Warning: adversary checkpoint is incompatible with the current architecture — starting adversary fresh.")
         if adversary_optimizer is not None and "adversary_optimizer_state_dict" in resume_ckpt:
-            adversary_optimizer.load_state_dict(resume_ckpt["adversary_optimizer_state_dict"])
-        if adversary is not None and "adversary_state_dict" in resume_ckpt:
-            adversary.load_state_dict(resume_ckpt["adversary_state_dict"])
-        if adversary_optimizer is not None and "adversary_optimizer_state_dict" in resume_ckpt:
-            adversary_optimizer.load_state_dict(resume_ckpt["adversary_optimizer_state_dict"])
+            try:
+                adversary_optimizer.load_state_dict(resume_ckpt["adversary_optimizer_state_dict"])
+            except RuntimeError:
+                print("Warning: adversary optimizer checkpoint incompatible — starting adversary optimizer fresh.")
         start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
         best_val = float(resume_ckpt.get("best_val", math.inf))
         print(f"Resumed from {resume_path} (next_epoch={start_epoch}, best_val={best_val:.4f})")
@@ -575,6 +645,7 @@ def main() -> None:
             adversary=adversary, adversary_optimizer=adversary_optimizer,
             grade_adversary_weight=args.grade_adversary_weight,
             grade_adversary_alpha=args.grade_adversary_alpha,
+            angle_adversary_scale=args.angle_adversary_scale,
             free_bits=args.free_bits,
             **norm_ranges,
         )
@@ -588,6 +659,7 @@ def main() -> None:
                 adversary=adversary,
                 grade_adversary_weight=args.grade_adversary_weight,
                 grade_adversary_alpha=args.grade_adversary_alpha,
+                angle_adversary_scale=args.angle_adversary_scale,
                 free_bits=args.free_bits,
                 **norm_ranges,
             )
@@ -597,24 +669,22 @@ def main() -> None:
         kl_floor = args.free_bits * args.latent_dim
 
         # kl_w is the actual KL contribution to total — derived rather than stored separately.
-        # Identity (train): total = recon + kl_w + adv_weight*adv
-        # Identity (val):   total = recon + kl_w                   (adversary excluded from val total)
+        # Identity (train): total = recon + kl_w + grade_adv_weight*(grade_adv + angle_scale*angle_adv)
+        # Identity (val):   total = recon + kl_w   (adversary excluded from val total)
         # kl=X(+Y): X = raw unweighted KL, Y = excess above kl_floor (diagnostic).
-        train_kl_w = train_m.total_loss - train_recon - args.grade_adversary_weight * train_m.adversary_loss
+        train_weighted_adv = args.grade_adversary_weight * (
+            train_m.grade_adv_loss + args.angle_adversary_scale * train_m.angle_adv_loss
+        )
+        train_kl_w = train_m.total_loss - train_recon - train_weighted_adv
         val_kl_w = val_m.total_loss - val_recon
         train_kl_excess = max(train_m.kl_raw - kl_floor, 0.0)
         val_kl_excess = max(val_m.kl_raw - kl_floor, 0.0)
 
-        adv_str = (
-            f" adv={train_m.adversary_loss:.4f}"
-            if args.grade_adversary_weight > 0.0
-            else ""
-        )
-        val_adv_str = (
-            f" adv={val_m.adversary_loss:.4f}"
-            if args.grade_adversary_weight > 0.0
-            else ""
-        )
+        if args.grade_adversary_weight > 0.0:
+            adv_str = f" g_adv={train_m.grade_adv_loss:.4f} a_adv={train_m.angle_adv_loss:.4f}"
+            val_adv_str = f" g_adv={val_m.grade_adv_loss:.4f} a_adv={val_m.angle_adv_loss:.4f}"
+        else:
+            adv_str = val_adv_str = ""
         print(
             f"Epoch {epoch:03d} | kl_beta={kl_beta:.6f} "
             f"train total={train_m.total_loss:.4f} recon={train_recon:.4f} kl_w={train_kl_w:.4f} "
@@ -692,6 +762,7 @@ def main() -> None:
             adversary=adversary,
             grade_adversary_weight=args.grade_adversary_weight,
             grade_adversary_alpha=args.grade_adversary_alpha,
+            angle_adversary_scale=args.angle_adversary_scale,
             free_bits=args.free_bits,
             **norm_ranges,
         )
@@ -701,7 +772,7 @@ def main() -> None:
     test_kl_floor = args.free_bits * args.latent_dim
     test_kl_excess = max(test_m.kl_raw - test_kl_floor, 0.0)
     test_adv_str = (
-        f" adv={test_m.adversary_loss:.4f}"
+        f" g_adv={test_m.grade_adv_loss:.4f} a_adv={test_m.angle_adv_loss:.4f}"
         if args.grade_adversary_weight > 0.0
         else ""
     )
