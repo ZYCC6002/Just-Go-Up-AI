@@ -167,8 +167,8 @@ def prepare_cvae_training_batch(
 		return tgt
 
 	numeric_targets = {
-		"x_target": _shift_numeric_target("x", 0.0, 140.0),
-		"y_target": _shift_numeric_target("y", 0.0, 160.0),
+		"x_target": _shift_numeric_target("x", -20.0, 164.0),   # matches enc_cfg x_min/x_max
+		"y_target": _shift_numeric_target("y", 4.0, 176.0),     # matches enc_cfg y_min/y_max
 		"orientation_sin_target": _shift_numeric_target("orientation_sin", -1.0, 1.0),
 		"orientation_cos_target": _shift_numeric_target("orientation_cos", -1.0, 1.0),
 		"size_target": _shift_numeric_target("size", 2.0, 5.0),

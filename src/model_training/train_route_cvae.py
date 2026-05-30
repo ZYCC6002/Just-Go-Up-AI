@@ -374,7 +374,7 @@ def _run_epoch(
         batches += 1
 
     if batches == 0:
-        return EpochMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)
+        return EpochMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0)
     return EpochMetrics(
         total_loss=loss_sum / batches,
         categorical_loss=cat_sum / batches,
