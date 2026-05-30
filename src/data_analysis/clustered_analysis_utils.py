@@ -77,8 +77,8 @@ def enable_hover_annotations(
 
 	def _label(i: int) -> str:
 		name = samples[i].name.strip() if samples[i].name else "<unnamed route>"
-		grade = samples[i].grade if samples[i].grade else "<ungraded route>"
-		angle = samples[i].angle if samples[i].angle else "<no angle route>"
+		grade = samples[i].grade if samples[i].grade is not None else "<ungraded route>"
+		angle = samples[i].angle if samples[i].angle is not None else "<no angle route>"
 		if len(name) > 80:
 			name = name[:77] + "..."
 		return f"{name}\ngrade={grade}\nangle={angle}\ncluster={int(cluster_ids[i])}"

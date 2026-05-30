@@ -69,12 +69,27 @@ def _save_loss_curve(
     val_recon: list[float],
     train_kl: list[float],
     val_kl: list[float],
+    train_grade_adv: list[float] | None = None,
+    val_grade_adv: list[float] | None = None,
+    train_angle_adv: list[float] | None = None,
+    val_angle_adv: list[float] | None = None,
+    grade_chance: float | None = None,
+    angle_chance: float | None = None,
     output_path: Path,
 ) -> None:
     if not epochs:
         return
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(12, 4))
+
+    has_adv = bool(train_grade_adv)
+
+    if has_adv:
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        ax1, ax2, ax3 = axes[0]
+        ax4, ax5, ax6 = axes[1]
+        ax6.set_visible(False)
+    else:
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(12, 4))
 
     for ax, train, val, title in [
         (ax1, train_total, val_total, "Total Loss"),
@@ -88,6 +103,24 @@ def _save_loss_curve(
         ax.set_ylabel("Loss")
         ax.grid(alpha=0.3)
         ax.legend(loc="best")
+
+    if has_adv:
+        for ax, train, val, title, chance in [
+            (ax4, train_grade_adv, val_grade_adv, "Grade Adversary (g_adv)", grade_chance),
+            (ax5, train_angle_adv, val_angle_adv, "Angle Adversary (a_adv)", angle_chance),
+        ]:
+            ax.plot(epochs, train, label="Train", linewidth=2)
+            ax.plot(epochs, val, label="Val", linewidth=2)
+            if chance is not None:
+                ax.axhline(
+                    chance, color="gray", linestyle="--", linewidth=1.5,
+                    label=f"Chance ({chance:.4f})",
+                )
+            ax.set_title(title)
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("MSE")
+            ax.grid(alpha=0.3)
+            ax.legend(loc="best")
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
@@ -245,7 +278,7 @@ def _compute_batch_losses(
     grade_max: float = 33.0,
     free_bits: float = 0.0,
     adversary_in_total: bool = True,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, dict[str, float], torch.Tensor | None]:
     prepared = prepare_cvae_training_batch(
         batch_samples, eos_ids=eos_ids, device=device, ignore_index=ignore_index
     )
@@ -283,35 +316,43 @@ def _compute_batch_losses(
 
     grade_adv_val = 0.0
     angle_adv_val = 0.0
-    if adversary is not None and grade_adversary_weight > 0.0:
-        grade_pred, angle_pred = adversary(out["z"], alpha=grade_adversary_alpha)
+    adversary_loss_clean: torch.Tensor | None = None
 
-        # Grade target: route's own grade at its stored angle — exactly what z encodes.
-        # z = f(route, angle_A), so grade_A is the directly inferable signal.
+    if adversary is not None and grade_adversary_weight > 0.0:
         grade_range = max(grade_max - grade_min, 1e-6)
         grade_norm = ((prepared["grade"].to(torch.float32) - grade_min) / grade_range).clamp(0.0, 1.0)
-        grade_adv_loss = F.mse_loss(grade_pred, grade_norm)
-
         angle_range = max(angle_max - angle_min, 1e-6)
         angle_norm = ((prepared["angle"].to(torch.float32) - angle_min) / angle_range).clamp(0.0, 1.0)
-        angle_adv_loss = F.mse_loss(angle_pred, angle_norm)
 
-        # angle_adversary_scale amplifies the angle term so the encoder receives a
-        # proportionally stronger reversed gradient for angle than grade.  The total
-        # adversary contribution to `total` is therefore:
-        #   grade_adversary_weight * (grade_adv + angle_adversary_scale * angle_adv)
-        # → effective grade weight = grade_adversary_weight × 1
-        # → effective angle weight = grade_adversary_weight × angle_adversary_scale
-        adversary_loss = grade_adv_loss + angle_adversary_scale * angle_adv_loss
+        # ── Clean pass (z detached, alpha=0) ────────────────────────────────
+        # The adversary optimizer steps on THIS loss only.  Detaching z breaks
+        # the gradient link to the encoder so the adversary receives a clean
+        # learning signal — it can freely probe z without the encoder's GRL
+        # update simultaneously overriding it every step.
+        # Stats (g_adv / a_adv) are reported from this pass: it is the true
+        # measure of "how well can the adversary predict grade/angle from z?"
+        grade_pred_clean, angle_pred_clean = adversary(out["z"].detach(), alpha=0.0)
+        grade_adv_loss_clean = F.mse_loss(grade_pred_clean, grade_norm)
+        angle_adv_loss_clean = F.mse_loss(angle_pred_clean, angle_norm)
+        adversary_loss_clean = grade_adv_loss_clean + angle_adversary_scale * angle_adv_loss_clean
 
-        grade_adv_val = float(grade_adv_loss.detach().cpu())
-        angle_adv_val = float(angle_adv_loss.detach().cpu())
+        grade_adv_val = float(grade_adv_loss_clean.detach().cpu())
+        angle_adv_val = float(angle_adv_loss_clean.detach().cpu())
+
         if adversary_in_total:
-            # Training only: GRL on z reverses this term's gradient for encoder/bottleneck —
-            # adversary head learns to predict grade/angle; encoder learns to prevent prediction.
-            # Excluded from validation total: a better-disentangled model has HIGHER adversary
-            # loss (encoder won), which would wrongly make val_total look worse.
-            total = total + grade_adversary_weight * adversary_loss
+            # ── GRL pass (z connected, with reversal) ───────────────────────
+            # Only the ENCODER is updated from this path.  The adversary
+            # optimizer is zeroed and re-run on adversary_loss_clean after
+            # loss.backward(), so the polluted adversary gradient from this
+            # pass is discarded.
+            # GRL identity in forward → same adversary outputs as clean pass;
+            # gradient at z is negated × alpha → encoder learns to hide grade.
+            grade_pred_grl, angle_pred_grl = adversary(out["z"], alpha=grade_adversary_alpha)
+            adversary_loss_grl = (
+                F.mse_loss(grade_pred_grl, grade_norm)
+                + angle_adversary_scale * F.mse_loss(angle_pred_grl, angle_norm)
+            )
+            total = total + grade_adversary_weight * adversary_loss_grl
 
     stats = {
         "total": float(total.detach().cpu()),
@@ -321,7 +362,7 @@ def _compute_batch_losses(
         "grade_adv": grade_adv_val,
         "angle_adv": angle_adv_val,
     }
-    return total, stats
+    return total, stats, adversary_loss_clean
 
 
 def _run_epoch(
@@ -362,7 +403,7 @@ def _run_epoch(
                 adversary_optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(is_train):
-            loss, stats = _compute_batch_losses(
+            loss, stats, adversary_loss_clean = _compute_batch_losses(
                 model, batch_samples,
                 device=device, eos_ids=eos_ids,
                 kl_beta=kl_beta, numeric_weight=numeric_weight,
@@ -377,10 +418,21 @@ def _run_epoch(
                 adversary_in_total=is_train,  # adversary excluded from val total (see _compute_batch_losses)
             )
             if is_train:
+                # ── Encoder / decoder update (includes GRL adversary signal) ──
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
-                if adversary_optimizer is not None:
+
+                # ── Adversary update (decoupled clean pass) ───────────────────
+                # Zero the adversary's grads accumulated from loss.backward() above
+                # (those came through the GRL path and are discarded), then backward
+                # on adversary_loss_clean — the detached-z pass where the adversary
+                # freely learns to probe z without the encoder fighting back in the
+                # same step.  This prevents the encoder's 7× stronger GRL signal
+                # from overpowering the adversary every iteration.
+                if adversary_optimizer is not None and adversary_loss_clean is not None:
+                    adversary_optimizer.zero_grad(set_to_none=True)
+                    adversary_loss_clean.backward()
                     nn.utils.clip_grad_norm_(adversary.parameters(), grad_clip_norm)
                     adversary_optimizer.step()
 
@@ -554,6 +606,8 @@ def main() -> None:
 
     adversary: GradeAngleAdversaryHead | None = None
     adversary_optimizer: AdamW | None = None
+    grade_chance: float | None = None
+    angle_chance: float | None = None
     if args.grade_adversary_weight > 0.0:
         adversary = GradeAngleAdversaryHead(
             args.latent_dim,
@@ -630,6 +684,10 @@ def main() -> None:
     val_recon_history: list[float] = []
     train_kl_history: list[float] = []        # kl_beta * kl_loss (full weighted KL, not excess-only)
     val_kl_history: list[float] = []
+    train_grade_adv_history: list[float] = []
+    val_grade_adv_history: list[float] = []
+    train_angle_adv_history: list[float] = []
+    val_angle_adv_history: list[float] = []
     early_stop_stable_epochs = 0
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -702,6 +760,10 @@ def main() -> None:
         val_recon_history.append(val_recon)
         train_kl_history.append(train_kl_w)
         val_kl_history.append(val_kl_w)
+        train_grade_adv_history.append(train_m.grade_adv_loss)
+        val_grade_adv_history.append(val_m.grade_adv_loss)
+        train_angle_adv_history.append(train_m.angle_adv_loss)
+        val_angle_adv_history.append(val_m.angle_adv_loss)
 
         # val_m.total_loss = recon + kl_w + floor_pen (adversary excluded at compute time).
         # This is the right checkpoint criterion: lower = better reconstruction and more active dims.
@@ -746,6 +808,12 @@ def main() -> None:
         val_recon=val_recon_history,
         train_kl=train_kl_history,
         val_kl=val_kl_history,
+        train_grade_adv=train_grade_adv_history or None,
+        val_grade_adv=val_grade_adv_history or None,
+        train_angle_adv=train_angle_adv_history or None,
+        val_angle_adv=val_angle_adv_history or None,
+        grade_chance=grade_chance,
+        angle_chance=angle_chance,
         output_path=Path(args.loss_plot_path),
     )
 
