@@ -281,6 +281,44 @@ def filter_samples_by_decoder_max_len(
 
 
 # ---------------------------------------------------------------------------
+# State dict helpers
+# ---------------------------------------------------------------------------
+
+def _adapt_pool_state_dict(state_dict: dict, d_model: int) -> dict:
+    """Adapt old single-query pool weights to the new multi-query format.
+
+    Old format (single-query attention pooling):
+        encoder.pool_query          [d_model]      → rename + unsqueeze
+        encoder.pool_attn.*                         → unchanged (shape is nhead-agnostic)
+        (no pool_proj)
+
+    New format (multi-query attention pooling):
+        encoder.pool_queries        [K, d_model]
+        encoder.pool_attn.*
+        encoder.pool_proj.weight    [d_model, K*d_model]
+        encoder.pool_proj.bias      [d_model]
+
+    When K=1 (old checkpoint): pool_proj becomes an identity Linear(d_model, d_model).
+    Pre-pooling checkpoints ("cls" mode) have neither key — no change needed.
+    """
+    import torch
+    if "encoder.pool_queries" in state_dict:
+        return state_dict  # already new multi-query format
+    if "encoder.pool_query" not in state_dict:
+        return state_dict  # pre-pooling "cls" checkpoint — no adaptation needed
+
+    # Old single-query: rename and reshape
+    old_q = state_dict.pop("encoder.pool_query")           # [d_model]
+    state_dict["encoder.pool_queries"] = old_q.unsqueeze(0)  # [1, d_model]
+
+    # Add identity pool_proj (Linear(d_model, d_model)) so K=1 is a no-op projection
+    state_dict["encoder.pool_proj.weight"] = torch.eye(d_model, dtype=old_q.dtype)
+    state_dict["encoder.pool_proj.bias"]   = torch.zeros(d_model, dtype=old_q.dtype)
+
+    return state_dict
+
+
+# ---------------------------------------------------------------------------
 # Model factory
 # ---------------------------------------------------------------------------
 
@@ -329,9 +367,13 @@ def build_model_from_checkpoint(
     enc_cfg.use_type_feature = bool(ckpt_args.get("use_type_feature", True))
     enc_cfg.shape_desc_dim = int(ckpt_args.get("shape_desc_dim", 9))
     # Default to "cls" for old checkpoints that pre-date attention pooling —
-    # those checkpoints have no pool_query / pool_attn weights, so "attention"
+    # those checkpoints have no pool_queries / pool_attn weights, so "attention"
     # would cause a strict load_state_dict failure.
     enc_cfg.route_pool_mode = str(ckpt_args.get("route_pool_mode", "cls"))
+    # Pool architecture — old single-query checkpoints default to K=1 / nhead=encoder_nhead
+    # so their pool_query [d_model] and pool_attn weights load cleanly after key adaptation.
+    enc_cfg.pool_num_queries = int(ckpt_args.get("pool_num_queries", 1))
+    enc_cfg.pool_nhead = int(ckpt_args.get("pool_nhead", int(ckpt_args.get("encoder_nhead", 8))))
 
     latent_dim = int(
         latent_dim_override if latent_dim_override is not None
@@ -370,7 +412,8 @@ def build_model_from_checkpoint(
         bottleneck=RouteVAEBottleneck(bottleneck_cfg),
         decoder=RouteTransformerDecoder(dec_cfg),
     ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    state_dict = _adapt_pool_state_dict(dict(ckpt["model_state_dict"]), enc_cfg.d_model)
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
 
     eos_ids = DecoderEOSIds(

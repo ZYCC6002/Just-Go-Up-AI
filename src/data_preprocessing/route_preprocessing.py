@@ -239,14 +239,15 @@ def _encode_route_tokens(
     foot_fraction   = n_foot / n_total
     hand_count_norm = min(n_hand / 20.0, 1.0)  # 20 hand holds ≈ "many" (endurance signal)
 
-    # Per-type fractions — commented out for shape-only experiment.
-    # With these in shape_desc the encoder shortcuts to hold-type clustering;
-    # removing them forces z to encode spatial/geometric route structure instead.
-    # Restore by uncommenting and updating shape_desc below (9D → 5D change).
-    # jug_frac    = sum(1 for t in route_tokens if t.type_name == "jug")    / n_total
-    # sloper_frac = sum(1 for t in route_tokens if t.type_name == "sloper") / n_total
-    # crimp_frac  = sum(1 for t in route_tokens if t.type_name == "crimp")  / n_total
-    # pinch_frac  = sum(1 for t in route_tokens if t.type_name == "pinch")  / n_total
+    # Per-type fractions: fraction of all holds that are each of the four main
+    # Kilter grip types.  These go into the shape_desc CLS token so the encoder
+    # has grip-type context when computing hold-token representations.
+    # NOTE: these also require use_type_feature=True in train_cfg so that the
+    # per-hold type embedding table is included in the encoder token embeddings.
+    jug_frac    = sum(1 for t in route_tokens if t.type_name == "jug")    / n_total
+    sloper_frac = sum(1 for t in route_tokens if t.type_name == "sloper") / n_total
+    crimp_frac  = sum(1 for t in route_tokens if t.type_name == "crimp")  / n_total
+    pinch_frac  = sum(1 for t in route_tokens if t.type_name == "pinch")  / n_total
 
     # Mean pairwise distance between hand holds (deadpoint/reachy vs technical)
     hand_coords = np.array(
@@ -263,12 +264,16 @@ def _encode_route_tokens(
     # already a very large reach regardless of board size.  Clamp at 1.0.
     mean_move_norm = min(mean_move / (board_diag * 0.5), 1.0)
 
+    # Feature ordering is backward-compatible with the 5D shape-only layout:
+    # indices 0-4 are IDENTICAL to the old 5D vector so old checkpoints can
+    # safely truncate shape_desc[:5] and still see the same features they were
+    # trained on.  New checkpoints (shape_desc_dim=9) use all 9 features.
     shape_desc = torch.tensor(
-        [x_std, y_std, foot_fraction, hand_count_norm,
-         # jug_frac, sloper_frac, crimp_frac, pinch_frac,  # shape-only experiment
-         mean_move_norm],
+        [x_std, y_std, foot_fraction, hand_count_norm, mean_move_norm,
+         jug_frac, sloper_frac, crimp_frac, pinch_frac],
         dtype=torch.float32,
-    )  # shape [5] (shape-only experiment); restore above lines for [9]
+    )  # shape [9]: x_std, y_std, foot_frac, hand_density, move_size | jug%, sloper%, crimp%, pinch%
+    # Old 5D layout (still valid at [:5]): x_std, y_std, foot_frac, hand_density, move_size
 
     result: dict[str, torch.Tensor] = {
         "type_encoded_id":   torch.tensor(type_ids, dtype=torch.long),

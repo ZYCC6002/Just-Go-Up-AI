@@ -148,7 +148,8 @@ python src/data_analysis/routes_cluster.py --method kmeans --n-clusters 6
 # HDBSCAN with UMAP pre-reduction (recommended for manifold data)
 python src/data_analysis/routes_cluster.py \
   --method hdbscan --pre-reduce --pre-reduce-method umap --pre-reduce-dims 5 \
-  --hdbscan-min-cluster-size 200 --hdbscan-min-samples 15
+  --min-grade 22 --max-grade 22 --min-angle 40 --max-angle 40 \
+  --hdbscan-min-cluster-size 20 --hdbscan-min-samples 2
 
 # Filter by grade/angle before clustering (e.g. V6 at 40°)
 python src/data_analysis/routes_cluster.py \

@@ -113,9 +113,14 @@ Training runs on GPU via `notebooks/train_route_cvae.ipynb`. The notebook cell `
 "decoder_z_memory_tokens": 8,
 # Route embedding pooling: learned query attends over hold tokens — avoids CLS shortcutting
 "route_pool_mode": "attention",
-# Shape-only ablation: remove absolute coords + hold-type embedding
+# Feature flags:
+#   use_absolute_pos=False  → no sinusoidal x/y in hold tokens; spatial info via deltas + knn only
+#   use_type_feature=True   → hold-type embedding (jug/sloper/crimp/pinch) in tokens + type
+#                             fractions in shape_desc (9D CLS token)
+#   delta features (Δx, Δy) are always ON in the encoder (no flag; hardcoded use_delta=True)
+# IMPORTANT: changing use_type_feature requires --rebuild-cache (shape_desc changes 5D ↔ 9D)
 "use_absolute_pos": False,
-"use_type_feature": False,
+"use_type_feature": True,
 # Encoder architecture (all exposed as CLI args, saved in checkpoint)
 "encoder_d_model": 256,          # 32 dims/head, richer per-hold representations
 "encoder_nhead": 8,
@@ -136,11 +141,14 @@ Training runs on GPU via `notebooks/train_route_cvae.ipynb`. The notebook cell `
 - `mean_move_norm` in `shape_desc` → divided by half the board diagonal → range [0, 1]
 - `x`, `y` raw coordinates are stored as-is; normalised at model time by `RouteVAEEncoderConfig.x_min/x_max/y_min/y_max` (corrected to [−20, 164] and [4, 176] from the actual `holes` table range).
 
-**Per-hold token projection dims** (after removing `function`, replacing `dist_to_nearest` with `knn_features`):
-- Encoder: type(32) + role(8) + hole(16) + x(16) + y(16) + depth(8) + ori_sin(8) + ori_cos(8) + size(8) + Δx(8) + Δy(8) + knn(16) = **160 → d_model=128**
-- Decoder: same minus knn = **144 → d_model=128**
+**Per-hold token projection dims** (current config: `use_type_feature=True`, `use_absolute_pos=False`):
+- Encoder: type(32) + role(8) + hole(16) + depth(8) + ori_sin(8) + ori_cos(8) + size(8) + Δx(8) + Δy(8) + knn(16) = **120 → projected to d_model**
+- Decoder: same minus knn and Δx/Δy = **72 → projected to d_model**
+- `x`/`y` sinusoidal embeddings omitted (`use_absolute_pos=False`); spatial info comes from Δx/Δy move deltas and knn distances/bearings only.
+- shape_desc = [x_std, y_std, foot_frac, hand_density, move_size, jug_frac, sloper_frac, crimp_frac, pinch_frac] → **9D**
+  - Indices 0–4 are identical to the old 5D layout; old checkpoints truncate `[:5]` safely.
 
 After training, verify:
-- **KL** per epoch should remain ≥ `free_bits × latent_dim` (≥ 32.0 with free_bits=2.0). If KL drops below this, free_bits is not being applied correctly.
-- **Val adversary loss** should stay elevated (encoder winning — z is grade- and angle-uninformative). Val adversary loss = grade_adv + angle_adv combined. Theoretical chance level: grade ≈ 0.083 (uniform over 12 grade bands), angle ≈ 0.04 (uniform over 15 angles in 0–1). If val adversary loss drops well below ~0.1, grade or angle is leaking into z; increase `grade_adversary_weight` / `grade_adversary_alpha`.
-- **Total loss** will be higher than previous runs (stronger adversary adds more to total) — expected.
+- **KL** per epoch should remain ≥ `free_bits × latent_dim` (≥ 16.0 with free_bits=1.0, latent_dim=16). If KL collapses, increase free_bits.
+- **No adversary** in this config — grade/angle structure in z is intentional. Verify via Ridge probe in style_analysis.py: global cache should show moderate-high grade/angle R² (model encoded difficulty); micro-cluster cache should show near-zero grade/angle R² (grade/angle controlled).
+- **Style feature R²** in micro-cluster analysis: foot_frac, move_size, crowding should be >0.1 (★) or >0.3 (★★) indicating z captures style.

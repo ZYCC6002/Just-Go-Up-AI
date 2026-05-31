@@ -146,6 +146,8 @@ def _build_model(
     use_type_feature: bool = True,
     shape_desc_dim: int = 9,
     route_pool_mode: str = "cls",
+    pool_num_queries: int = 4,
+    pool_nhead: int = 4,
 ) -> tuple[RouteConditionalVAE, DecoderEOSIds, dict[str, float]]:
     if encoder_d_model % encoder_nhead != 0:
         raise ValueError(
@@ -165,6 +167,8 @@ def _build_model(
     enc_cfg.use_type_feature = use_type_feature
     enc_cfg.shape_desc_dim = shape_desc_dim
     enc_cfg.route_pool_mode = route_pool_mode
+    enc_cfg.pool_num_queries = pool_num_queries
+    enc_cfg.pool_nhead = pool_nhead
 
     dec_cfg = RouteVAEDecoderConfig(
         type_vocab_size=enc_cfg.type_vocab_size,
@@ -488,9 +492,15 @@ def main() -> None:
     parser.add_argument(
         "--route-pool-mode", type=str, default="attention", choices=["attention", "cls"],
         help="Pooling strategy for the route embedding fed to the bottleneck. "
-             "'attention' = learned query attends over hold tokens (recommended; avoids shape_desc shortcut). "
+             "'attention' = K learned queries attend over hold tokens (recommended). "
              "'cls' = shape/CLS token (fast; risks shortcutting via pre-computed shape_desc stats).",
     )
+    parser.add_argument("--pool-num-queries", type=int, default=4,
+                        help="Number of learned query vectors for multi-query attention pooling. "
+                             "Each query specialises on a different style axis. Default: 4.")
+    parser.add_argument("--pool-nhead", type=int, default=4,
+                        help="Number of heads in the pooling MHA. Fewer than encoder heads; "
+                             "pooling needs routing diversity, not feature decomposition. Default: 4.")
     # Encoder architecture (saved in checkpoint — must be restored exactly for resume/inference)
     parser.add_argument("--encoder-d-model", type=int, default=256,
                         help="Encoder transformer model dimension. Must be divisible by --encoder-nhead.")
@@ -580,6 +590,8 @@ def main() -> None:
         use_type_feature=args.use_type_feature,
         shape_desc_dim=shape_desc_dim,
         route_pool_mode=args.route_pool_mode,
+        pool_num_queries=args.pool_num_queries,
+        pool_nhead=args.pool_nhead,
     )
 
     max_seq_len = model.decoder.cfg.max_seq_len
