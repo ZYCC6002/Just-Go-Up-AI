@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -29,28 +31,52 @@ def _load_samples_and_vocabs(
     *,
     db_path: str,
     cache_path: str,
+    checkpoint_path: str,
     metadata_source: str,
     metadata_product_id: int,
 ) -> tuple[list[RouteSample], Any]:
+    """Load route samples and vocabs for latent extraction.
+
+    Samples are always taken from the preprocessed cache (or rebuilt from DB).
+    Vocabs are taken from the checkpoint when it embeds them (new-style checkpoints),
+    so the model architecture matches the training weights regardless of local DB
+    differences.  For old checkpoints without embedded vocabs, falls back to the
+    runtime vocabs from the preprocessed cache / DB build.
+    """
+    # --- Vocabs: prefer checkpoint-embedded -----------------------------------
+    # The checkpoint stores the exact vocabs used during training.  Using them
+    # avoids mismatches when the local DB has a different hold/type vocabulary
+    # than the Colab DB the model was trained on.
+    ckpt_vocabs: Any = None
+    try:
+        ckpt_payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        ckpt_vocabs = ckpt_payload.get("vocabs")
+        if ckpt_vocabs is not None:
+            print(f"Loaded training vocabs from checkpoint: {checkpoint_path}")
+    except Exception as exc:
+        print(f"Warning: could not read vocabs from checkpoint ({exc}); will use cache/DB vocabs.")
+
+    # --- Samples: preprocessed cache or DB ------------------------------------
     cache_file = Path(cache_path)
     if cache_file.exists():
         try:
             payload = torch.load(cache_file, map_location="cpu", weights_only=False)
             samples = payload.get("samples")
-            vocabs = payload.get("vocabs")
-            if samples and vocabs is not None:
+            cache_vocabs = payload.get("vocabs")
+            if samples and cache_vocabs is not None:
                 print(f"Loaded preprocessed routes cache: {cache_file}")
-                return samples, vocabs
+                return list(samples), ckpt_vocabs if ckpt_vocabs is not None else cache_vocabs
         except Exception as exc:
             print(f"Warning: failed to load cache ({exc}); rebuilding from DB.")
 
     print("Building route samples from DB...")
-    return build_training_samples_from_db(
+    samples, db_vocabs = build_training_samples_from_db(
         db_path,
         metadata_source=metadata_source,
         metadata_product_id=metadata_product_id,
         max_routes=None,
     )
+    return samples, ckpt_vocabs if ckpt_vocabs is not None else db_vocabs
 
 
 def _load_or_build_angle_grade_map(samples: list[RouteSample], *, cache_path: str) -> dict[str, Any]:
@@ -123,6 +149,65 @@ def _filter_samples_by_grade_angle(
     return kept_indices, int(len(samples) - len(kept_indices))
 
 
+def _filter_samples_by_angle_grades(
+    samples: list[RouteSample],
+    *,
+    target_angle: float,
+    min_grade: float | None,
+    max_grade: float | None,
+    include_ungraded: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Filter samples by grade at a specific target angle using angle_grades.
+
+    Unlike _filter_samples_by_grade_angle (which uses the sample's canonical
+    grade chosen during deduplication), this looks up each sample's grade at
+    target_angle in sample.angle_grades.  This lets the cluster cache include
+    routes whose *canonical* training angle differs from target_angle but that
+    have quality-filtered grade data AT target_angle.
+
+    The quality / ascensionist filters are already enforced: angle_grades is
+    populated only for (angle, grade) pairs that passed those thresholds during
+    preprocessing.
+
+    Args:
+        samples:         Deduplicated preprocessed samples (one per UUID).
+        target_angle:    The angle to look up in each sample's angle_grades.
+        min_grade:       Inclusive lower grade bound (applied via floor, like the
+                         canonical filter).  None means no lower bound.
+        max_grade:       Inclusive upper grade bound.  None means no upper bound.
+        include_ungraded: If True, include samples that have no grade at target_angle.
+
+    Returns:
+        kept_indices:    int64 array of indices into samples.
+        grades_at_angle: float32 array; grades_at_angle[i] is the grade of
+                         samples[kept_indices[i]] at target_angle (nan if ungraded).
+    """
+    kept: list[int] = []
+    grades: list[float] = []
+
+    for i, s in enumerate(samples):
+        grade = s.angle_grades.get(float(target_angle))
+
+        if grade is None:
+            if include_ungraded:
+                kept.append(i)
+                grades.append(float("nan"))
+            continue
+
+        # Apply grade-band filter (floor so integer bounds capture full float bands).
+        if min_grade is not None or max_grade is not None:
+            band = math.floor(float(grade))
+            if min_grade is not None and band < float(min_grade):
+                continue
+            if max_grade is not None and band > float(max_grade):
+                continue
+
+        kept.append(i)
+        grades.append(float(grade))
+
+    return np.array(kept, dtype=np.intp), np.array(grades, dtype=np.float32)
+
+
 def _extract_latent_matrix(
     *,
     model: Any,
@@ -183,22 +268,57 @@ def run_analysis(
     samples, vocabs = _load_samples_and_vocabs(
         db_path=db_path,
         cache_path=cache_path,
+        checkpoint_path=checkpoint_path,
         metadata_source=metadata_source,
         metadata_product_id=metadata_product_id,
     )
     if not samples:
         raise ValueError("No route samples available for analysis.")
 
-    angle_grade_map = _load_or_build_angle_grade_map(samples, cache_path=cache_path)
-    kept_indices, n_filtered = _filter_samples_by_grade_angle(
-        samples,
-        angle_grade_map=angle_grade_map,
-        min_grade=min_grade,
-        max_grade=max_grade,
-        min_angle=min_angle,
-        max_angle=max_angle,
-        include_ungraded=include_ungraded,
+    # When min_angle == max_angle, treat it as a specific target angle and use
+    # angle_grades-based filtering.  This includes routes whose canonical
+    # (training) angle differs from target_angle but that have quality-filtered
+    # grade data at target_angle — giving a fuller micro-cluster than canonical
+    # filtering alone.  For angle ranges (min != max) fall back to the original
+    # canonical-angle filter.
+    _target_angle: float | None = (
+        float(min_angle)
+        if (
+            min_angle is not None
+            and max_angle is not None
+            and float(min_angle) == float(max_angle)
+        )
+        else None
     )
+
+    grades_at_angle: np.ndarray | None = None
+
+    if _target_angle is not None:
+        kept_indices, grades_at_angle = _filter_samples_by_angle_grades(
+            samples,
+            target_angle=_target_angle,
+            min_grade=min_grade,
+            max_grade=max_grade,
+            include_ungraded=include_ungraded,
+        )
+        n_filtered = len(samples) - len(kept_indices)
+        print(
+            f"Target-angle filter ({_target_angle}°): {len(kept_indices)} routes have "
+            f"quality-filtered grade data at this angle "
+            f"(includes routes whose canonical training angle differs)."
+        )
+    else:
+        angle_grade_map = _load_or_build_angle_grade_map(samples, cache_path=cache_path)
+        kept_indices, n_filtered = _filter_samples_by_grade_angle(
+            samples,
+            angle_grade_map=angle_grade_map,
+            min_grade=min_grade,
+            max_grade=max_grade,
+            min_angle=min_angle,
+            max_angle=max_angle,
+            include_ungraded=include_ungraded,
+        )
+
     if n_filtered:
         print(f"Filtered out {n_filtered} routes by grade/angle constraints.")
     if kept_indices.size == 0:
@@ -206,7 +326,22 @@ def run_analysis(
 
     if max_routes is not None:
         kept_indices = kept_indices[:max_routes]
+        if grades_at_angle is not None:
+            grades_at_angle = grades_at_angle[: len(kept_indices)]
     samples = [samples[int(i)] for i in kept_indices]
+
+    # Replace angle / grade on display copies so hover tooltips, the Ridge probe,
+    # and PC1 diagnostics all show the grade AT the target angle rather than the
+    # canonical (training-deduplication) grade.
+    if _target_angle is not None and grades_at_angle is not None:
+        samples = [
+            dataclasses.replace(
+                s,
+                angle=_target_angle,
+                grade=float(g) if not np.isnan(float(g)) else None,
+            )
+            for s, g in zip(samples, grades_at_angle)
+        ]
 
     device = select_device()
     print(f"Using device: {device}")

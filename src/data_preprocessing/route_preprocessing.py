@@ -443,8 +443,8 @@ def build_training_samples_from_db(
     metadata_product_id: int = 1,
     max_routes: int | None = None,
     min_holds: int = 1,
-    min_quality_average: float = 2.8,
-    min_ascensionist_count: int = 100,
+    min_quality_average: float = 2.5,
+    min_ascensionist_count: int = 15,
     public_only: bool = True,
 ) -> tuple[list[RouteSample], RouteVocabBundle]:
     """Prepare train-ready route samples and vocabularies from SQLite.

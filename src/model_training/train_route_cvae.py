@@ -775,6 +775,11 @@ def main() -> None:
                 "optimizer_state_dict": optimizer.state_dict(),
                 "best_val": best_val,
                 "args": vars(args),
+                # Vocabs embedded so downstream scripts (routes_cluster.py) can
+                # rebuild the exact training-time model architecture without needing
+                # the preprocessed cache or local DB.  build_model_from_checkpoint
+                # prefers these over runtime-supplied vocabs when present.
+                "vocabs": vocabs,
             }
             if adversary is not None:
                 checkpoint["adversary_state_dict"] = adversary.state_dict()

@@ -295,6 +295,13 @@ def build_model_from_checkpoint(
 
     Reads encoder/decoder hyperparameters from the checkpoint's saved args,
     reconstructs the model architecture, loads weights, and returns eval mode model.
+
+    Vocab priority (highest to lowest):
+      1. Checkpoint-embedded vocabs (``ckpt["vocabs"]``) — present in checkpoints
+         saved after the vocabs-in-checkpoint change.  These are the exact vocabs
+         used during training, so the model architecture always matches the weights.
+      2. Runtime ``vocabs`` argument — used for old checkpoints that predate the
+         embedded-vocabs change, and during training itself (before the first save).
     """
     from .route_vae_encoder import RouteTransformerEncoder
     from .route_vae_decoder import RouteTransformerDecoder, RouteVAEDecoderConfig
@@ -304,7 +311,14 @@ def build_model_from_checkpoint(
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     ckpt_args: dict[str, Any] = dict(ckpt.get("args", {}))
 
-    enc_cfg = vocabs.to_transformer_config(
+    # Prefer vocabs embedded in the checkpoint so the model architecture always
+    # matches the saved weights, regardless of what the local DB produces.
+    ckpt_vocabs = ckpt.get("vocabs")
+    effective_vocabs = ckpt_vocabs if ckpt_vocabs is not None else vocabs
+    if ckpt_vocabs is not None and ckpt_vocabs is not vocabs:
+        print("build_model_from_checkpoint: using checkpoint-embedded vocabs.")
+
+    enc_cfg = effective_vocabs.to_transformer_config(
         d_model=int(ckpt_args.get("encoder_d_model", 256)),
         nhead=int(ckpt_args.get("encoder_nhead", 8)),
         num_layers=int(ckpt_args.get("encoder_num_layers", 6)),
