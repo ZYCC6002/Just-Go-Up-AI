@@ -204,14 +204,20 @@ class RouteTransformerDecoder(nn.Module):
         bos = bos.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1)
         tokens = torch.cat([bos, tokens[:, 1:, :]], dim=1)
 
-        # Token dropout: randomly replace hold tokens (positions 1+) with the learned
-        # mask embedding.  BOS is never masked.  Applied only during training.
-        if self.training and self.cfg.token_dropout > 0.0:
-            hold_tokens = tokens[:, 1:, :]                                   # [B, L, d_model]
+        # Token masking: replaces hold tokens (positions 1+) with the learned mask
+        # embedding.  BOS is never masked.
+        #
+        # Two modes:
+        #   mask_all=True  — all hold tokens replaced (eval-time, batched non-teacher-forced pass)
+        #   training + token_dropout > 0 — random stochastic dropout (training regularisation)
+        hold_tokens = tokens[:, 1:, :]
+        mask_emb = self.mask_token.view(1, 1, -1).expand_as(hold_tokens)
+        if self._mask_all:
+            hold_tokens = mask_emb
+        elif self.training and self.cfg.token_dropout > 0.0:
             drop = torch.rand(batch_size, hold_tokens.shape[1], device=tokens.device) < self.cfg.token_dropout
-            mask_emb = self.mask_token.view(1, 1, -1).expand_as(hold_tokens)
             hold_tokens = torch.where(drop.unsqueeze(-1), mask_emb, hold_tokens)
-            tokens = torch.cat([tokens[:, :1, :], hold_tokens], dim=1)
+        tokens = torch.cat([tokens[:, :1, :], hold_tokens], dim=1)
 
         return tokens
 
@@ -222,15 +228,21 @@ class RouteTransformerDecoder(nn.Module):
         z: torch.Tensor,
         angle: torch.Tensor,
         grade: torch.Tensor,
+        mask_inputs: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Teacher-forcing forward pass.
 
         Args:
-            batch: tokenized decoder inputs (shifted-right targets with BOS at position 0)
-            z:     latent vector [B, latent_dim]
-            angle: route angle condition [B]
-            grade: route grade condition [B]
+            batch:       tokenized decoder inputs (shifted-right targets with BOS at position 0)
+            z:           latent vector [B, latent_dim]
+            angle:       route angle condition [B]
+            grade:       route grade condition [B]
+            mask_inputs: if True, replace ALL hold tokens with the learned mask embedding
+                         before the transformer stack.  Used for batched non-teacher-forced
+                         validation: the decoder sees only BOS + z (via cross-attention) +
+                         position embeddings, with no ground-truth token context.
         """
+        self._mask_all = mask_inputs
         padding_mask = batch["padding_mask"].bool()
         tgt = self._build_decoder_tokens(batch)
 

@@ -275,13 +275,13 @@ def _autoregressive_forward(
     *,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    """Run encoder normally (mean z) then decode autoregressively — no teacher forcing.
+    """Autoregressive forward pass with no teacher forcing.
 
-    Feeds each step's predictions back as the next step's decoder input.
-    Returns the same keys as model.forward() so _compute_batch_losses can use
-    this output transparently.
+    Encodes normally (mean z), then decodes one token at a time, feeding each
+    step's predicted token back as the next step's input.  All B sequences in
+    the batch are processed in parallel; only the L time-steps are sequential.
 
-    Denormalization constants must match training_utils.prepare_cvae_training_batch:
+    Denormalisation constants must match training_utils.prepare_cvae_training_batch:
       x   : raw ∈ [x_min, x_max]  →  target = (x − x_min) / (x_max − x_min)
       y   : raw ∈ [y_min, y_max]  →  target = (y − y_min) / (y_max − y_min)
       ori : raw ∈ [−1, 1]         →  target = (ori + 1) / 2
@@ -290,47 +290,41 @@ def _autoregressive_forward(
     angle = prepared["angle"]
     grade = prepared["grade"]
 
-    # Encode once; use mean z (no sampling) — same as sample_latent=False.
     enc_out = model.encoder(prepared["encoder_batch"], angle=angle, grade=grade)
     bn_out  = model.bottleneck(enc_out["route_embedding"], sample_latent=False)
     z       = bn_out["z"]
 
     dec_cfg    = model.decoder.cfg
-    target_len = prepared["categorical_targets"]["type_target"].shape[1]  # L+1
+    target_len = prepared["categorical_targets"]["type_target"].shape[1]  # L + 1
     B          = z.shape[0]
 
-    # Running decoder input state — raw feature values, updated at each step.
-    # Position 0 is always the BOS slot (zeros → overwritten by bos_embedding in decoder).
+    # Running decoder input — raw feature values updated at each step.
+    # Position 0 is the BOS slot (zeros, overwritten by bos_embedding inside decoder).
     seq = {
-        "type_encoded_id": torch.zeros(B, target_len, dtype=torch.long,  device=device),
-        "role_encoded_id": torch.zeros(B, target_len, dtype=torch.long,  device=device),
-        "hole_encoded_id": torch.zeros(B, target_len, dtype=torch.long,  device=device),
-        "x":               torch.zeros(B, target_len,                    device=device),
-        "y":               torch.zeros(B, target_len,                    device=device),
-        "orientation_sin": torch.zeros(B, target_len,                    device=device),
-        "orientation_cos": torch.ones( B, target_len,                    device=device),
-        "size":            torch.full( (B, target_len), 3.5,             device=device),
-        # No padding — every position is "real" from the decoder's perspective.
-        "padding_mask":    torch.zeros(B, target_len, dtype=torch.bool,  device=device),
+        "type_encoded_id": torch.zeros(B, target_len, dtype=torch.long, device=device),
+        "role_encoded_id": torch.zeros(B, target_len, dtype=torch.long, device=device),
+        "hole_encoded_id": torch.zeros(B, target_len, dtype=torch.long, device=device),
+        "x":               torch.zeros(B, target_len,                   device=device),
+        "y":               torch.zeros(B, target_len,                   device=device),
+        "orientation_sin": torch.zeros(B, target_len,                   device=device),
+        "orientation_cos": torch.ones( B, target_len,                   device=device),
+        "size":            torch.full( (B, target_len), 3.5,            device=device),
+        "padding_mask":    torch.zeros(B, target_len, dtype=torch.bool, device=device),
     }
 
-    # Accumulators — filled position-by-position, then stacked into full tensors.
-    type_logits_list  = []
-    role_logits_list  = []
-    hole_logits_list  = []
-    x_pred_list       = []
-    y_pred_list       = []
-    ori_sin_pred_list = []
-    ori_cos_pred_list = []
-    size_pred_list    = []
+    type_logits_list:  list[torch.Tensor] = []
+    role_logits_list:  list[torch.Tensor] = []
+    hole_logits_list:  list[torch.Tensor] = []
+    x_pred_list:       list[torch.Tensor] = []
+    y_pred_list:       list[torch.Tensor] = []
+    ori_sin_pred_list: list[torch.Tensor] = []
+    ori_cos_pred_list: list[torch.Tensor] = []
+    size_pred_list:    list[torch.Tensor] = []
 
     for t in range(target_len):
-        # Slice the sequence up to the current position (causal — only 0..t are valid).
         batch_t = {k: v[:, :t + 1] for k, v in seq.items()}
-
         dec_out = model.decoder(batch_t, z=z, angle=angle, grade=grade)
 
-        # Grab prediction at position t (the last position in this partial forward).
         type_logits_list .append(dec_out["type_logits"]         [:, t, :])
         role_logits_list .append(dec_out["role_logits"]         [:, t, :])
         hole_logits_list .append(dec_out["hole_logits"]         [:, t, :])
@@ -340,38 +334,30 @@ def _autoregressive_forward(
         ori_cos_pred_list.append(dec_out["orientation_cos_pred"][:, t])
         size_pred_list   .append(dec_out["size_pred"]           [:, t])
 
-        # Feed prediction at t into position t+1 of the running sequence.
         if t + 1 < target_len:
-            # Categorical: argmax over hold classes only (exclude EOS slot at −1).
             seq["type_encoded_id"][:, t + 1] = dec_out["type_logits"][:, t, :-1].argmax(-1)
             seq["role_encoded_id"][:, t + 1] = dec_out["role_logits"][:, t, :-1].argmax(-1)
             seq["hole_encoded_id"][:, t + 1] = dec_out["hole_logits"][:, t, :-1].argmax(-1)
-            # Numeric: undo the normalisation applied by training_utils to match raw input range.
-            x_p   = dec_out["x_pred"]              [:, t]
-            y_p   = dec_out["y_pred"]              [:, t]
-            os_p  = dec_out["orientation_sin_pred"][:, t]
-            oc_p  = dec_out["orientation_cos_pred"][:, t]
-            sz_p  = dec_out["size_pred"]           [:, t]
-            seq["x"]              [:, t + 1] = x_p  * (dec_cfg.x_max - dec_cfg.x_min) + dec_cfg.x_min
-            seq["y"]              [:, t + 1] = y_p  * (dec_cfg.y_max - dec_cfg.y_min) + dec_cfg.y_min
-            seq["orientation_sin"][:, t + 1] = os_p * 2.0 - 1.0   # [0,1] → [−1,1]
-            seq["orientation_cos"][:, t + 1] = oc_p * 2.0 - 1.0
-            seq["size"]           [:, t + 1] = sz_p * 3.0 + 2.0   # [0,1] → [2,5]
+            seq["x"]              [:, t + 1] = dec_out["x_pred"]              [:, t] * (dec_cfg.x_max - dec_cfg.x_min) + dec_cfg.x_min
+            seq["y"]              [:, t + 1] = dec_out["y_pred"]              [:, t] * (dec_cfg.y_max - dec_cfg.y_min) + dec_cfg.y_min
+            seq["orientation_sin"][:, t + 1] = dec_out["orientation_sin_pred"][:, t] * 2.0 - 1.0
+            seq["orientation_cos"][:, t + 1] = dec_out["orientation_cos_pred"][:, t] * 2.0 - 1.0
+            seq["size"]           [:, t + 1] = dec_out["size_pred"]           [:, t] * 3.0 + 2.0
 
     return {
-        "mu":     bn_out["mu"],
-        "logvar": bn_out["logvar"],
-        "z":      z,
-        "encoder_route_embedding": enc_out["route_embedding"],
+        "mu":                       bn_out["mu"],
+        "logvar":                   bn_out["logvar"],
+        "z":                        z,
+        "encoder_route_embedding":  enc_out["route_embedding"],
         "encoder_token_embeddings": enc_out["token_embeddings"],
-        "type_logits":          torch.stack(type_logits_list,   dim=1),
-        "role_logits":          torch.stack(role_logits_list,   dim=1),
-        "hole_logits":          torch.stack(hole_logits_list,   dim=1),
-        "x_pred":               torch.stack(x_pred_list,        dim=1),
-        "y_pred":               torch.stack(y_pred_list,        dim=1),
-        "orientation_sin_pred": torch.stack(ori_sin_pred_list,  dim=1),
-        "orientation_cos_pred": torch.stack(ori_cos_pred_list,  dim=1),
-        "size_pred":            torch.stack(size_pred_list,     dim=1),
+        "type_logits":              torch.stack(type_logits_list,  dim=1),
+        "role_logits":              torch.stack(role_logits_list,  dim=1),
+        "hole_logits":              torch.stack(hole_logits_list,  dim=1),
+        "x_pred":                   torch.stack(x_pred_list,       dim=1),
+        "y_pred":                   torch.stack(y_pred_list,       dim=1),
+        "orientation_sin_pred":     torch.stack(ori_sin_pred_list, dim=1),
+        "orientation_cos_pred":     torch.stack(ori_cos_pred_list, dim=1),
+        "size_pred":                torch.stack(size_pred_list,    dim=1),
     }
 
 
@@ -403,8 +389,8 @@ def _compute_batch_losses(
         batch_samples, eos_ids=eos_ids, device=device, ignore_index=ignore_index
     )
     if autoregressive:
-        # Validation / test: decode with no teacher forcing — each step's prediction
-        # is fed back as the next step's input.  Encoder/bottleneck run normally.
+        # Validation / test: decode autoregressively — each step's prediction
+        # is fed back as the next step's input.  No teacher forcing.
         out = _autoregressive_forward(model, prepared, device=device)
     else:
         out = model(
@@ -639,6 +625,9 @@ def main() -> None:
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--val-batch-size", type=int, default=256,
+                        help="Batch size for validation and test. Larger than --batch-size is fine "
+                             "because autoregressive decoding has no backprop memory pressure.")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--latent-dim", type=int, default=32)
@@ -927,7 +916,7 @@ def main() -> None:
             val_m = _run_epoch(
                 model, val_samples,
                 optimizer=None, device=device, eos_ids=eos_ids,
-                batch_size=args.batch_size, kl_beta=kl_beta,
+                batch_size=args.val_batch_size, kl_beta=kl_beta,
                 numeric_weight=args.numeric_weight, grad_clip_norm=args.grad_clip_norm,
                 sample_latent=False,
                 adversary=adversary,
@@ -1070,7 +1059,7 @@ def main() -> None:
         test_m = _run_epoch(
             model, test_samples,
             optimizer=None, device=device, eos_ids=eos_ids,
-            batch_size=args.batch_size, kl_beta=args.kl_beta,
+            batch_size=args.val_batch_size, kl_beta=args.kl_beta,
             numeric_weight=args.numeric_weight, grad_clip_norm=args.grad_clip_norm,
             sample_latent=False,
             adversary=adversary,
