@@ -45,6 +45,7 @@ class EpochMetrics:
     grade_adv_loss: float    # MSE of adversary predicting grade from z; good ≥ Var(grade_norm)
     angle_adv_loss: float    # MSE of adversary predicting angle from z; good ≥ Var(angle_norm)
     num_batches: int
+    pairwise_loss: float = 0.0  # unweighted pairwise distance MSE (0 when pairwise_weight=0)
 
     @property
     def adversary_loss(self) -> float:
@@ -285,6 +286,8 @@ def _compute_batch_losses(
     grade_min: float = 10.0,
     grade_max: float = 33.0,
     free_bits: float = 0.0,
+    pairwise_weight: float = 0.0,
+    hole_loss_weight: float = 1.0,
     adversary_in_total: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor | None]:
     prepared = prepare_cvae_training_batch(
@@ -305,7 +308,11 @@ def _compute_batch_losses(
             cat_targets[f"{feat}_target"].reshape(-1),
             ignore_index=ignore_index,
         )
-        for feat in ("type", "role", "hole")
+        for feat in ("type", "role")
+    ) + hole_loss_weight * F.cross_entropy(
+        out["hole_logits"].reshape(-1, out["hole_logits"].shape[-1]),
+        cat_targets["hole_target"].reshape(-1),
+        ignore_index=ignore_index,
     )
 
     num_targets = prepared["numeric_targets"]
@@ -321,6 +328,38 @@ def _compute_batch_losses(
         out["mu"], out["logvar"], kl_beta=kl_beta, reduction="mean", free_bits=free_bits
     )
     total = categorical_loss + numeric_weight * numeric_loss + kl_unified
+
+    # Pairwise distance loss: MSE on L2 distances between all valid hold pairs.
+    # x/y targets are normalised to [0, 1] (board span), so pairwise distances
+    # lie in [0, √2].  Dividing by √2 maps to [0, 1], keeping scale comparable
+    # to per-token numeric_loss.  Only upper-triangle pairs are used to avoid
+    # double-counting; padded / EOS tokens are excluded via valid_numeric_mask.
+    pairwise_val = 0.0
+    if pairwise_weight > 0.0:
+        x_pred_pw = out["x_pred"]                # [B, L+1]
+        y_pred_pw = out["y_pred"]                # [B, L+1]
+        x_true_pw = num_targets["x_target"]      # [B, L+1]
+        y_true_pw = num_targets["y_target"]      # [B, L+1]
+
+        dx_pred = x_pred_pw.unsqueeze(2) - x_pred_pw.unsqueeze(1)   # [B, L+1, L+1]
+        dy_pred = y_pred_pw.unsqueeze(2) - y_pred_pw.unsqueeze(1)
+        d_pred  = torch.sqrt(dx_pred ** 2 + dy_pred ** 2 + 1e-8)
+
+        dx_true = x_true_pw.unsqueeze(2) - x_true_pw.unsqueeze(1)
+        dy_true = y_true_pw.unsqueeze(2) - y_true_pw.unsqueeze(1)
+        d_true  = torch.sqrt(dx_true ** 2 + dy_true ** 2 + 1e-8)
+
+        Lp1 = x_pred_pw.shape[1]
+        triu = torch.triu(
+            torch.ones(Lp1, Lp1, dtype=torch.bool, device=x_pred_pw.device),
+            diagonal=1,
+        )
+        pair_mask = mask.unsqueeze(2) & mask.unsqueeze(1) & triu.unsqueeze(0)
+
+        _SQRT2 = 2.0 ** 0.5
+        pairwise_loss = masked_mse(d_pred / _SQRT2, d_true / _SQRT2, pair_mask)
+        total = total + pairwise_weight * pairwise_loss
+        pairwise_val = float(pairwise_loss.detach().cpu())
 
     grade_adv_val = 0.0
     angle_adv_val = 0.0
@@ -369,6 +408,7 @@ def _compute_batch_losses(
         "kl_raw": float(kl_raw.detach().cpu()),
         "grade_adv": grade_adv_val,
         "angle_adv": angle_adv_val,
+        "pairwise": pairwise_val,
     }
     return total, stats, adversary_loss_clean
 
@@ -395,13 +435,15 @@ def _run_epoch(
     grade_min: float = 10.0,
     grade_max: float = 33.0,
     free_bits: float = 0.0,
+    pairwise_weight: float = 0.0,
+    hole_loss_weight: float = 1.0,
 ) -> EpochMetrics:
     is_train = optimizer is not None
     model.train(is_train)
     if adversary is not None:
         adversary.train(is_train)
 
-    loss_sum = cat_sum = num_sum = kl_raw_sum = grade_adv_sum = angle_adv_sum = 0.0
+    loss_sum = cat_sum = num_sum = kl_raw_sum = grade_adv_sum = angle_adv_sum = pairwise_sum = 0.0
     batches = 0
 
     for batch_samples in iter_minibatches(samples, batch_size, shuffle=is_train):
@@ -423,6 +465,8 @@ def _run_epoch(
                 angle_min=angle_min, angle_max=angle_max,
                 grade_min=grade_min, grade_max=grade_max,
                 free_bits=free_bits,
+                pairwise_weight=pairwise_weight,
+                hole_loss_weight=hole_loss_weight,
                 adversary_in_total=is_train,  # adversary excluded from val total (see _compute_batch_losses)
             )
             if is_train:
@@ -450,6 +494,7 @@ def _run_epoch(
         kl_raw_sum += stats["kl_raw"]
         grade_adv_sum += stats["grade_adv"]
         angle_adv_sum += stats["angle_adv"]
+        pairwise_sum += stats["pairwise"]
         batches += 1
 
     if batches == 0:
@@ -462,6 +507,7 @@ def _run_epoch(
         grade_adv_loss=grade_adv_sum / batches,
         angle_adv_loss=angle_adv_sum / batches,
         num_batches=batches,
+        pairwise_loss=pairwise_sum / batches,
     )
 
 
@@ -563,6 +609,19 @@ def main() -> None:
                         help="Minimum KL per latent dimension (nats). Prevents posterior collapse by "
                              "clamping each dimension's KL from below before summing. "
                              "Recommended: 0.5 nats/dim.")
+    parser.add_argument("--pairwise-weight", type=float, default=0.0,
+                        help="Weight for pairwise distance loss. MSE between predicted and true L2 "
+                             "distances for all valid hold pairs, normalised by board diagonal / √2. "
+                             "Creates gradient signal for inter-hold spatial structure (e.g. move "
+                             "distances) which per-token x/y MSE alone cannot provide. "
+                             "Suggested starting value: 1.0.")
+    parser.add_argument("--hole-loss-weight", type=float, default=1.0,
+                        help="Multiplier on the hole cross-entropy term in the reconstruction loss. "
+                             "Hole vocab size is 593 (log₂(593)≈9.2 bits) vs type=7 and role=~5, so "
+                             "hole CE dominates gradient signal by ~3× type+role combined and ~150× "
+                             "x/y MSE. Reducing this (e.g. 0.1) shifts the gradient balance toward "
+                             "spatial structure and away from set-membership encoding. "
+                             "Default 1.0 preserves backward compatibility.")
     args = parser.parse_args()
 
     if args.kl_warmup_epochs is None:
@@ -735,6 +794,8 @@ def main() -> None:
             grade_adversary_alpha=args.grade_adversary_alpha,
             angle_adversary_scale=args.angle_adversary_scale,
             free_bits=args.free_bits,
+            pairwise_weight=args.pairwise_weight,
+            hole_loss_weight=args.hole_loss_weight,
             **norm_ranges,
         )
         with torch.no_grad():
@@ -749,6 +810,8 @@ def main() -> None:
                 grade_adversary_alpha=args.grade_adversary_alpha,
                 angle_adversary_scale=args.angle_adversary_scale,
                 free_bits=args.free_bits,
+                pairwise_weight=args.pairwise_weight,
+                hole_loss_weight=args.hole_loss_weight,
                 **norm_ranges,
             )
 
@@ -763,8 +826,10 @@ def main() -> None:
         train_weighted_adv = args.grade_adversary_weight * (
             train_m.grade_adv_loss + args.angle_adversary_scale * train_m.angle_adv_loss
         )
-        train_kl_w = train_m.total_loss - train_recon - train_weighted_adv
-        val_kl_w = val_m.total_loss - val_recon
+        train_pairwise_w = args.pairwise_weight * train_m.pairwise_loss
+        val_pairwise_w   = args.pairwise_weight * val_m.pairwise_loss
+        train_kl_w = train_m.total_loss - train_recon - train_weighted_adv - train_pairwise_w
+        val_kl_w   = val_m.total_loss - val_recon - val_pairwise_w
         train_kl_excess = max(train_m.kl_raw - kl_floor, 0.0)
         val_kl_excess = max(val_m.kl_raw - kl_floor, 0.0)
 
@@ -773,11 +838,15 @@ def main() -> None:
             val_adv_str = f" g_adv={val_m.grade_adv_loss:.4f} a_adv={val_m.angle_adv_loss:.4f}"
         else:
             adv_str = val_adv_str = ""
+        pw_str = (
+            f" pw={train_m.pairwise_loss:.4f}/{val_m.pairwise_loss:.4f}"
+            if args.pairwise_weight > 0.0 else ""
+        )
         print(
             f"Epoch {epoch:03d} | kl_beta={kl_beta:.6f} "
             f"train total={train_m.total_loss:.4f} recon={train_recon:.4f} kl_w={train_kl_w:.4f} "
             f"cat={train_m.categorical_loss:.4f} num={train_m.numeric_loss:.4f} "
-            f"kl={train_m.kl_raw:.4f}(+{train_kl_excess:.4f}){adv_str} | "
+            f"kl={train_m.kl_raw:.4f}(+{train_kl_excess:.4f}){adv_str}{pw_str} | "
             f"val total={val_m.total_loss:.4f} recon={val_recon:.4f} kl_w={val_kl_w:.4f} "
             f"cat={val_m.categorical_loss:.4f} num={val_m.numeric_loss:.4f} "
             f"kl={val_m.kl_raw:.4f}(+{val_kl_excess:.4f}){val_adv_str}"
@@ -867,6 +936,8 @@ def main() -> None:
             grade_adversary_alpha=args.grade_adversary_alpha,
             angle_adversary_scale=args.angle_adversary_scale,
             free_bits=args.free_bits,
+            pairwise_weight=args.pairwise_weight,
+            hole_loss_weight=args.hole_loss_weight,
             **norm_ranges,
         )
     test_recon = test_m.categorical_loss + args.numeric_weight * test_m.numeric_loss
