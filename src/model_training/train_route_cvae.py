@@ -151,6 +151,7 @@ def _build_model(
     route_pool_mode: str = "cls",
     pool_num_queries: int = 4,
     pool_nhead: int = 4,
+    decoder_token_dropout: float = 0.0,
 ) -> tuple[RouteConditionalVAE, DecoderEOSIds, dict[str, float]]:
     if encoder_d_model % encoder_nhead != 0:
         raise ValueError(
@@ -187,6 +188,7 @@ def _build_model(
         use_knn_features=False,    # decoder never uses full-sequence knn features
         use_absolute_pos=use_absolute_pos,
         use_type_feature=use_type_feature,
+        token_dropout=decoder_token_dropout,
         x_min=enc_cfg.x_min,
         x_max=enc_cfg.x_max,
         y_min=enc_cfg.y_min,
@@ -267,6 +269,112 @@ def _load_or_build_samples_and_vocabs(args: argparse.Namespace) -> tuple[list[An
 
 
 
+def _autoregressive_forward(
+    model: RouteConditionalVAE,
+    prepared: dict[str, Any],
+    *,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Run encoder normally (mean z) then decode autoregressively — no teacher forcing.
+
+    Feeds each step's predictions back as the next step's decoder input.
+    Returns the same keys as model.forward() so _compute_batch_losses can use
+    this output transparently.
+
+    Denormalization constants must match training_utils.prepare_cvae_training_batch:
+      x   : raw ∈ [x_min, x_max]  →  target = (x − x_min) / (x_max − x_min)
+      y   : raw ∈ [y_min, y_max]  →  target = (y − y_min) / (y_max − y_min)
+      ori : raw ∈ [−1, 1]         →  target = (ori + 1) / 2
+      size: raw ∈ [2, 5]          →  target = (size − 2) / 3
+    """
+    angle = prepared["angle"]
+    grade = prepared["grade"]
+
+    # Encode once; use mean z (no sampling) — same as sample_latent=False.
+    enc_out = model.encoder(prepared["encoder_batch"], angle=angle, grade=grade)
+    bn_out  = model.bottleneck(enc_out["route_embedding"], sample_latent=False)
+    z       = bn_out["z"]
+
+    dec_cfg    = model.decoder.cfg
+    target_len = prepared["categorical_targets"]["type_target"].shape[1]  # L+1
+    B          = z.shape[0]
+
+    # Running decoder input state — raw feature values, updated at each step.
+    # Position 0 is always the BOS slot (zeros → overwritten by bos_embedding in decoder).
+    seq = {
+        "type_encoded_id": torch.zeros(B, target_len, dtype=torch.long,  device=device),
+        "role_encoded_id": torch.zeros(B, target_len, dtype=torch.long,  device=device),
+        "hole_encoded_id": torch.zeros(B, target_len, dtype=torch.long,  device=device),
+        "x":               torch.zeros(B, target_len,                    device=device),
+        "y":               torch.zeros(B, target_len,                    device=device),
+        "orientation_sin": torch.zeros(B, target_len,                    device=device),
+        "orientation_cos": torch.ones( B, target_len,                    device=device),
+        "size":            torch.full( (B, target_len), 3.5,             device=device),
+        # No padding — every position is "real" from the decoder's perspective.
+        "padding_mask":    torch.zeros(B, target_len, dtype=torch.bool,  device=device),
+    }
+
+    # Accumulators — filled position-by-position, then stacked into full tensors.
+    type_logits_list  = []
+    role_logits_list  = []
+    hole_logits_list  = []
+    x_pred_list       = []
+    y_pred_list       = []
+    ori_sin_pred_list = []
+    ori_cos_pred_list = []
+    size_pred_list    = []
+
+    for t in range(target_len):
+        # Slice the sequence up to the current position (causal — only 0..t are valid).
+        batch_t = {k: v[:, :t + 1] for k, v in seq.items()}
+
+        dec_out = model.decoder(batch_t, z=z, angle=angle, grade=grade)
+
+        # Grab prediction at position t (the last position in this partial forward).
+        type_logits_list .append(dec_out["type_logits"]         [:, t, :])
+        role_logits_list .append(dec_out["role_logits"]         [:, t, :])
+        hole_logits_list .append(dec_out["hole_logits"]         [:, t, :])
+        x_pred_list      .append(dec_out["x_pred"]              [:, t])
+        y_pred_list      .append(dec_out["y_pred"]              [:, t])
+        ori_sin_pred_list.append(dec_out["orientation_sin_pred"][:, t])
+        ori_cos_pred_list.append(dec_out["orientation_cos_pred"][:, t])
+        size_pred_list   .append(dec_out["size_pred"]           [:, t])
+
+        # Feed prediction at t into position t+1 of the running sequence.
+        if t + 1 < target_len:
+            # Categorical: argmax over hold classes only (exclude EOS slot at −1).
+            seq["type_encoded_id"][:, t + 1] = dec_out["type_logits"][:, t, :-1].argmax(-1)
+            seq["role_encoded_id"][:, t + 1] = dec_out["role_logits"][:, t, :-1].argmax(-1)
+            seq["hole_encoded_id"][:, t + 1] = dec_out["hole_logits"][:, t, :-1].argmax(-1)
+            # Numeric: undo the normalisation applied by training_utils to match raw input range.
+            x_p   = dec_out["x_pred"]              [:, t]
+            y_p   = dec_out["y_pred"]              [:, t]
+            os_p  = dec_out["orientation_sin_pred"][:, t]
+            oc_p  = dec_out["orientation_cos_pred"][:, t]
+            sz_p  = dec_out["size_pred"]           [:, t]
+            seq["x"]              [:, t + 1] = x_p  * (dec_cfg.x_max - dec_cfg.x_min) + dec_cfg.x_min
+            seq["y"]              [:, t + 1] = y_p  * (dec_cfg.y_max - dec_cfg.y_min) + dec_cfg.y_min
+            seq["orientation_sin"][:, t + 1] = os_p * 2.0 - 1.0   # [0,1] → [−1,1]
+            seq["orientation_cos"][:, t + 1] = oc_p * 2.0 - 1.0
+            seq["size"]           [:, t + 1] = sz_p * 3.0 + 2.0   # [0,1] → [2,5]
+
+    return {
+        "mu":     bn_out["mu"],
+        "logvar": bn_out["logvar"],
+        "z":      z,
+        "encoder_route_embedding": enc_out["route_embedding"],
+        "encoder_token_embeddings": enc_out["token_embeddings"],
+        "type_logits":          torch.stack(type_logits_list,   dim=1),
+        "role_logits":          torch.stack(role_logits_list,   dim=1),
+        "hole_logits":          torch.stack(hole_logits_list,   dim=1),
+        "x_pred":               torch.stack(x_pred_list,        dim=1),
+        "y_pred":               torch.stack(y_pred_list,        dim=1),
+        "orientation_sin_pred": torch.stack(ori_sin_pred_list,  dim=1),
+        "orientation_cos_pred": torch.stack(ori_cos_pred_list,  dim=1),
+        "size_pred":            torch.stack(size_pred_list,     dim=1),
+    }
+
+
 def _compute_batch_losses(
     model: RouteConditionalVAE,
     batch_samples: list[Any],
@@ -289,17 +397,23 @@ def _compute_batch_losses(
     pairwise_weight: float = 0.0,
     hole_loss_weight: float = 1.0,
     adversary_in_total: bool = True,
+    autoregressive: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor | None]:
     prepared = prepare_cvae_training_batch(
         batch_samples, eos_ids=eos_ids, device=device, ignore_index=ignore_index
     )
-    out = model(
-        encoder_batch=prepared["encoder_batch"],
-        decoder_batch=prepared["decoder_input_batch"],
-        angle=prepared["angle"],
-        grade=prepared["grade"],
-        sample_latent=sample_latent,
-    )
+    if autoregressive:
+        # Validation / test: decode with no teacher forcing — each step's prediction
+        # is fed back as the next step's input.  Encoder/bottleneck run normally.
+        out = _autoregressive_forward(model, prepared, device=device)
+    else:
+        out = model(
+            encoder_batch=prepared["encoder_batch"],
+            decoder_batch=prepared["decoder_input_batch"],
+            angle=prepared["angle"],
+            grade=prepared["grade"],
+            sample_latent=sample_latent,
+        )
 
     cat_targets = prepared["categorical_targets"]
     categorical_loss = sum(
@@ -437,6 +551,7 @@ def _run_epoch(
     free_bits: float = 0.0,
     pairwise_weight: float = 0.0,
     hole_loss_weight: float = 1.0,
+    autoregressive: bool = False,
 ) -> EpochMetrics:
     is_train = optimizer is not None
     model.train(is_train)
@@ -468,6 +583,7 @@ def _run_epoch(
                 pairwise_weight=pairwise_weight,
                 hole_loss_weight=hole_loss_weight,
                 adversary_in_total=is_train,  # adversary excluded from val total (see _compute_batch_losses)
+                autoregressive=autoregressive,
             )
             if is_train:
                 # ── Encoder / decoder update (includes GRL adversary signal) ──
@@ -580,6 +696,12 @@ def main() -> None:
                         help="Number of decoder transformer layers.")
     parser.add_argument("--decoder-dim-feedforward", type=int, default=512,
                         help="Decoder FFN hidden dim. Recommended: 4 × decoder-d-model.")
+    parser.add_argument("--decoder-token-dropout", type=float, default=0.0,
+                        help="Probability of replacing each decoder input token (positions 1+) "
+                             "with a learned mask embedding during training. Forces the decoder "
+                             "to rely on z rather than exploiting categorical/spatial patterns "
+                             "in the teacher-forced context. Disabled at inference. "
+                             "Suggested range: 0.15–0.25.")
     parser.add_argument("--kl-warmup-epochs", type=int, default=None,
                         help="Linear KL warmup epochs. Defaults to 40%% of total epochs.")
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
@@ -671,6 +793,7 @@ def main() -> None:
         route_pool_mode=args.route_pool_mode,
         pool_num_queries=args.pool_num_queries,
         pool_nhead=args.pool_nhead,
+        decoder_token_dropout=args.decoder_token_dropout,
     )
 
     max_seq_len = model.decoder.cfg.max_seq_len
@@ -814,6 +937,7 @@ def main() -> None:
                 free_bits=args.free_bits,
                 pairwise_weight=args.pairwise_weight,
                 hole_loss_weight=args.hole_loss_weight,
+                autoregressive=True,
                 **norm_ranges,
             )
 
@@ -888,6 +1012,22 @@ def main() -> None:
                 checkpoint["adversary_optimizer_state_dict"] = adversary_optimizer.state_dict()
             torch.save(checkpoint, checkpoint_path)
             print(f"Saved checkpoint (val={best_val:.4f}): {checkpoint_path}")
+            _save_loss_curve(
+                epochs=epoch_history,
+                train_total=train_total_history,
+                val_total=val_total_history,
+                train_recon=train_recon_history,
+                val_recon=val_recon_history,
+                train_kl=train_kl_history,
+                val_kl=val_kl_history,
+                train_grade_adv=train_grade_adv_history or None,
+                val_grade_adv=val_grade_adv_history or None,
+                train_angle_adv=train_angle_adv_history or None,
+                val_angle_adv=val_angle_adv_history or None,
+                grade_chance=grade_chance,
+                angle_chance=angle_chance,
+                output_path=Path(args.loss_plot_path),
+            )
 
         if args.early_stop_delta is not None and len(val_total_history) >= 2:
             val_delta = abs(val_total_history[-1] - val_total_history[-2])
@@ -940,6 +1080,7 @@ def main() -> None:
             free_bits=args.free_bits,
             pairwise_weight=args.pairwise_weight,
             hole_loss_weight=args.hole_loss_weight,
+            autoregressive=True,
             **norm_ranges,
         )
     test_recon = test_m.categorical_loss + args.numeric_weight * test_m.numeric_loss

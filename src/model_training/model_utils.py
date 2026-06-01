@@ -396,6 +396,9 @@ def build_model_from_checkpoint(
         use_knn_features=False,    # decoder never uses full-sequence knn features
         use_absolute_pos=enc_cfg.use_absolute_pos,
         use_type_feature=enc_cfg.use_type_feature,
+        # token_dropout is a training-only flag; default 0.0 so old checkpoints
+        # (which have no mask_token weight) load cleanly without it.
+        token_dropout=float(ckpt_args.get("decoder_token_dropout", 0.0)),
         x_min=enc_cfg.x_min,
         x_max=enc_cfg.x_max,
         y_min=enc_cfg.y_min,
@@ -416,6 +419,10 @@ def build_model_from_checkpoint(
         decoder=RouteTransformerDecoder(dec_cfg),
     ).to(device)
     state_dict = _adapt_pool_state_dict(dict(ckpt["model_state_dict"]), enc_cfg.d_model)
+    # Back-compat: old checkpoints predate mask_token; initialise to zeros so
+    # the architecture matches without requiring a strict-load failure.
+    if "decoder.mask_token" not in state_dict:
+        state_dict["decoder.mask_token"] = torch.zeros(dec_cfg.d_model, device=device)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
 

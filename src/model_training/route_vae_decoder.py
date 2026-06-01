@@ -45,6 +45,12 @@ class RouteVAEDecoderConfig:
     use_absolute_pos: bool = True
     use_type_feature: bool = True
 
+    # Token dropout: during training, replace each decoder input token (positions 1+,
+    # never BOS) with a learned mask embedding with this probability.  Forces the
+    # decoder to rely on z rather than exploiting categorical / spatial patterns in
+    # the previous-token context.  Disabled at inference (self.training=False).
+    token_dropout: float = 0.0
+
     # Decoder transformer sizes
     # d_model is deliberately kept at 128 (encoder uses 256).
     # The decoder's job is conditional generation given z + angle/grade — it doesn't
@@ -99,6 +105,9 @@ class RouteTransformerDecoder(nn.Module):
         self.sequence_position_embedding = nn.Embedding(cfg.max_seq_len, cfg.d_model)
         # Learned BOS anchor token
         self.bos_embedding = nn.Parameter(torch.randn(cfg.d_model) * 0.02)
+        # Learned mask token: substituted for dropped hold tokens during training.
+        # Initialised to zero so early training sees a neutral (near-mean) signal.
+        self.mask_token = nn.Parameter(torch.zeros(cfg.d_model))
 
         # Project z into a single d_model-dim memory token for cross-attention.
         # The cross-attention's internal K/V projections do the rest of the work;
@@ -194,6 +203,16 @@ class RouteTransformerDecoder(nn.Module):
         bos = (self.bos_embedding + self.sequence_position_embedding.weight[0])
         bos = bos.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1)
         tokens = torch.cat([bos, tokens[:, 1:, :]], dim=1)
+
+        # Token dropout: randomly replace hold tokens (positions 1+) with the learned
+        # mask embedding.  BOS is never masked.  Applied only during training.
+        if self.training and self.cfg.token_dropout > 0.0:
+            hold_tokens = tokens[:, 1:, :]                                   # [B, L, d_model]
+            drop = torch.rand(batch_size, hold_tokens.shape[1], device=tokens.device) < self.cfg.token_dropout
+            mask_emb = self.mask_token.view(1, 1, -1).expand_as(hold_tokens)
+            hold_tokens = torch.where(drop.unsqueeze(-1), mask_emb, hold_tokens)
+            tokens = torch.cat([tokens[:, :1, :], hold_tokens], dim=1)
+
         return tokens
 
     def forward(
