@@ -365,6 +365,9 @@ def build_model_from_checkpoint(
     enc_cfg.use_cond_adaln = bool(ckpt_args.get("encoder_use_cond_adaln", True))
     enc_cfg.use_absolute_pos = bool(ckpt_args.get("use_absolute_pos", True))
     enc_cfg.use_type_feature = bool(ckpt_args.get("use_type_feature", True))
+    # Spatial feature flags — default True so old checkpoints (which always had these on) load correctly.
+    enc_cfg.use_knn_features = bool(ckpt_args.get("use_knn_features", True))
+    enc_cfg.use_delta_features = bool(ckpt_args.get("use_delta_features", True))
     enc_cfg.shape_desc_dim = int(ckpt_args.get("shape_desc_dim", 9))
     # Default to "cls" for old checkpoints that pre-date attention pooling —
     # those checkpoints have no pool_queries / pool_attn weights, so "attention"

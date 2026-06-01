@@ -38,29 +38,34 @@ class RouteVAEEncoderConfig:
     delta_embed_dim: int = 8             # used for delta_x_prev, delta_y_prev
 
     # k-NN neighbourhood features (encoder-only; requires full sequence)
-    use_knn_features: bool = True
+    use_knn_features: bool = False
     knn_embed_dim: int = 16
 
     # Ablation flags — set False to remove the feature from the token embedding.
     # These must match whatever the preprocessed cache was built with.
     use_absolute_pos: bool = True   # if False, x/y sinusoidal embeddings are dropped
     use_type_feature: bool = True   # if False, hold-type embedding is dropped
+    use_delta_features: bool = False  # if False, Δx/Δy move-delta embeddings are dropped
 
     # Route-level shape descriptor dimension — auto-detected from data at training time
     # so it stays consistent with whatever route_preprocessing.py produced.
     shape_desc_dim: int = 9
 
     # Pooling strategy for the route embedding fed to the bottleneck.
+    # "mean_max"  — concatenate mean-pooled and max-pooled hold token outputs [B, 2*d_model]
+    #               then project to d_model.  Mean captures aggregate route statistics;
+    #               max surfaces the most extreme hold per style dimension (largest move,
+    #               hardest hold type, etc.).  Theoretically motivated by DeepSets:
+    #               {mean, max} can approximate any continuous set function.  Default.
     # "attention" — K learned queries attend over hold token outputs via multi-head attention.
-    #               Each query specialises on a different style aspect (type mix, reach, density…).
-    #               K summaries are concatenated and projected back to d_model.
+    #               Kept for backward compat with existing checkpoints; in practice converges
+    #               to near-uniform weights (effectively mean pooling) due to the VAE
+    #               reconstruction loss not rewarding query specialisation.
     # "cls"       — shape/CLS token at position 0; kept for backward compat only.
-    route_pool_mode: str = "attention"
-    # Number of learned query vectors.  K=4 covers the ~5 genuine style PCs while
-    # keeping the projection (K×d_model → d_model) manageable.
+    route_pool_mode: str = "mean_max"
+    # Number of learned query vectors (attention mode only).
     pool_num_queries: int = 4
-    # Heads in the pooling MHA.  Fewer than the encoder transformer (where heads decompose
-    # features); here heads diversify *routing* patterns.  4 heads × 64 dims is enough.
+    # Heads in the pooling MHA (attention mode only).
     pool_nhead: int = 4
 
     # Transformer sizes
@@ -104,7 +109,7 @@ class RouteTransformerEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        self.hold_embedder = HoldTokenEmbedder(cfg)
+        self.hold_embedder = HoldTokenEmbedder(cfg, use_delta=getattr(cfg, "use_delta_features", True))
 
         # Shape descriptor MLP: projects shape_desc → d_model CLS token.
         # Dimension is cfg.shape_desc_dim (9 full / 5 shape-only experiment).
@@ -150,28 +155,33 @@ class RouteTransformerEncoder(nn.Module):
         else:
             self.pre_encoder_adaln = None
 
-        # Multi-query attention pooling: K learned queries attend over hold token outputs.
-        # Each query specialises on a different style axis (type mix, reach, density…),
-        # avoiding the single-query bias toward mean statistics that prevents encoding
-        # features like max move distance.  K summaries are projected back to d_model.
-        # Only instantiated for route_pool_mode=="attention"; skipped for "cls" so old
-        # checkpoints without these weights still load cleanly.
+        # Route embedding pooling — see route_pool_mode docstring above.
+        # "mean_max": simple concat of mean + max over hold tokens, projected to d_model.
+        #             No additional learned parameters beyond a single Linear.
+        # "attention": K learned queries (backward compat with existing checkpoints).
+        # "cls": shape token fallback (backward compat only).
         pool_mode = getattr(cfg, "route_pool_mode", "attention")
-        if pool_mode == "attention":
+        self._pool_mode = pool_mode
+        if pool_mode == "mean_max":
+            self.pool_queries: nn.Parameter | None = None  # type: ignore[assignment]
+            self.pool_attn: nn.MultiheadAttention | None = None
+            self.pool_proj: nn.Linear | None = nn.Linear(2 * cfg.d_model, cfg.d_model)
+        elif pool_mode == "attention":
             K = cfg.pool_num_queries
             self.pool_queries = nn.Parameter(torch.randn(K, cfg.d_model) * 0.02)
             self.pool_attn = nn.MultiheadAttention(
                 embed_dim=cfg.d_model,
                 num_heads=cfg.pool_nhead,
-                dropout=0.0,   # no dropout — stable attention weights matter for routing
+                dropout=0.0,
                 batch_first=True,
             )
             # Project K concatenated summaries back to d_model
             self.pool_proj = nn.Linear(K * cfg.d_model, cfg.d_model)
         else:
-            self.pool_queries: nn.Parameter | None = None  # type: ignore[assignment]
-            self.pool_attn: nn.MultiheadAttention | None = None
-            self.pool_proj: nn.Linear | None = None
+            # "cls" fallback
+            self.pool_queries = None
+            self.pool_attn = None
+            self.pool_proj = None
 
     def _build_condition_embedding(
         self,
@@ -243,13 +253,21 @@ class RouteTransformerEncoder(nn.Module):
         # Token embeddings = hold tokens only (exclude shape token at position 0)
         token_embeddings = encoded[:, 1:, :]    # [B, L, d_model]
 
-        # Route embedding: multi-query attention pool over hold tokens.
-        # K learned queries attend simultaneously; each can specialise on a different
-        # style aspect.  The shape/CLS token is excluded (hold tokens only) to prevent
-        # shortcutting via pre-computed shape_desc statistics.
-        # Falls back to CLS for old checkpoints saved without pool_queries.
+        # Route embedding: pool over hold tokens (shape/CLS token excluded to prevent
+        # shortcutting via pre-computed shape_desc statistics).
         hold_padding = padding_mask[:, 1:]  # [B, L] — padding mask for hold tokens only
-        if self.pool_attn is not None:
+        if self._pool_mode == "mean_max":
+            # Mean pool over non-padded tokens
+            valid = (~hold_padding).unsqueeze(-1).to(token_embeddings.dtype)  # [B, L, 1]
+            mean_pooled = (token_embeddings * valid).sum(1) / valid.sum(1).clamp(min=1.0)  # [B, D]
+            # Max pool — mask padded positions to -inf before reduction
+            max_pooled = token_embeddings.masked_fill(
+                hold_padding.unsqueeze(-1), float("-inf")
+            ).max(dim=1).values                                               # [B, D]
+            route_embedding = self.pool_proj(
+                torch.cat([mean_pooled, max_pooled], dim=-1)
+            )                                                                 # [B, d_model]
+        elif self._pool_mode == "attention" and self.pool_attn is not None:
             q = self.pool_queries.unsqueeze(0).expand(batch_size, -1, -1)  # [B, K, d_model]
             pooled, _ = self.pool_attn(
                 q, token_embeddings, token_embeddings,
@@ -257,7 +275,7 @@ class RouteTransformerEncoder(nn.Module):
             )                                                               # [B, K, d_model]
             route_embedding = self.pool_proj(pooled.flatten(1))            # [B, d_model]
         else:
-            # "cls" fallback for backward-compat with pre-attention-pool checkpoints
+            # "cls" fallback for backward-compat with pre-pool checkpoints
             route_embedding = encoded[:, 0, :]  # [B, d_model]
 
         return {"token_embeddings": token_embeddings, "route_embedding": route_embedding}

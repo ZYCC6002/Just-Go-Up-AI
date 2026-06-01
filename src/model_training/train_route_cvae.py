@@ -144,6 +144,8 @@ def _build_model(
     decoder_dim_feedforward: int,
     use_absolute_pos: bool = True,
     use_type_feature: bool = True,
+    use_delta_features: bool = False,
+    use_knn_features: bool = False,
     shape_desc_dim: int = 9,
     route_pool_mode: str = "cls",
     pool_num_queries: int = 4,
@@ -165,6 +167,8 @@ def _build_model(
     enc_cfg.use_cond_adaln = encoder_use_cond_adaln
     enc_cfg.use_absolute_pos = use_absolute_pos
     enc_cfg.use_type_feature = use_type_feature
+    enc_cfg.use_delta_features = use_delta_features
+    enc_cfg.use_knn_features = use_knn_features
     enc_cfg.shape_desc_dim = shape_desc_dim
     enc_cfg.route_pool_mode = route_pool_mode
     enc_cfg.pool_num_queries = pool_num_queries
@@ -490,10 +494,22 @@ def main() -> None:
              "Set --no-use-type-feature to ablate (forces z to encode geometry, not hold type).",
     )
     parser.add_argument(
-        "--route-pool-mode", type=str, default="attention", choices=["attention", "cls"],
+        "--use-delta-features", action=argparse.BooleanOptionalAction, default=False,
+        help="Include Δx/Δy move-delta embeddings in hold tokens. "
+             "Default False: sinusoidal x/y already encodes spatial structure; "
+             "deltas are redundant and add noise. Set --use-delta-features to re-enable.",
+    )
+    parser.add_argument(
+        "--use-knn-features", action=argparse.BooleanOptionalAction, default=False,
+        help="Include k-NN neighbourhood distance/bearing features in hold tokens. "
+             "Default False: redundant with sinusoidal x/y. Set --use-knn-features to re-enable.",
+    )
+    parser.add_argument(
+        "--route-pool-mode", type=str, default="mean_max", choices=["mean_max", "attention", "cls"],
         help="Pooling strategy for the route embedding fed to the bottleneck. "
-             "'attention' = K learned queries attend over hold tokens (recommended). "
-             "'cls' = shape/CLS token (fast; risks shortcutting via pre-computed shape_desc stats).",
+             "'mean_max' = concat mean+max over hold tokens, project to d_model (recommended). "
+             "'attention' = K learned queries (backward compat; converges to near-uniform weights). "
+             "'cls' = shape/CLS token (backward compat only).",
     )
     parser.add_argument("--pool-num-queries", type=int, default=4,
                         help="Number of learned query vectors for multi-query attention pooling. "
@@ -588,6 +604,8 @@ def main() -> None:
         decoder_dim_feedforward=args.decoder_dim_feedforward,
         use_absolute_pos=args.use_absolute_pos,
         use_type_feature=args.use_type_feature,
+        use_delta_features=args.use_delta_features,
+        use_knn_features=args.use_knn_features,
         shape_desc_dim=shape_desc_dim,
         route_pool_mode=args.route_pool_mode,
         pool_num_queries=args.pool_num_queries,
