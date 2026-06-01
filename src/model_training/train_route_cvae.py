@@ -358,7 +358,7 @@ def _compute_batch_losses(
 
         _SQRT2 = 2.0 ** 0.5
         pairwise_loss = masked_mse(d_pred / _SQRT2, d_true / _SQRT2, pair_mask)
-        total = total + pairwise_weight * pairwise_loss
+        total = total + numeric_weight * pairwise_weight * pairwise_loss
         pairwise_val = float(pairwise_loss.detach().cpu())
 
     grade_adv_val = 0.0
@@ -610,11 +610,13 @@ def main() -> None:
                              "clamping each dimension's KL from below before summing. "
                              "Recommended: 0.5 nats/dim.")
     parser.add_argument("--pairwise-weight", type=float, default=0.0,
-                        help="Weight for pairwise distance loss. MSE between predicted and true L2 "
-                             "distances for all valid hold pairs, normalised by board diagonal / √2. "
-                             "Creates gradient signal for inter-hold spatial structure (e.g. move "
-                             "distances) which per-token x/y MSE alone cannot provide. "
-                             "Suggested starting value: 1.0.")
+                        help="Weight for pairwise distance loss (compounded with --numeric-weight). "
+                             "Effective contribution = numeric_weight × pairwise_weight × MSE, so "
+                             "pairwise_weight=1.0 gives one additional numeric-scale term. MSE is "
+                             "between predicted and true L2 distances for all valid hold pairs, "
+                             "normalised by √2. Creates gradient signal for inter-hold spatial "
+                             "structure which per-token x/y MSE alone cannot provide. "
+                             "Suggested starting value: 1.0–4.0.")
     parser.add_argument("--hole-loss-weight", type=float, default=1.0,
                         help="Multiplier on the hole cross-entropy term in the reconstruction loss. "
                              "Hole vocab size is 593 (log₂(593)≈9.2 bits) vs type=7 and role=~5, so "
@@ -826,8 +828,8 @@ def main() -> None:
         train_weighted_adv = args.grade_adversary_weight * (
             train_m.grade_adv_loss + args.angle_adversary_scale * train_m.angle_adv_loss
         )
-        train_pairwise_w = args.pairwise_weight * train_m.pairwise_loss
-        val_pairwise_w   = args.pairwise_weight * val_m.pairwise_loss
+        train_pairwise_w = args.numeric_weight * args.pairwise_weight * train_m.pairwise_loss
+        val_pairwise_w   = args.numeric_weight * args.pairwise_weight * val_m.pairwise_loss
         train_kl_w = train_m.total_loss - train_recon - train_weighted_adv - train_pairwise_w
         val_kl_w   = val_m.total_loss - val_recon - val_pairwise_w
         train_kl_excess = max(train_m.kl_raw - kl_floor, 0.0)
@@ -941,8 +943,9 @@ def main() -> None:
             **norm_ranges,
         )
     test_recon = test_m.categorical_loss + args.numeric_weight * test_m.numeric_loss
-    # Test uses is_train=False → adversary excluded from total. Identity: total = recon + kl_w.
-    test_kl_w = test_m.total_loss - test_recon
+    test_pairwise_w = args.numeric_weight * args.pairwise_weight * test_m.pairwise_loss
+    # Test uses is_train=False → adversary excluded from total. Identity: total = recon + kl_w + pairwise_w.
+    test_kl_w = test_m.total_loss - test_recon - test_pairwise_w
     test_kl_floor = args.free_bits * args.latent_dim
     test_kl_excess = max(test_m.kl_raw - test_kl_floor, 0.0)
     test_adv_str = (
