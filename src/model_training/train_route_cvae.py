@@ -32,6 +32,7 @@ from model_training.route_vae_bottleneck import (
 )
 from model_training.route_vae_decoder import RouteTransformerDecoder, RouteVAEDecoderConfig
 from model_training.route_vae_encoder import RouteTransformerEncoder
+from model_training.route_vae_parallel_decoder import RouteParallelDecoder, RouteVAEParallelDecoderConfig
 from model_training.training_utils import DecoderEOSIds, masked_mse, prepare_cvae_training_batch
 
 
@@ -172,13 +173,12 @@ def _build_model(
     use_type_feature: bool = True,
     shape_desc_dim: int = 9,
     decoder_token_dropout: float = 0.0,
+    use_parallel_decoder: bool = False,
 ) -> tuple[RouteConditionalVAE, DecoderEOSIds]:
     if encoder_d_model % encoder_nhead != 0:
         raise ValueError(
             f"--encoder-d-model ({encoder_d_model}) must be divisible by --encoder-nhead ({encoder_nhead})"
         )
-    if decoder_d_model % 8 != 0:
-        raise ValueError(f"--decoder-d-model ({decoder_d_model}) must be divisible by nhead=8")
 
     enc_cfg = vocabs.to_transformer_config(
         d_model=encoder_d_model,
@@ -191,31 +191,46 @@ def _build_model(
     enc_cfg.shape_desc_dim = shape_desc_dim
     enc_cfg.route_pool_mode = "mean_max"
 
-    dec_cfg = RouteVAEDecoderConfig(
-        type_vocab_size=enc_cfg.type_vocab_size,
-        role_vocab_size=enc_cfg.role_vocab_size,
-        hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
-        latent_dim=latent_dim,
-        d_model=decoder_d_model,
-        num_layers=decoder_num_layers,
-        dim_feedforward=decoder_dim_feedforward,
-        use_absolute_pos=use_absolute_pos,
-        use_type_feature=use_type_feature,
-        token_dropout=decoder_token_dropout,
-        x_min=enc_cfg.x_min,
-        x_max=enc_cfg.x_max,
-        y_min=enc_cfg.y_min,
-        y_max=enc_cfg.y_max,
-    )
     bottleneck_cfg = RouteVAEBottleneckConfig(
         encoder_embedding_dim=enc_cfg.d_model,
         latent_dim=latent_dim,
     )
 
+    if use_parallel_decoder:
+        dec_cfg: RouteVAEParallelDecoderConfig | RouteVAEDecoderConfig = RouteVAEParallelDecoderConfig(
+            type_vocab_size=enc_cfg.type_vocab_size,
+            role_vocab_size=enc_cfg.role_vocab_size,
+            hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
+            latent_dim=latent_dim,
+            d_model=decoder_d_model,
+            mlp_depth=decoder_num_layers,
+        )
+        decoder = RouteParallelDecoder(dec_cfg)
+    else:
+        if decoder_d_model % 8 != 0:
+            raise ValueError(f"--decoder-d-model ({decoder_d_model}) must be divisible by nhead=8")
+        dec_cfg = RouteVAEDecoderConfig(
+            type_vocab_size=enc_cfg.type_vocab_size,
+            role_vocab_size=enc_cfg.role_vocab_size,
+            hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
+            latent_dim=latent_dim,
+            d_model=decoder_d_model,
+            num_layers=decoder_num_layers,
+            dim_feedforward=decoder_dim_feedforward,
+            use_absolute_pos=use_absolute_pos,
+            use_type_feature=use_type_feature,
+            token_dropout=decoder_token_dropout,
+            x_min=enc_cfg.x_min,
+            x_max=enc_cfg.x_max,
+            y_min=enc_cfg.y_min,
+            y_max=enc_cfg.y_max,
+        )
+        decoder = RouteTransformerDecoder(dec_cfg)
+
     model = RouteConditionalVAE(
         encoder=RouteTransformerEncoder(enc_cfg),
         bottleneck=RouteVAEBottleneck(bottleneck_cfg),
-        decoder=RouteTransformerDecoder(dec_cfg),
+        decoder=decoder,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -223,10 +238,16 @@ def _build_model(
         f"Encoder: d_model={enc_cfg.d_model} nhead={enc_cfg.nhead} "
         f"layers={enc_cfg.num_layers} ffn={enc_cfg.dim_feedforward}"
     )
-    print(
-        f"Decoder: d_model={dec_cfg.d_model} nhead={dec_cfg.nhead} "
-        f"layers={dec_cfg.num_layers} ffn={dec_cfg.dim_feedforward}"
-    )
+    if use_parallel_decoder:
+        print(
+            f"Decoder (parallel MLP): d_model={dec_cfg.d_model} "
+            f"mlp_depth={dec_cfg.mlp_depth}"
+        )
+    else:
+        print(
+            f"Decoder (autoregressive): d_model={dec_cfg.d_model} nhead={dec_cfg.nhead} "
+            f"layers={dec_cfg.num_layers} ffn={dec_cfg.dim_feedforward}"
+        )
     print(f"Total parameters: {total_params:,}")
 
     eos_ids = DecoderEOSIds(
@@ -380,11 +401,14 @@ def _compute_batch_losses(
     prepared = prepare_cvae_training_batch(
         batch_samples, eos_ids=eos_ids, device=device, ignore_index=ignore_index
     )
-    if autoregressive:
+    is_parallel = not getattr(model.decoder, "is_autoregressive", True)
+
+    if autoregressive and not is_parallel:
         out = _autoregressive_forward(model, prepared, device=device)
-    elif ss_ratio > 0.0 and model.training:
+    elif ss_ratio > 0.0 and model.training and not is_parallel:
         # Two-pass scheduled sampling: first pass (eval, no_grad) gets clean predictions;
         # second pass (train) trains on the mixed ground-truth/own-prediction inputs.
+        # Not applicable to the parallel decoder (no input tokens to mix).
         dec_cfg = model.decoder.cfg
         model.eval()
         with torch.no_grad():
@@ -589,6 +613,15 @@ def main() -> None:
                         help="Number of decoder transformer layers.")
     parser.add_argument("--decoder-dim-feedforward", type=int, default=512,
                         help="Decoder FFN hidden dim. Recommended: 4 × decoder-d-model.")
+    parser.add_argument(
+        "--parallel-decoder", action=argparse.BooleanOptionalAction, default=False,
+        help="Use a non-autoregressive parallel MLP decoder instead of the transformer decoder. "
+             "Each output position is predicted independently from z + a position embedding — "
+             "no cross-token communication.  Forces z to encode all route structure (Phase 1). "
+             "Ignores --decoder-token-dropout, --scheduled-sampling-ratio, and "
+             "--decoder-dim-feedforward (not applicable to an MLP).  "
+             "--decoder-d-model and --decoder-num-layers control the MLP width and depth.",
+    )
     parser.add_argument("--decoder-token-dropout", type=float, default=0.0,
                         help="Probability of replacing each decoder input token (positions 1+) "
                              "with a learned mask embedding during training. Forces the decoder "
@@ -681,6 +714,7 @@ def main() -> None:
         use_type_feature=args.use_type_feature,
         shape_desc_dim=shape_desc_dim,
         decoder_token_dropout=args.decoder_token_dropout,
+        use_parallel_decoder=args.parallel_decoder,
     )
 
     max_seq_len = model.decoder.cfg.max_seq_len

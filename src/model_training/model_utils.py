@@ -269,6 +269,7 @@ def build_model_from_checkpoint(
     """
     from .route_vae_encoder import RouteTransformerEncoder
     from .route_vae_decoder import RouteTransformerDecoder, RouteVAEDecoderConfig
+    from .route_vae_parallel_decoder import RouteParallelDecoder, RouteVAEParallelDecoderConfig
     from .route_vae_bottleneck import RouteConditionalVAE, RouteVAEBottleneck, RouteVAEBottleneckConfig
     from .training_utils import DecoderEOSIds
 
@@ -297,37 +298,51 @@ def build_model_from_checkpoint(
         latent_dim_override if latent_dim_override is not None
         else ckpt_args.get("latent_dim", 32)
     )
-    dec_cfg = RouteVAEDecoderConfig(
-        type_vocab_size=enc_cfg.type_vocab_size,
-        role_vocab_size=enc_cfg.role_vocab_size,
-        hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
-        latent_dim=latent_dim,
-        d_model=int(ckpt_args.get("decoder_d_model", 128)),
-        num_layers=int(ckpt_args.get("decoder_num_layers", 4)),
-        dim_feedforward=int(ckpt_args.get("decoder_dim_feedforward", 512)),
-        type_embed_dim=int(ckpt_args.get("type_embed_dim", 32)),
-        use_absolute_pos=enc_cfg.use_absolute_pos,
-        use_type_feature=enc_cfg.use_type_feature,
-        token_dropout=float(ckpt_args.get("decoder_token_dropout", 0.0)),
-        x_min=enc_cfg.x_min,
-        x_max=enc_cfg.x_max,
-        y_min=enc_cfg.y_min,
-        y_max=enc_cfg.y_max,
-    )
     bottleneck_cfg = RouteVAEBottleneckConfig(
         encoder_embedding_dim=enc_cfg.d_model,
         latent_dim=latent_dim,
     )
 
+    use_parallel = bool(ckpt_args.get("parallel_decoder", False))
+    if use_parallel:
+        dec_cfg: RouteVAEParallelDecoderConfig | RouteVAEDecoderConfig = RouteVAEParallelDecoderConfig(
+            type_vocab_size=enc_cfg.type_vocab_size,
+            role_vocab_size=enc_cfg.role_vocab_size,
+            hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
+            latent_dim=latent_dim,
+            d_model=int(ckpt_args.get("decoder_d_model", 128)),
+            mlp_depth=int(ckpt_args.get("decoder_num_layers", 2)),
+        )
+        decoder: RouteParallelDecoder | RouteTransformerDecoder = RouteParallelDecoder(dec_cfg)
+    else:
+        dec_cfg = RouteVAEDecoderConfig(
+            type_vocab_size=enc_cfg.type_vocab_size,
+            role_vocab_size=enc_cfg.role_vocab_size,
+            hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
+            latent_dim=latent_dim,
+            d_model=int(ckpt_args.get("decoder_d_model", 128)),
+            num_layers=int(ckpt_args.get("decoder_num_layers", 4)),
+            dim_feedforward=int(ckpt_args.get("decoder_dim_feedforward", 512)),
+            type_embed_dim=int(ckpt_args.get("type_embed_dim", 32)),
+            use_absolute_pos=enc_cfg.use_absolute_pos,
+            use_type_feature=enc_cfg.use_type_feature,
+            token_dropout=float(ckpt_args.get("decoder_token_dropout", 0.0)),
+            x_min=enc_cfg.x_min,
+            x_max=enc_cfg.x_max,
+            y_min=enc_cfg.y_min,
+            y_max=enc_cfg.y_max,
+        )
+        decoder = RouteTransformerDecoder(dec_cfg)
+
     model = RouteConditionalVAE(
         encoder=RouteTransformerEncoder(enc_cfg),
         bottleneck=RouteVAEBottleneck(bottleneck_cfg),
-        decoder=RouteTransformerDecoder(dec_cfg),
+        decoder=decoder,
     ).to(device)
     state_dict = dict(ckpt["model_state_dict"])
     # Back-compat: old checkpoints predate mask_token; initialise to zeros so
     # the architecture matches without requiring a strict-load failure.
-    if "decoder.mask_token" not in state_dict:
+    if not use_parallel and "decoder.mask_token" not in state_dict:
         state_dict["decoder.mask_token"] = torch.zeros(dec_cfg.d_model, device=device)
     model.load_state_dict(state_dict, strict=True)
     model.eval()

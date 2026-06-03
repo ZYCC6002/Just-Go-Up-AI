@@ -6,7 +6,6 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-from .route_vae_decoder import RouteTransformerDecoder
 from .route_vae_encoder import RouteTransformerEncoder
 
 
@@ -118,7 +117,7 @@ class RouteConditionalVAE(nn.Module):
         self,
         encoder: RouteTransformerEncoder,
         bottleneck: RouteVAEBottleneck,
-        decoder: RouteTransformerDecoder,
+        decoder: nn.Module,
     ) -> None:
         super().__init__()
         self.encoder = encoder
