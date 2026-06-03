@@ -25,7 +25,6 @@ from model_training.model_utils import (
     select_device,
 )
 from model_training.route_vae_bottleneck import (
-    GradeAngleAdversaryHead,
     RouteConditionalVAE,
     RouteVAEBottleneck,
     RouteVAEBottleneckConfig,
@@ -41,16 +40,9 @@ class EpochMetrics:
     total_loss: float
     categorical_loss: float
     numeric_loss: float
-    kl_raw: float            # unweighted KL — for kl=X(+Y) diagnostics, not the loss contribution
-    grade_adv_loss: float    # MSE of adversary predicting grade from z; good ≥ Var(grade_norm)
-    angle_adv_loss: float    # MSE of adversary predicting angle from z; good ≥ Var(angle_norm)
+    kl_raw: float       # unweighted KL — for kl=X(+Y) diagnostics, not the loss contribution
     num_batches: int
     pairwise_loss: float = 0.0  # unweighted pairwise distance MSE (0 when pairwise_weight=0)
-
-    @property
-    def adversary_loss(self) -> float:
-        """Combined (unweighted) adversary loss — sum of grade + angle MSE."""
-        return self.grade_adv_loss + self.angle_adv_loss
 
 
 def _compute_kl_beta(*, epoch: int, target_kl_beta: float, kl_warmup_epochs: int) -> float:
@@ -70,27 +62,13 @@ def _save_loss_curve(
     val_recon: list[float],
     train_kl: list[float],
     val_kl: list[float],
-    train_grade_adv: list[float] | None = None,
-    val_grade_adv: list[float] | None = None,
-    train_angle_adv: list[float] | None = None,
-    val_angle_adv: list[float] | None = None,
-    grade_chance: float | None = None,
-    angle_chance: float | None = None,
     output_path: Path,
 ) -> None:
     if not epochs:
         return
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    has_adv = bool(train_grade_adv)
-
-    if has_adv:
-        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-        ax1, ax2, ax3 = axes[0]
-        ax4, ax5, ax6 = axes[1]
-        ax6.set_visible(False)
-    else:
-        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(12, 4))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(12, 4))
 
     for ax, train, val, title in [
         (ax1, train_total, val_total, "Total Loss"),
@@ -105,24 +83,6 @@ def _save_loss_curve(
         ax.grid(alpha=0.3)
         ax.legend(loc="best")
 
-    if has_adv:
-        for ax, train, val, title, chance in [
-            (ax4, train_grade_adv, val_grade_adv, "Grade Adversary (g_adv)", grade_chance),
-            (ax5, train_angle_adv, val_angle_adv, "Angle Adversary (a_adv)", angle_chance),
-        ]:
-            ax.plot(epochs, train, label="Train", linewidth=2)
-            ax.plot(epochs, val, label="Val", linewidth=2)
-            if chance is not None:
-                ax.axhline(
-                    chance, color="gray", linestyle="--", linewidth=1.5,
-                    label=f"Chance ({chance:.4f})",
-                )
-            ax.set_title(title)
-            ax.set_xlabel("Epoch")
-            ax.set_ylabel("MSE")
-            ax.grid(alpha=0.3)
-            ax.legend(loc="best")
-
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
@@ -134,25 +94,18 @@ def _build_model(
     device: torch.device,
     *,
     latent_dim: int,
-    encoder_use_cond_adaln: bool,
     encoder_d_model: int,
     encoder_nhead: int,
     encoder_num_layers: int,
     encoder_dim_feedforward: int,
-    decoder_use_cond_adaln: bool,
     decoder_d_model: int,
     decoder_num_layers: int,
     decoder_dim_feedforward: int,
     use_absolute_pos: bool = True,
     use_type_feature: bool = True,
-    use_delta_features: bool = False,
-    use_knn_features: bool = False,
     shape_desc_dim: int = 9,
-    route_pool_mode: str = "cls",
-    pool_num_queries: int = 4,
-    pool_nhead: int = 4,
     decoder_token_dropout: float = 0.0,
-) -> tuple[RouteConditionalVAE, DecoderEOSIds, dict[str, float]]:
+) -> tuple[RouteConditionalVAE, DecoderEOSIds]:
     if encoder_d_model % encoder_nhead != 0:
         raise ValueError(
             f"--encoder-d-model ({encoder_d_model}) must be divisible by --encoder-nhead ({encoder_nhead})"
@@ -166,26 +119,19 @@ def _build_model(
         num_layers=encoder_num_layers,
         dim_feedforward=encoder_dim_feedforward,
     )
-    enc_cfg.use_cond_adaln = encoder_use_cond_adaln
     enc_cfg.use_absolute_pos = use_absolute_pos
     enc_cfg.use_type_feature = use_type_feature
-    enc_cfg.use_delta_features = use_delta_features
-    enc_cfg.use_knn_features = use_knn_features
     enc_cfg.shape_desc_dim = shape_desc_dim
-    enc_cfg.route_pool_mode = route_pool_mode
-    enc_cfg.pool_num_queries = pool_num_queries
-    enc_cfg.pool_nhead = pool_nhead
+    enc_cfg.route_pool_mode = "mean_max"
 
     dec_cfg = RouteVAEDecoderConfig(
         type_vocab_size=enc_cfg.type_vocab_size,
         role_vocab_size=enc_cfg.role_vocab_size,
         hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
         latent_dim=latent_dim,
-        use_cond_adaln=decoder_use_cond_adaln,
         d_model=decoder_d_model,
         num_layers=decoder_num_layers,
         dim_feedforward=decoder_dim_feedforward,
-        use_knn_features=False,    # decoder never uses full-sequence knn features
         use_absolute_pos=use_absolute_pos,
         use_type_feature=use_type_feature,
         token_dropout=decoder_token_dropout,
@@ -193,10 +139,6 @@ def _build_model(
         x_max=enc_cfg.x_max,
         y_min=enc_cfg.y_min,
         y_max=enc_cfg.y_max,
-        angle_min=enc_cfg.angle_min,
-        angle_max=enc_cfg.angle_max,
-        grade_min=enc_cfg.grade_min,
-        grade_max=enc_cfg.grade_max,
     )
     bottleneck_cfg = RouteVAEBottleneckConfig(
         encoder_embedding_dim=enc_cfg.d_model,
@@ -225,13 +167,7 @@ def _build_model(
         role_eos_id=model.decoder.role_eos_id,
         hole_eos_id=model.decoder.hole_eos_id,
     )
-    norm_ranges = {
-        "angle_min": float(enc_cfg.angle_min),
-        "angle_max": float(enc_cfg.angle_max),
-        "grade_min": float(enc_cfg.grade_min),
-        "grade_max": float(enc_cfg.grade_max),
-    }
-    return model, eos_ids, norm_ranges
+    return model, eos_ids
 
 
 def _load_or_build_samples_and_vocabs(args: argparse.Namespace) -> tuple[list[Any], Any]:
@@ -287,10 +223,7 @@ def _autoregressive_forward(
       ori : raw ∈ [−1, 1]         →  target = (ori + 1) / 2
       size: raw ∈ [2, 5]          →  target = (size − 2) / 3
     """
-    angle = prepared["angle"]
-    grade = prepared["grade"]
-
-    enc_out = model.encoder(prepared["encoder_batch"], angle=angle, grade=grade)
+    enc_out = model.encoder(prepared["encoder_batch"])
     bn_out  = model.bottleneck(enc_out["route_embedding"], sample_latent=False)
     z       = bn_out["z"]
 
@@ -323,7 +256,7 @@ def _autoregressive_forward(
 
     for t in range(target_len):
         batch_t = {k: v[:, :t + 1] for k, v in seq.items()}
-        dec_out = model.decoder(batch_t, z=z, angle=angle, grade=grade)
+        dec_out = model.decoder(batch_t, z=z)
 
         type_logits_list .append(dec_out["type_logits"]         [:, t, :])
         role_logits_list .append(dec_out["role_logits"]         [:, t, :])
@@ -371,33 +304,20 @@ def _compute_batch_losses(
     numeric_weight: float,
     ignore_index: int = -100,
     sample_latent: bool = True,
-    adversary: GradeAngleAdversaryHead | None = None,
-    grade_adversary_weight: float = 0.0,
-    grade_adversary_alpha: float = 1.0,
-    angle_adversary_scale: float = 1.0,
-    angle_min: float = 0.0,
-    angle_max: float = 70.0,
-    grade_min: float = 10.0,
-    grade_max: float = 33.0,
     free_bits: float = 0.0,
     pairwise_weight: float = 0.0,
     hole_loss_weight: float = 1.0,
-    adversary_in_total: bool = True,
     autoregressive: bool = False,
-) -> tuple[torch.Tensor, dict[str, float], torch.Tensor | None]:
+) -> tuple[torch.Tensor, dict[str, float]]:
     prepared = prepare_cvae_training_batch(
         batch_samples, eos_ids=eos_ids, device=device, ignore_index=ignore_index
     )
     if autoregressive:
-        # Validation / test: decode autoregressively — each step's prediction
-        # is fed back as the next step's input.  No teacher forcing.
         out = _autoregressive_forward(model, prepared, device=device)
     else:
         out = model(
             encoder_batch=prepared["encoder_batch"],
             decoder_batch=prepared["decoder_input_batch"],
-            angle=prepared["angle"],
-            grade=prepared["grade"],
             sample_latent=sample_latent,
         )
 
@@ -461,56 +381,14 @@ def _compute_batch_losses(
         total = total + numeric_weight * pairwise_weight * pairwise_loss
         pairwise_val = float(pairwise_loss.detach().cpu())
 
-    grade_adv_val = 0.0
-    angle_adv_val = 0.0
-    adversary_loss_clean: torch.Tensor | None = None
-
-    if adversary is not None and grade_adversary_weight > 0.0:
-        grade_range = max(grade_max - grade_min, 1e-6)
-        grade_norm = ((prepared["grade"].to(torch.float32) - grade_min) / grade_range).clamp(0.0, 1.0)
-        angle_range = max(angle_max - angle_min, 1e-6)
-        angle_norm = ((prepared["angle"].to(torch.float32) - angle_min) / angle_range).clamp(0.0, 1.0)
-
-        # ── Clean pass (z detached, alpha=0) ────────────────────────────────
-        # The adversary optimizer steps on THIS loss only.  Detaching z breaks
-        # the gradient link to the encoder so the adversary receives a clean
-        # learning signal — it can freely probe z without the encoder's GRL
-        # update simultaneously overriding it every step.
-        # Stats (g_adv / a_adv) are reported from this pass: it is the true
-        # measure of "how well can the adversary predict grade/angle from z?"
-        grade_pred_clean, angle_pred_clean = adversary(out["z"].detach(), alpha=0.0)
-        grade_adv_loss_clean = F.mse_loss(grade_pred_clean, grade_norm)
-        angle_adv_loss_clean = F.mse_loss(angle_pred_clean, angle_norm)
-        adversary_loss_clean = grade_adv_loss_clean + angle_adversary_scale * angle_adv_loss_clean
-
-        grade_adv_val = float(grade_adv_loss_clean.detach().cpu())
-        angle_adv_val = float(angle_adv_loss_clean.detach().cpu())
-
-        if adversary_in_total:
-            # ── GRL pass (z connected, with reversal) ───────────────────────
-            # Only the ENCODER is updated from this path.  The adversary
-            # optimizer is zeroed and re-run on adversary_loss_clean after
-            # loss.backward(), so the polluted adversary gradient from this
-            # pass is discarded.
-            # GRL identity in forward → same adversary outputs as clean pass;
-            # gradient at z is negated × alpha → encoder learns to hide grade.
-            grade_pred_grl, angle_pred_grl = adversary(out["z"], alpha=grade_adversary_alpha)
-            adversary_loss_grl = (
-                F.mse_loss(grade_pred_grl, grade_norm)
-                + angle_adversary_scale * F.mse_loss(angle_pred_grl, angle_norm)
-            )
-            total = total + grade_adversary_weight * adversary_loss_grl
-
     stats = {
         "total": float(total.detach().cpu()),
         "categorical": float(categorical_loss.detach().cpu()),
         "numeric": float(numeric_loss.detach().cpu()),
         "kl_raw": float(kl_raw.detach().cpu()),
-        "grade_adv": grade_adv_val,
-        "angle_adv": angle_adv_val,
         "pairwise": pairwise_val,
     }
-    return total, stats, adversary_loss_clean
+    return total, stats
 
 
 def _run_epoch(
@@ -525,15 +403,6 @@ def _run_epoch(
     numeric_weight: float,
     grad_clip_norm: float,
     sample_latent: bool,
-    adversary: GradeAngleAdversaryHead | None = None,
-    adversary_optimizer: AdamW | None = None,
-    grade_adversary_weight: float = 0.0,
-    grade_adversary_alpha: float = 1.0,
-    angle_adversary_scale: float = 1.0,
-    angle_min: float = 0.0,
-    angle_max: float = 70.0,
-    grade_min: float = 10.0,
-    grade_max: float = 33.0,
     free_bits: float = 0.0,
     pairwise_weight: float = 0.0,
     hole_loss_weight: float = 1.0,
@@ -541,73 +410,44 @@ def _run_epoch(
 ) -> EpochMetrics:
     is_train = optimizer is not None
     model.train(is_train)
-    if adversary is not None:
-        adversary.train(is_train)
 
-    loss_sum = cat_sum = num_sum = kl_raw_sum = grade_adv_sum = angle_adv_sum = pairwise_sum = 0.0
+    loss_sum = cat_sum = num_sum = kl_raw_sum = pairwise_sum = 0.0
     batches = 0
 
     for batch_samples in iter_minibatches(samples, batch_size, shuffle=is_train):
         if is_train:
             optimizer.zero_grad(set_to_none=True)
-            if adversary_optimizer is not None:
-                adversary_optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(is_train):
-            loss, stats, adversary_loss_clean = _compute_batch_losses(
+            loss, stats = _compute_batch_losses(
                 model, batch_samples,
                 device=device, eos_ids=eos_ids,
                 kl_beta=kl_beta, numeric_weight=numeric_weight,
                 sample_latent=sample_latent,
-                adversary=adversary,
-                grade_adversary_weight=grade_adversary_weight,
-                grade_adversary_alpha=grade_adversary_alpha,
-                angle_adversary_scale=angle_adversary_scale,
-                angle_min=angle_min, angle_max=angle_max,
-                grade_min=grade_min, grade_max=grade_max,
                 free_bits=free_bits,
                 pairwise_weight=pairwise_weight,
                 hole_loss_weight=hole_loss_weight,
-                adversary_in_total=is_train,  # adversary excluded from val total (see _compute_batch_losses)
                 autoregressive=autoregressive,
             )
             if is_train:
-                # ── Encoder / decoder update (includes GRL adversary signal) ──
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
-
-                # ── Adversary update (decoupled clean pass) ───────────────────
-                # Zero the adversary's grads accumulated from loss.backward() above
-                # (those came through the GRL path and are discarded), then backward
-                # on adversary_loss_clean — the detached-z pass where the adversary
-                # freely learns to probe z without the encoder fighting back in the
-                # same step.  This prevents the encoder's 7× stronger GRL signal
-                # from overpowering the adversary every iteration.
-                if adversary_optimizer is not None and adversary_loss_clean is not None:
-                    adversary_optimizer.zero_grad(set_to_none=True)
-                    adversary_loss_clean.backward()
-                    nn.utils.clip_grad_norm_(adversary.parameters(), grad_clip_norm)
-                    adversary_optimizer.step()
 
         loss_sum += stats["total"]
         cat_sum += stats["categorical"]
         num_sum += stats["numeric"]
         kl_raw_sum += stats["kl_raw"]
-        grade_adv_sum += stats["grade_adv"]
-        angle_adv_sum += stats["angle_adv"]
         pairwise_sum += stats["pairwise"]
         batches += 1
 
     if batches == 0:
-        return EpochMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)
+        return EpochMetrics(0.0, 0.0, 0.0, 0.0, 0)
     return EpochMetrics(
         total_loss=loss_sum / batches,
         categorical_loss=cat_sum / batches,
         numeric_loss=num_sum / batches,
         kl_raw=kl_raw_sum / batches,
-        grade_adv_loss=grade_adv_sum / batches,
-        angle_adv_loss=angle_adv_sum / batches,
         num_batches=batches,
         pairwise_loss=pairwise_sum / batches,
     )
@@ -633,7 +473,6 @@ def main() -> None:
     parser.add_argument("--latent-dim", type=int, default=32)
     parser.add_argument("--numeric-weight", type=float, default=0.25)
     parser.add_argument("--kl-beta", type=float, default=0.1)
-    parser.add_argument("--encoder-use-cond-adaln", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--use-absolute-pos", action=argparse.BooleanOptionalAction, default=True,
         help="Include absolute x/y sinusoidal embeddings in hold tokens. "
@@ -644,30 +483,6 @@ def main() -> None:
         help="Include hold-type categorical embedding and type fractions in shape_desc. "
              "Set --no-use-type-feature to ablate (forces z to encode geometry, not hold type).",
     )
-    parser.add_argument(
-        "--use-delta-features", action=argparse.BooleanOptionalAction, default=False,
-        help="Include Δx/Δy move-delta embeddings in hold tokens. "
-             "Default False: sinusoidal x/y already encodes spatial structure; "
-             "deltas are redundant and add noise. Set --use-delta-features to re-enable.",
-    )
-    parser.add_argument(
-        "--use-knn-features", action=argparse.BooleanOptionalAction, default=False,
-        help="Include k-NN neighbourhood distance/bearing features in hold tokens. "
-             "Default False: redundant with sinusoidal x/y. Set --use-knn-features to re-enable.",
-    )
-    parser.add_argument(
-        "--route-pool-mode", type=str, default="mean_max", choices=["mean_max", "attention", "cls"],
-        help="Pooling strategy for the route embedding fed to the bottleneck. "
-             "'mean_max' = concat mean+max over hold tokens, project to d_model (recommended). "
-             "'attention' = K learned queries (backward compat; converges to near-uniform weights). "
-             "'cls' = shape/CLS token (backward compat only).",
-    )
-    parser.add_argument("--pool-num-queries", type=int, default=4,
-                        help="Number of learned query vectors for multi-query attention pooling. "
-                             "Each query specialises on a different style axis. Default: 4.")
-    parser.add_argument("--pool-nhead", type=int, default=4,
-                        help="Number of heads in the pooling MHA. Fewer than encoder heads; "
-                             "pooling needs routing diversity, not feature decomposition. Default: 4.")
     # Encoder architecture (saved in checkpoint — must be restored exactly for resume/inference)
     parser.add_argument("--encoder-d-model", type=int, default=256,
                         help="Encoder transformer model dimension. Must be divisible by --encoder-nhead.")
@@ -677,7 +492,6 @@ def main() -> None:
                         help="Number of encoder transformer layers.")
     parser.add_argument("--encoder-dim-feedforward", type=int, default=1024,
                         help="Encoder FFN hidden dim. Recommended: 4 × encoder-d-model.")
-    parser.add_argument("--decoder-use-cond-adaln", action=argparse.BooleanOptionalAction, default=True)
     # Decoder architecture
     parser.add_argument("--decoder-d-model", type=int, default=128,
                         help="Decoder transformer model dimension (kept smaller than encoder).")
@@ -701,21 +515,6 @@ def main() -> None:
     parser.add_argument("--resume-path", type=str, default=None)
     parser.add_argument("--early-stop-delta", type=float, default=None)
     parser.add_argument("--early-stop-patience", type=int, default=1)
-    parser.add_argument("--grade-adversary-weight", type=float, default=0.0,
-                        help="Overall weight applied to the adversary loss term in the total "
-                             "(0 = disabled).  Scales both grade and angle adversary losses.")
-    parser.add_argument("--grade-adversary-alpha", type=float, default=1.0,
-                        help="Gradient reversal layer scale factor for the adversary head.")
-    parser.add_argument("--angle-adversary-scale", type=float, default=1.0,
-                        help="Additional multiplier applied to the angle adversary loss inside the "
-                             "combined loss: adversary_loss = grade_adv + angle_adversary_scale × angle_adv. "
-                             "Effective angle weight = grade_adversary_weight × angle_adversary_scale. "
-                             "Set > 1 to suppress angle more aggressively than grade.")
-    parser.add_argument("--adversary-hidden-dim", type=int, default=128,
-                        help="Width of each hidden layer in the grade/angle adversary MLP trunks.")
-    parser.add_argument("--adversary-depth", type=int, default=2,
-                        help="Number of hidden layers in each adversary trunk (grade and angle have "
-                             "separate trunks of this depth).")
     parser.add_argument("--free-bits", type=float, default=0.0,
                         help="Minimum KL per latent dimension (nats). Prevents posterior collapse by "
                              "clamping each dimension's KL from below before summing. "
@@ -762,26 +561,19 @@ def main() -> None:
     # Save back so it is persisted in the checkpoint args.
     args.shape_desc_dim = shape_desc_dim
 
-    model, eos_ids, norm_ranges = _build_model(
+    model, eos_ids = _build_model(
         vocabs, device,
         latent_dim=args.latent_dim,
-        encoder_use_cond_adaln=args.encoder_use_cond_adaln,
         encoder_d_model=args.encoder_d_model,
         encoder_nhead=args.encoder_nhead,
         encoder_num_layers=args.encoder_num_layers,
         encoder_dim_feedforward=args.encoder_dim_feedforward,
-        decoder_use_cond_adaln=args.decoder_use_cond_adaln,
         decoder_d_model=args.decoder_d_model,
         decoder_num_layers=args.decoder_num_layers,
         decoder_dim_feedforward=args.decoder_dim_feedforward,
         use_absolute_pos=args.use_absolute_pos,
         use_type_feature=args.use_type_feature,
-        use_delta_features=args.use_delta_features,
-        use_knn_features=args.use_knn_features,
         shape_desc_dim=shape_desc_dim,
-        route_pool_mode=args.route_pool_mode,
-        pool_num_queries=args.pool_num_queries,
-        pool_nhead=args.pool_nhead,
         decoder_token_dropout=args.decoder_token_dropout,
     )
 
@@ -807,52 +599,6 @@ def main() -> None:
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    adversary: GradeAngleAdversaryHead | None = None
-    adversary_optimizer: AdamW | None = None
-    grade_chance: float | None = None
-    angle_chance: float | None = None
-    if args.grade_adversary_weight > 0.0:
-        adversary = GradeAngleAdversaryHead(
-            args.latent_dim,
-            hidden_dim=args.adversary_hidden_dim,
-            depth=args.adversary_depth,
-        ).to(device)
-        adversary_optimizer = AdamW(adversary.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        adv_params = sum(p.numel() for p in adversary.parameters())
-        print(
-            f"Grade+angle adversary enabled  weight={args.grade_adversary_weight}  "
-            f"alpha={args.grade_adversary_alpha}  angle_scale={args.angle_adversary_scale}"
-        )
-        print(
-            f"  Adversary: hidden_dim={args.adversary_hidden_dim}  depth={args.adversary_depth}  "
-            f"params={adv_params:,}  (separate grade/angle trunks)"
-        )
-        print(
-            f"  Effective weights — grade: {args.grade_adversary_weight:.1f}  "
-            f"angle: {args.grade_adversary_weight * args.angle_adversary_scale:.1f}"
-        )
-
-        # Empirical chance levels: Var(target_norm) over training set = MSE of the mean predictor.
-        # Val adversary losses should stay AT OR ABOVE these values for good disentanglement.
-        import numpy as np
-        grade_min_r, grade_max_r = norm_ranges["grade_min"], norm_ranges["grade_max"]
-        angle_min_r, angle_max_r = norm_ranges["angle_min"], norm_ranges["angle_max"]
-        grade_norms_all = [
-            ((float(s.grade) - grade_min_r) / max(grade_max_r - grade_min_r, 1e-6))
-            for s in train_samples if s.grade is not None
-        ]
-        angle_norms_all = [
-            ((float(s.angle) - angle_min_r) / max(angle_max_r - angle_min_r, 1e-6))
-            for s in train_samples
-        ]
-        grade_chance = float(np.var(np.clip(grade_norms_all, 0, 1)))
-        angle_chance = float(np.var(np.clip(angle_norms_all, 0, 1)))
-        print(
-            f"  Chance levels (Var of norm. targets in train set): "
-            f"grade={grade_chance:.4f}  angle={angle_chance:.4f}  combined={grade_chance + angle_chance:.4f}"
-        )
-        print(f"  → val grade_adv should be ≥ {grade_chance:.4f}, val angle_adv should be ≥ {angle_chance:.4f}")
-
     best_val = math.inf
     start_epoch = 1
     checkpoint_path = Path(args.checkpoint_path)
@@ -866,16 +612,6 @@ def main() -> None:
         model.load_state_dict(resume_ckpt["model_state_dict"])
         if "optimizer_state_dict" in resume_ckpt:
             optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
-        if adversary is not None and "adversary_state_dict" in resume_ckpt:
-            try:
-                adversary.load_state_dict(resume_ckpt["adversary_state_dict"])
-            except RuntimeError:
-                print("Warning: adversary checkpoint is incompatible with the current architecture — starting adversary fresh.")
-        if adversary_optimizer is not None and "adversary_optimizer_state_dict" in resume_ckpt:
-            try:
-                adversary_optimizer.load_state_dict(resume_ckpt["adversary_optimizer_state_dict"])
-            except RuntimeError:
-                print("Warning: adversary optimizer checkpoint incompatible — starting adversary optimizer fresh.")
         start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
         best_val = float(resume_ckpt.get("best_val", math.inf))
         print(f"Resumed from {resume_path} (next_epoch={start_epoch}, best_val={best_val:.4f})")
@@ -885,12 +621,8 @@ def main() -> None:
     val_total_history: list[float] = []       # recon + kl_w + floor_pen (adversary excluded — see _compute_batch_losses)
     train_recon_history: list[float] = []
     val_recon_history: list[float] = []
-    train_kl_history: list[float] = []        # kl_beta * kl_loss (full weighted KL, not excess-only)
+    train_kl_history: list[float] = []
     val_kl_history: list[float] = []
-    train_grade_adv_history: list[float] = []
-    val_grade_adv_history: list[float] = []
-    train_angle_adv_history: list[float] = []
-    val_angle_adv_history: list[float] = []
     early_stop_stable_epochs = 0
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -903,14 +635,9 @@ def main() -> None:
             batch_size=args.batch_size, kl_beta=kl_beta,
             numeric_weight=args.numeric_weight, grad_clip_norm=args.grad_clip_norm,
             sample_latent=True,
-            adversary=adversary, adversary_optimizer=adversary_optimizer,
-            grade_adversary_weight=args.grade_adversary_weight,
-            grade_adversary_alpha=args.grade_adversary_alpha,
-            angle_adversary_scale=args.angle_adversary_scale,
             free_bits=args.free_bits,
             pairwise_weight=args.pairwise_weight,
             hole_loss_weight=args.hole_loss_weight,
-            **norm_ranges,
         )
         with torch.no_grad():
             val_m = _run_epoch(
@@ -919,40 +646,25 @@ def main() -> None:
                 batch_size=args.val_batch_size, kl_beta=kl_beta,
                 numeric_weight=args.numeric_weight, grad_clip_norm=args.grad_clip_norm,
                 sample_latent=False,
-                adversary=adversary,
-                grade_adversary_weight=args.grade_adversary_weight,
-                grade_adversary_alpha=args.grade_adversary_alpha,
-                angle_adversary_scale=args.angle_adversary_scale,
                 free_bits=args.free_bits,
                 pairwise_weight=args.pairwise_weight,
                 hole_loss_weight=args.hole_loss_weight,
                 autoregressive=True,
-                **norm_ranges,
             )
 
         train_recon = train_m.categorical_loss + args.numeric_weight * train_m.numeric_loss
         val_recon = val_m.categorical_loss + args.numeric_weight * val_m.numeric_loss
         kl_floor = args.free_bits * args.latent_dim
 
-        # kl_w is the actual KL contribution to total — derived rather than stored separately.
-        # Identity (train): total = recon + kl_w + grade_adv_weight*(grade_adv + angle_scale*angle_adv)
-        # Identity (val):   total = recon + kl_w   (adversary excluded from val total)
+        # kl_w: KL contribution to total. Identity: total = recon + kl_w + pairwise_w
         # kl=X(+Y): X = raw unweighted KL, Y = excess above kl_floor (diagnostic).
-        train_weighted_adv = args.grade_adversary_weight * (
-            train_m.grade_adv_loss + args.angle_adversary_scale * train_m.angle_adv_loss
-        )
         train_pairwise_w = args.numeric_weight * args.pairwise_weight * train_m.pairwise_loss
         val_pairwise_w   = args.numeric_weight * args.pairwise_weight * val_m.pairwise_loss
-        train_kl_w = train_m.total_loss - train_recon - train_weighted_adv - train_pairwise_w
+        train_kl_w = train_m.total_loss - train_recon - train_pairwise_w
         val_kl_w   = val_m.total_loss - val_recon - val_pairwise_w
         train_kl_excess = max(train_m.kl_raw - kl_floor, 0.0)
         val_kl_excess = max(val_m.kl_raw - kl_floor, 0.0)
 
-        if args.grade_adversary_weight > 0.0:
-            adv_str = f" g_adv={train_m.grade_adv_loss:.4f} a_adv={train_m.angle_adv_loss:.4f}"
-            val_adv_str = f" g_adv={val_m.grade_adv_loss:.4f} a_adv={val_m.angle_adv_loss:.4f}"
-        else:
-            adv_str = val_adv_str = ""
         pw_str = (
             f" pw={train_m.pairwise_loss:.4f}/{val_m.pairwise_loss:.4f}"
             if args.pairwise_weight > 0.0 else ""
@@ -961,10 +673,10 @@ def main() -> None:
             f"Epoch {epoch:03d} | kl_beta={kl_beta:.6f} "
             f"train total={train_m.total_loss:.4f} recon={train_recon:.4f} kl_w={train_kl_w:.4f} "
             f"cat={train_m.categorical_loss:.4f} num={train_m.numeric_loss:.4f} "
-            f"kl={train_m.kl_raw:.4f}(+{train_kl_excess:.4f}){adv_str}{pw_str} | "
+            f"kl={train_m.kl_raw:.4f}(+{train_kl_excess:.4f}){pw_str} | "
             f"val total={val_m.total_loss:.4f} recon={val_recon:.4f} kl_w={val_kl_w:.4f} "
             f"cat={val_m.categorical_loss:.4f} num={val_m.numeric_loss:.4f} "
-            f"kl={val_m.kl_raw:.4f}(+{val_kl_excess:.4f}){val_adv_str}"
+            f"kl={val_m.kl_raw:.4f}(+{val_kl_excess:.4f})"
         )
 
         epoch_history.append(epoch)
@@ -974,10 +686,6 @@ def main() -> None:
         val_recon_history.append(val_recon)
         train_kl_history.append(train_kl_w)
         val_kl_history.append(val_kl_w)
-        train_grade_adv_history.append(train_m.grade_adv_loss)
-        val_grade_adv_history.append(val_m.grade_adv_loss)
-        train_angle_adv_history.append(train_m.angle_adv_loss)
-        val_angle_adv_history.append(val_m.angle_adv_loss)
 
         # val_m.total_loss = recon + kl_w + floor_pen (adversary excluded at compute time).
         # This is the right checkpoint criterion: lower = better reconstruction and more active dims.
@@ -995,10 +703,6 @@ def main() -> None:
                 # prefers these over runtime-supplied vocabs when present.
                 "vocabs": vocabs,
             }
-            if adversary is not None:
-                checkpoint["adversary_state_dict"] = adversary.state_dict()
-            if adversary_optimizer is not None:
-                checkpoint["adversary_optimizer_state_dict"] = adversary_optimizer.state_dict()
             torch.save(checkpoint, checkpoint_path)
             print(f"Saved checkpoint (val={best_val:.4f}): {checkpoint_path}")
             _save_loss_curve(
@@ -1009,12 +713,6 @@ def main() -> None:
                 val_recon=val_recon_history,
                 train_kl=train_kl_history,
                 val_kl=val_kl_history,
-                train_grade_adv=train_grade_adv_history or None,
-                val_grade_adv=val_grade_adv_history or None,
-                train_angle_adv=train_angle_adv_history or None,
-                val_angle_adv=val_angle_adv_history or None,
-                grade_chance=grade_chance,
-                angle_chance=angle_chance,
                 output_path=Path(args.loss_plot_path),
             )
 
@@ -1043,12 +741,6 @@ def main() -> None:
         val_recon=val_recon_history,
         train_kl=train_kl_history,
         val_kl=val_kl_history,
-        train_grade_adv=train_grade_adv_history or None,
-        val_grade_adv=val_grade_adv_history or None,
-        train_angle_adv=train_angle_adv_history or None,
-        val_angle_adv=val_angle_adv_history or None,
-        grade_chance=grade_chance,
-        angle_chance=angle_chance,
         output_path=Path(args.loss_plot_path),
     )
 
@@ -1062,31 +754,19 @@ def main() -> None:
             batch_size=args.val_batch_size, kl_beta=args.kl_beta,
             numeric_weight=args.numeric_weight, grad_clip_norm=args.grad_clip_norm,
             sample_latent=False,
-            adversary=adversary,
-            grade_adversary_weight=args.grade_adversary_weight,
-            grade_adversary_alpha=args.grade_adversary_alpha,
-            angle_adversary_scale=args.angle_adversary_scale,
             free_bits=args.free_bits,
             pairwise_weight=args.pairwise_weight,
             hole_loss_weight=args.hole_loss_weight,
             autoregressive=True,
-            **norm_ranges,
         )
     test_recon = test_m.categorical_loss + args.numeric_weight * test_m.numeric_loss
     test_pairwise_w = args.numeric_weight * args.pairwise_weight * test_m.pairwise_loss
-    # Test uses is_train=False → adversary excluded from total. Identity: total = recon + kl_w + pairwise_w.
     test_kl_w = test_m.total_loss - test_recon - test_pairwise_w
-    test_kl_floor = args.free_bits * args.latent_dim
-    test_kl_excess = max(test_m.kl_raw - test_kl_floor, 0.0)
-    test_adv_str = (
-        f" g_adv={test_m.grade_adv_loss:.4f} a_adv={test_m.angle_adv_loss:.4f}"
-        if args.grade_adversary_weight > 0.0
-        else ""
-    )
+    test_kl_excess = max(test_m.kl_raw - args.free_bits * args.latent_dim, 0.0)
     print(
         f"Test | total={test_m.total_loss:.4f} recon={test_recon:.4f} kl_w={test_kl_w:.4f} "
         f"cat={test_m.categorical_loss:.4f} num={test_m.numeric_loss:.4f} "
-        f"kl={test_m.kl_raw:.4f}(+{test_kl_excess:.4f}){test_adv_str}"
+        f"kl={test_m.kl_raw:.4f}(+{test_kl_excess:.4f})"
     )
 
 

@@ -47,7 +47,7 @@ class ScalarSinusoidalEmbedding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Adaptive LayerNorm (shared by encoder and decoder)
+# Adaptive LayerNorm (kept for potential future use)
 # ---------------------------------------------------------------------------
 
 class ConditionAdaLayerNorm(nn.Module):
@@ -103,14 +103,15 @@ class HoldTokenEmbedder(nn.Module):
     Both encoder and decoder use per-hold feature embeddings.
     Accepts any config object that provides the expected attribute names.
 
-    New features vs. original:
-    - type_embed_dim raised to 32 (most style-discriminating feature)
-    - delta_x_prev, delta_y_prev: move vector from the previous hold (y-sorted sequence)
-    - dist_to_nearest: distance to the nearest other hold (encoder-only; set
-      use_dist_to_nearest=False on the decoder config to skip this feature)
+    Feature set (current config):
+    - type_encoded_id (optional, use_type_feature)
+    - role_encoded_id, hole_encoded_id
+    - x, y sinusoidal (optional, use_absolute_pos)
+    - depth (optional, use_depth — encoder only)
+    - orientation_sin, orientation_cos, size
     """
 
-    def __init__(self, cfg: Any, *, use_delta: bool = True, use_depth: bool = True) -> None:
+    def __init__(self, cfg: Any, *, use_depth: bool = True) -> None:
         super().__init__()
         self.x_min: float = cfg.x_min
         self.x_max: float = cfg.x_max
@@ -153,27 +154,6 @@ class HoldTokenEmbedder(nn.Module):
         self.orientation_cos_projection = nn.Linear(1, cfg.orientation_cos_embed_dim)
         self.size_projection = nn.Linear(1, cfg.size_embed_dim)
 
-        # Move-delta projections (encoder only — derivable from predicted x/y in decoder)
-        delta_dim = getattr(cfg, "delta_embed_dim", 8)
-        if use_delta:
-            self.delta_x_projection: nn.Linear | None = nn.Linear(1, delta_dim)
-            self.delta_y_projection: nn.Linear | None = nn.Linear(1, delta_dim)
-            self._delta_dim = delta_dim
-        else:
-            self.delta_x_projection = None
-            self.delta_y_projection = None
-            self._delta_dim = 0
-
-        # k-NN neighbourhood features (encoder-only; requires full hold set)
-        use_knn = getattr(cfg, "use_knn_features", True)
-        knn_embed_dim = getattr(cfg, "knn_embed_dim", 16)
-        if use_knn:
-            self.knn_projection: nn.Linear | None = nn.Linear(9, knn_embed_dim)
-            self._knn_dim = knn_embed_dim
-        else:
-            self.knn_projection = None
-            self._knn_dim = 0
-
         token_input_dim = (
             self._type_dim      # 0 if use_type_feature=False
             + cfg.role_embed_dim
@@ -183,8 +163,6 @@ class HoldTokenEmbedder(nn.Module):
             + cfg.orientation_sin_embed_dim
             + cfg.orientation_cos_embed_dim
             + cfg.size_embed_dim
-            + self._delta_dim * 2   # 0 if use_delta=False
-            + self._knn_dim         # 0 if use_knn_features=False
         )
         self.token_projection = nn.Sequential(
             nn.Linear(token_input_dim, cfg.d_model),
@@ -208,33 +186,19 @@ class HoldTokenEmbedder(nn.Module):
 
         parts: list[torch.Tensor] = []
 
-        # Optional: hold type categorical embedding
         if self.type_embedding is not None:
             parts.append(self.type_embedding(batch["type_encoded_id"]))
 
         parts.extend([role_emb, hole_emb])
 
-        # Optional: absolute board coordinates (x/y sinusoidal)
         if self.x_embedding is not None:
             parts.append(self.x_embedding(normalize_minmax(batch["x"], self.x_min, self.x_max)))
             parts.append(self.y_embedding(normalize_minmax(batch["y"], self.y_min, self.y_max)))
 
-        # Optional: depth (encoder only — physical hold property, not reconstructed by decoder)
         if self.depth_projection is not None:
             parts.append(self.depth_projection(normalize_depth(batch["depth"]).unsqueeze(-1)))
 
         parts.extend([orientation_sin_emb, orientation_cos_emb, size_emb])
-
-        # Optional: move-delta features (encoder only)
-        if self.delta_x_projection is not None:
-            parts.append(self.delta_x_projection(batch["delta_x_prev"].to(torch.float32).unsqueeze(-1)))
-            parts.append(self.delta_y_projection(batch["delta_y_prev"].to(torch.float32).unsqueeze(-1)))
-
-        # Optional: k-NN neighbourhood features (encoder-only; [B, L, 9] → [B, L, knn_embed_dim])
-        if self.knn_projection is not None and "knn_features" in batch:
-            parts.append(
-                self.knn_projection(batch["knn_features"].to(torch.float32))
-            )
 
         token_concat = torch.cat(parts, dim=-1)
         return self.token_projection(token_concat)
@@ -281,44 +245,6 @@ def filter_samples_by_decoder_max_len(
 
 
 # ---------------------------------------------------------------------------
-# State dict helpers
-# ---------------------------------------------------------------------------
-
-def _adapt_pool_state_dict(state_dict: dict, d_model: int) -> dict:
-    """Adapt old single-query pool weights to the new multi-query format.
-
-    Old format (single-query attention pooling):
-        encoder.pool_query          [d_model]      → rename + unsqueeze
-        encoder.pool_attn.*                         → unchanged (shape is nhead-agnostic)
-        (no pool_proj)
-
-    New format (multi-query attention pooling):
-        encoder.pool_queries        [K, d_model]
-        encoder.pool_attn.*
-        encoder.pool_proj.weight    [d_model, K*d_model]
-        encoder.pool_proj.bias      [d_model]
-
-    When K=1 (old checkpoint): pool_proj becomes an identity Linear(d_model, d_model).
-    Pre-pooling checkpoints ("cls" mode) have neither key — no change needed.
-    """
-    import torch
-    if "encoder.pool_queries" in state_dict:
-        return state_dict  # already new multi-query format
-    if "encoder.pool_query" not in state_dict:
-        return state_dict  # pre-pooling "cls" checkpoint — no adaptation needed
-
-    # Old single-query: rename and reshape
-    old_q = state_dict.pop("encoder.pool_query")           # [d_model]
-    state_dict["encoder.pool_queries"] = old_q.unsqueeze(0)  # [1, d_model]
-
-    # Add identity pool_proj (Linear(d_model, d_model)) so K=1 is a no-op projection
-    state_dict["encoder.pool_proj.weight"] = torch.eye(d_model, dtype=old_q.dtype)
-    state_dict["encoder.pool_proj.bias"]   = torch.zeros(d_model, dtype=old_q.dtype)
-
-    return state_dict
-
-
-# ---------------------------------------------------------------------------
 # Model factory
 # ---------------------------------------------------------------------------
 
@@ -362,21 +288,10 @@ def build_model_from_checkpoint(
         num_layers=int(ckpt_args.get("encoder_num_layers", 6)),
         dim_feedforward=int(ckpt_args.get("encoder_dim_feedforward", 1024)),
     )
-    enc_cfg.use_cond_adaln = bool(ckpt_args.get("encoder_use_cond_adaln", True))
     enc_cfg.use_absolute_pos = bool(ckpt_args.get("use_absolute_pos", True))
     enc_cfg.use_type_feature = bool(ckpt_args.get("use_type_feature", True))
-    # Spatial feature flags — default True so old checkpoints (which always had these on) load correctly.
-    enc_cfg.use_knn_features = bool(ckpt_args.get("use_knn_features", True))
-    enc_cfg.use_delta_features = bool(ckpt_args.get("use_delta_features", True))
     enc_cfg.shape_desc_dim = int(ckpt_args.get("shape_desc_dim", 9))
-    # Default to "cls" for old checkpoints that pre-date attention pooling —
-    # those checkpoints have no pool_queries / pool_attn weights, so "attention"
-    # would cause a strict load_state_dict failure.
-    enc_cfg.route_pool_mode = str(ckpt_args.get("route_pool_mode", "cls"))
-    # Pool architecture — old single-query checkpoints default to K=1 / nhead=encoder_nhead
-    # so their pool_query [d_model] and pool_attn weights load cleanly after key adaptation.
-    enc_cfg.pool_num_queries = int(ckpt_args.get("pool_num_queries", 1))
-    enc_cfg.pool_nhead = int(ckpt_args.get("pool_nhead", int(ckpt_args.get("encoder_nhead", 8))))
+    enc_cfg.route_pool_mode = "mean_max"
 
     latent_dim = int(
         latent_dim_override if latent_dim_override is not None
@@ -387,26 +302,17 @@ def build_model_from_checkpoint(
         role_vocab_size=enc_cfg.role_vocab_size,
         hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
         latent_dim=latent_dim,
-        use_cond_adaln=bool(ckpt_args.get("decoder_use_cond_adaln", True)),
         d_model=int(ckpt_args.get("decoder_d_model", 128)),
         num_layers=int(ckpt_args.get("decoder_num_layers", 4)),
         dim_feedforward=int(ckpt_args.get("decoder_dim_feedforward", 512)),
-        # Match encoder embedding dims (stored in checkpoint args for backward compat)
         type_embed_dim=int(ckpt_args.get("type_embed_dim", 32)),
-        use_knn_features=False,    # decoder never uses full-sequence knn features
         use_absolute_pos=enc_cfg.use_absolute_pos,
         use_type_feature=enc_cfg.use_type_feature,
-        # token_dropout is a training-only flag; default 0.0 so old checkpoints
-        # (which have no mask_token weight) load cleanly without it.
         token_dropout=float(ckpt_args.get("decoder_token_dropout", 0.0)),
         x_min=enc_cfg.x_min,
         x_max=enc_cfg.x_max,
         y_min=enc_cfg.y_min,
         y_max=enc_cfg.y_max,
-        angle_min=enc_cfg.angle_min,
-        angle_max=enc_cfg.angle_max,
-        grade_min=enc_cfg.grade_min,
-        grade_max=enc_cfg.grade_max,
     )
     bottleneck_cfg = RouteVAEBottleneckConfig(
         encoder_embedding_dim=enc_cfg.d_model,
@@ -418,7 +324,7 @@ def build_model_from_checkpoint(
         bottleneck=RouteVAEBottleneck(bottleneck_cfg),
         decoder=RouteTransformerDecoder(dec_cfg),
     ).to(device)
-    state_dict = _adapt_pool_state_dict(dict(ckpt["model_state_dict"]), enc_cfg.d_model)
+    state_dict = dict(ckpt["model_state_dict"])
     # Back-compat: old checkpoints predate mask_token; initialise to zeros so
     # the architecture matches without requiring a strict-load failure.
     if "decoder.mask_token" not in state_dict:

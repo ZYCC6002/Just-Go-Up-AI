@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 
 from .model_utils import (
-    ConditionAdaLayerNorm,
     HoldTokenEmbedder,
     normalize_minmax,
 )
@@ -21,13 +20,11 @@ class RouteVAEDecoderConfig:
     role_vocab_size: int
     hole_id_vocab_size: int
 
-    # Latent / conditioning sizes
+    # Latent size
     latent_dim: int
-    condition_hidden_dim: int = 64
-    use_cond_adaln: bool = True
 
     # Per-feature embedding sizes (must match encoder)
-    type_embed_dim: int = 32          # increased from 16 to match encoder
+    type_embed_dim: int = 32
     role_embed_dim: int = 8
     hole_id_embed_dim: int = 16
     x_embed_dim: int = 16
@@ -36,10 +33,6 @@ class RouteVAEDecoderConfig:
     orientation_sin_embed_dim: int = 8
     orientation_cos_embed_dim: int = 8
     size_embed_dim: int = 8
-
-    # k-NN neighbourhood features: disabled for decoder (requires full sequence,
-    # unavailable during autoregressive generation; only the encoder gets this feature)
-    use_knn_features: bool = False
 
     # Ablation flags — must match encoder (and the preprocessed cache).
     use_absolute_pos: bool = True
@@ -52,14 +45,10 @@ class RouteVAEDecoderConfig:
     token_dropout: float = 0.0
 
     # Decoder transformer sizes
-    # d_model is deliberately kept at 128 (encoder uses 256).
-    # The decoder's job is conditional generation given z + angle/grade — it doesn't
-    # need the same representational richness as the style encoder. Keeping it lighter
-    # also speeds up the autoregressive training inner loop.
     d_model: int = 128
     nhead: int = 8
     num_layers: int = 4
-    dim_feedforward: int = 512   # 4× d_model (standard ratio); was 256 = 2×
+    dim_feedforward: int = 512
     dropout: float = 0.1
     layer_norm_eps: float = 1e-5
     max_seq_len: int = 128
@@ -69,17 +58,12 @@ class RouteVAEDecoderConfig:
     x_max: float = 164.0
     y_min: float = 4.0
     y_max: float = 176.0
-    angle_min: float = 0.0
-    angle_max: float = 70.0
-    grade_min: float = 10.0
-    grade_max: float = 33.0
 
 
 class RouteTransformerDecoder(nn.Module):
     """Autoregressive transformer decoder.
 
-    Cross-attention memory comes from latent z.
-    Angle/grade conditioning is injected via AdaLN modulation.
+    Cross-attention memory comes from latent z (the sole conditioning signal).
 
     Expected teacher-forcing input keys (shifted-right with BOS at position 0):
     - type_encoded_id, role_encoded_id, hole_encoded_id
@@ -97,50 +81,18 @@ class RouteTransformerDecoder(nn.Module):
         self.hole_eos_id = cfg.hole_id_vocab_size
 
         # Depth and delta features excluded: depth is a physical hold property not reconstructed
-        # by the decoder; delta is derivable from predicted x/y and teacher-forcing with
-        # ground-truth delta creates a train/inference mismatch.
-        self.hold_embedder = HoldTokenEmbedder(cfg, use_delta=False, use_depth=False)
+        # by the decoder; delta is derivable from predicted x/y.
+        self.hold_embedder = HoldTokenEmbedder(cfg, use_depth=False)
 
         # Learned sequence position embedding
         self.sequence_position_embedding = nn.Embedding(cfg.max_seq_len, cfg.d_model)
         # Learned BOS anchor token
         self.bos_embedding = nn.Parameter(torch.randn(cfg.d_model) * 0.02)
         # Learned mask token: substituted for dropped hold tokens during training.
-        # Initialised to zero so early training sees a neutral (near-mean) signal.
         self.mask_token = nn.Parameter(torch.zeros(cfg.d_model))
 
         # Project z into a single d_model-dim memory token for cross-attention.
-        # The cross-attention's internal K/V projections do the rest of the work;
-        # no MLP expansion or multi-token positional tricks needed.
         self.z_proj = nn.Linear(cfg.latent_dim, cfg.d_model)
-
-        # Angle/grade condition pathway for AdaLN
-        self.angle_mlp = nn.Sequential(
-            nn.Linear(1, cfg.condition_hidden_dim),
-            nn.GELU(),
-            nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
-        )
-        self.grade_mlp = nn.Sequential(
-            nn.Linear(1, cfg.condition_hidden_dim),
-            nn.GELU(),
-            nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
-        )
-        self.condition_fusion = nn.Sequential(
-            nn.Linear(cfg.d_model * 2, cfg.condition_hidden_dim),
-            nn.GELU(),
-            nn.Linear(cfg.condition_hidden_dim, cfg.d_model),
-        )
-
-        if cfg.use_cond_adaln:
-            # Only post-decoder AdaLN is kept. A pre-decoder AdaLN was previously
-            # used here but was removed: injecting a strong angle/grade signal
-            # BEFORE the transformer allowed the decoder to satisfy reconstruction
-            # without ever attending to z, causing posterior collapse. A single
-            # post-decoder modulation retains grade/angle conditioning while
-            # significantly weakening this shortcut.
-            self.post_decoder_adaln = ConditionAdaLayerNorm(cfg.d_model, cfg.d_model, cfg.layer_norm_eps)
-        else:
-            self.post_decoder_adaln = None
 
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=cfg.d_model,
@@ -173,21 +125,6 @@ class RouteTransformerDecoder(nn.Module):
         """Project z to a single d_model memory token for cross-attention. Returns [B, 1, d_model]."""
         return self.z_proj(z.to(torch.float32)).unsqueeze(1)
 
-    def _build_condition_embedding(
-        self,
-        *,
-        angle: torch.Tensor,
-        grade: torch.Tensor,
-    ) -> torch.Tensor:
-        """Build route-level condition embedding for AdaLN from angle/grade."""
-        angle_emb = self.angle_mlp(
-            normalize_minmax(angle, self.cfg.angle_min, self.cfg.angle_max).unsqueeze(-1)
-        )
-        grade_emb = self.grade_mlp(
-            normalize_minmax(grade, self.cfg.grade_min, self.cfg.grade_max).unsqueeze(-1)
-        )
-        return self.condition_fusion(torch.cat([angle_emb, grade_emb], dim=-1))
-
     def _build_decoder_tokens(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Embed hold tokens, add position embeddings, and inject BOS at position 0."""
         tokens = self.hold_embedder.embed(batch)
@@ -204,20 +141,14 @@ class RouteTransformerDecoder(nn.Module):
         bos = bos.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1)
         tokens = torch.cat([bos, tokens[:, 1:, :]], dim=1)
 
-        # Token masking: replaces hold tokens (positions 1+) with the learned mask
-        # embedding.  BOS is never masked.
-        #
-        # Two modes:
-        #   mask_all=True  — all hold tokens replaced (eval-time, batched non-teacher-forced pass)
-        #   training + token_dropout > 0 — random stochastic dropout (training regularisation)
+        # Token dropout: replace hold tokens (positions 1+) with learned mask embedding.
+        # BOS is never masked.
         hold_tokens = tokens[:, 1:, :]
-        mask_emb = self.mask_token.view(1, 1, -1).expand_as(hold_tokens)
-        if self._mask_all:
-            hold_tokens = mask_emb
-        elif self.training and self.cfg.token_dropout > 0.0:
+        if self.training and self.cfg.token_dropout > 0.0:
+            mask_emb = self.mask_token.view(1, 1, -1).expand_as(hold_tokens)
             drop = torch.rand(batch_size, hold_tokens.shape[1], device=tokens.device) < self.cfg.token_dropout
             hold_tokens = torch.where(drop.unsqueeze(-1), mask_emb, hold_tokens)
-        tokens = torch.cat([tokens[:, :1, :], hold_tokens], dim=1)
+            tokens = torch.cat([tokens[:, :1, :], hold_tokens], dim=1)
 
         return tokens
 
@@ -226,28 +157,17 @@ class RouteTransformerDecoder(nn.Module):
         batch: dict[str, torch.Tensor],
         *,
         z: torch.Tensor,
-        angle: torch.Tensor,
-        grade: torch.Tensor,
-        mask_inputs: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Teacher-forcing forward pass.
 
         Args:
-            batch:       tokenized decoder inputs (shifted-right targets with BOS at position 0)
-            z:           latent vector [B, latent_dim]
-            angle:       route angle condition [B]
-            grade:       route grade condition [B]
-            mask_inputs: if True, replace ALL hold tokens with the learned mask embedding
-                         before the transformer stack.  Used for batched non-teacher-forced
-                         validation: the decoder sees only BOS + z (via cross-attention) +
-                         position embeddings, with no ground-truth token context.
+            batch: tokenized decoder inputs (shifted-right targets with BOS at position 0)
+            z:     latent vector [B, latent_dim] — sole conditioning signal
         """
-        self._mask_all = mask_inputs
         padding_mask = batch["padding_mask"].bool()
         tgt = self._build_decoder_tokens(batch)
 
         memory = self._build_condition_memory(z=z)
-        cond_emb = self._build_condition_embedding(angle=angle, grade=grade)
 
         tgt_mask = self._causal_mask(tgt.shape[1], tgt.device)
         decoded = self.decoder(
@@ -256,9 +176,6 @@ class RouteTransformerDecoder(nn.Module):
             tgt_mask=tgt_mask,
             tgt_key_padding_mask=padding_mask,
         )
-
-        if self.post_decoder_adaln is not None:
-            decoded = self.post_decoder_adaln(decoded, cond_emb)
         decoded = self.final_norm(decoded)
 
         return {
