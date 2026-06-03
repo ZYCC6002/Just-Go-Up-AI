@@ -53,6 +53,73 @@ def _compute_kl_beta(*, epoch: int, target_kl_beta: float, kl_warmup_epochs: int
     return float(target_kl_beta) * ratio
 
 
+def _compute_ss_ratio(*, epoch: int, target_ss_ratio: float, ss_warmup_epochs: int) -> float:
+    """Linear warmup for scheduled sampling ratio: 0 → target over ss_warmup_epochs."""
+    if target_ss_ratio <= 0.0:
+        return 0.0
+    if ss_warmup_epochs <= 0:
+        return float(target_ss_ratio)
+    ratio = min(max(epoch, 0), ss_warmup_epochs) / float(ss_warmup_epochs)
+    return float(target_ss_ratio) * ratio
+
+
+def _mix_predictions_into_batch(
+    gt_batch: dict[str, torch.Tensor],
+    model_out: dict[str, torch.Tensor],
+    ss_ratio: float,
+    dec_cfg: RouteVAEDecoderConfig,
+) -> dict[str, torch.Tensor]:
+    """Replace decoder input positions 1..L-1 with own predictions from position i-1.
+
+    For each position i ∈ [1, L-1], flips a coin: with probability ss_ratio use the
+    model's prediction from output position i-1 (denormalised to raw batch values);
+    otherwise keep the ground-truth input.
+
+    Categorical argmax excludes the EOS slot so EOS never feeds back mid-sequence.
+    Continuous values are denormalised identically to _autoregressive_forward.
+    """
+    B, L = gt_batch["type_encoded_id"].shape
+    device = gt_batch["type_encoded_id"].device
+    if L <= 1:
+        return gt_batch
+
+    # Output positions 0..L-2 become candidate inputs at positions 1..L-1.
+    # Exclude EOS from argmax (last logit index) to prevent EOS propagating mid-sequence.
+    pred_type = model_out["type_logits"][:, :L-1, :-1].argmax(-1)   # [B, L-1]
+    pred_role = model_out["role_logits"][:, :L-1, :-1].argmax(-1)
+    pred_hole = model_out["hole_logits"][:, :L-1, :-1].argmax(-1)
+
+    pred_x       = model_out["x_pred"][:, :L-1] * (dec_cfg.x_max - dec_cfg.x_min) + dec_cfg.x_min
+    pred_y       = model_out["y_pred"][:, :L-1] * (dec_cfg.y_max - dec_cfg.y_min) + dec_cfg.y_min
+    pred_ori_sin = model_out["orientation_sin_pred"][:, :L-1] * 2.0 - 1.0
+    pred_ori_cos = model_out["orientation_cos_pred"][:, :L-1] * 2.0 - 1.0
+    pred_size    = model_out["size_pred"][:, :L-1] * 3.0 + 2.0
+
+    use_pred = torch.rand(B, L - 1, device=device) < ss_ratio  # [B, L-1]
+
+    def _mix_cat(gt: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
+        out = gt.clone()
+        out[:, 1:] = torch.where(use_pred, pred, gt[:, 1:])
+        return out
+
+    def _mix_float(gt: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
+        out = gt.clone()
+        out[:, 1:] = torch.where(use_pred, pred.to(gt.dtype), gt[:, 1:])
+        return out
+
+    return {
+        **gt_batch,
+        "type_encoded_id":  _mix_cat(gt_batch["type_encoded_id"],   pred_type),
+        "role_encoded_id":  _mix_cat(gt_batch["role_encoded_id"],   pred_role),
+        "hole_encoded_id":  _mix_cat(gt_batch["hole_encoded_id"],   pred_hole),
+        "x":               _mix_float(gt_batch["x"],                pred_x),
+        "y":               _mix_float(gt_batch["y"],                pred_y),
+        "orientation_sin": _mix_float(gt_batch["orientation_sin"],  pred_ori_sin),
+        "orientation_cos": _mix_float(gt_batch["orientation_cos"],  pred_ori_cos),
+        "size":            _mix_float(gt_batch["size"],             pred_size),
+    }
+
+
 def _save_loss_curve(
     *,
     epochs: list[int],
@@ -308,12 +375,33 @@ def _compute_batch_losses(
     pairwise_weight: float = 0.0,
     hole_loss_weight: float = 1.0,
     autoregressive: bool = False,
+    ss_ratio: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     prepared = prepare_cvae_training_batch(
         batch_samples, eos_ids=eos_ids, device=device, ignore_index=ignore_index
     )
     if autoregressive:
         out = _autoregressive_forward(model, prepared, device=device)
+    elif ss_ratio > 0.0 and model.training:
+        # Two-pass scheduled sampling: first pass (eval, no_grad) gets clean predictions;
+        # second pass (train) trains on the mixed ground-truth/own-prediction inputs.
+        dec_cfg = model.decoder.cfg
+        model.eval()
+        with torch.no_grad():
+            first_out = model(
+                encoder_batch=prepared["encoder_batch"],
+                decoder_batch=prepared["decoder_input_batch"],
+                sample_latent=sample_latent,
+            )
+        model.train()
+        mixed_batch = _mix_predictions_into_batch(
+            prepared["decoder_input_batch"], first_out, ss_ratio, dec_cfg
+        )
+        out = model(
+            encoder_batch=prepared["encoder_batch"],
+            decoder_batch=mixed_batch,
+            sample_latent=sample_latent,
+        )
     else:
         out = model(
             encoder_batch=prepared["encoder_batch"],
@@ -407,6 +495,7 @@ def _run_epoch(
     pairwise_weight: float = 0.0,
     hole_loss_weight: float = 1.0,
     autoregressive: bool = False,
+    ss_ratio: float = 0.0,
 ) -> EpochMetrics:
     is_train = optimizer is not None
     model.train(is_train)
@@ -428,6 +517,7 @@ def _run_epoch(
                 pairwise_weight=pairwise_weight,
                 hole_loss_weight=hole_loss_weight,
                 autoregressive=autoregressive,
+                ss_ratio=ss_ratio,
             )
             if is_train:
                 loss.backward()
@@ -505,6 +595,18 @@ def main() -> None:
                              "to rely on z rather than exploiting categorical/spatial patterns "
                              "in the teacher-forced context. Disabled at inference. "
                              "Suggested range: 0.15–0.25.")
+    parser.add_argument("--scheduled-sampling-ratio", type=float, default=0.0,
+                        help="Target probability of replacing each decoder input token with the "
+                             "model's own prediction from the previous position (scheduled sampling). "
+                             "Unlike --decoder-token-dropout, the replacement is the model's actual "
+                             "predicted token rather than a mask embedding, directly training the "
+                             "model to recover from its own errors. Requires two forward passes per "
+                             "training batch (first pass clean teacher-forced, second pass mixed). "
+                             "Ramped from 0 to this target over --ss-warmup-epochs. "
+                             "Can be combined with --decoder-token-dropout. Suggested: 0.25–0.5.")
+    parser.add_argument("--ss-warmup-epochs", type=int, default=None,
+                        help="Epochs to linearly ramp scheduled-sampling-ratio from 0 to its target. "
+                             "Defaults to --kl-warmup-epochs if not set.")
     parser.add_argument("--kl-warmup-epochs", type=int, default=None,
                         help="Linear KL warmup epochs. Defaults to 40%% of total epochs.")
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
@@ -540,6 +642,10 @@ def main() -> None:
         args.kl_warmup_epochs = max(1, int(math.ceil(0.40 * args.epochs)))
     if args.kl_warmup_epochs < 0:
         raise ValueError("--kl-warmup-epochs must be >= 0")
+    if args.ss_warmup_epochs is None:
+        args.ss_warmup_epochs = args.kl_warmup_epochs
+    if args.ss_warmup_epochs < 0:
+        raise ValueError("--ss-warmup-epochs must be >= 0")
     if args.early_stop_delta is not None and args.early_stop_delta < 0:
         raise ValueError("--early-stop-delta must be >= 0")
     if args.early_stop_patience < 1:
@@ -629,6 +735,11 @@ def main() -> None:
         kl_beta = _compute_kl_beta(
             epoch=epoch, target_kl_beta=args.kl_beta, kl_warmup_epochs=args.kl_warmup_epochs
         )
+        ss_ratio = _compute_ss_ratio(
+            epoch=epoch,
+            target_ss_ratio=args.scheduled_sampling_ratio,
+            ss_warmup_epochs=args.ss_warmup_epochs,
+        )
         train_m = _run_epoch(
             model, train_samples,
             optimizer=optimizer, device=device, eos_ids=eos_ids,
@@ -638,6 +749,7 @@ def main() -> None:
             free_bits=args.free_bits,
             pairwise_weight=args.pairwise_weight,
             hole_loss_weight=args.hole_loss_weight,
+            ss_ratio=ss_ratio,
         )
         with torch.no_grad():
             val_m = _run_epoch(
@@ -669,8 +781,9 @@ def main() -> None:
             f" pw={train_m.pairwise_loss:.4f}/{val_m.pairwise_loss:.4f}"
             if args.pairwise_weight > 0.0 else ""
         )
+        ss_str = f" ss={ss_ratio:.3f}" if args.scheduled_sampling_ratio > 0.0 else ""
         print(
-            f"Epoch {epoch:03d} | kl_beta={kl_beta:.6f} "
+            f"Epoch {epoch:03d} | kl_beta={kl_beta:.6f}{ss_str} "
             f"train total={train_m.total_loss:.4f} recon={train_recon:.4f} kl_w={train_kl_w:.4f} "
             f"cat={train_m.categorical_loss:.4f} num={train_m.numeric_loss:.4f} "
             f"kl={train_m.kl_raw:.4f}(+{train_kl_excess:.4f}){pw_str} | "
