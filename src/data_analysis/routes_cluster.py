@@ -224,11 +224,7 @@ def _extract_latent_matrix(
     with torch.no_grad():
         for batch_samples in iter_minibatches(samples, batch_size):
             prepared = prepare_cvae_training_batch(batch_samples, eos_ids=eos_ids, device=device)
-            enc_out = model.encoder(
-                prepared["encoder_batch"],
-                angle=prepared["angle"],
-                grade=prepared["grade"],
-            )
+            enc_out = model.encoder(prepared["encoder_batch"])
             bottleneck_out = model.bottleneck(enc_out["route_embedding"], sample_latent=False)
             latents.append(bottleneck_out["z"].detach().cpu().numpy())
 

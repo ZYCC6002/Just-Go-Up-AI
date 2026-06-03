@@ -23,8 +23,8 @@ class RouteVAEParallelDecoderConfig:
     latent_dim: int
 
     # MLP architecture
-    d_model: int = 128
-    mlp_depth: int = 2          # hidden layers: each is Linear → GELU → LayerNorm → Dropout
+    d_model: int = 64
+    mlp_depth: int = 1          # hidden layers: each is Linear → GELU → LayerNorm → Dropout
     dropout: float = 0.1
     layer_norm_eps: float = 1e-5
     max_seq_len: int = 128
