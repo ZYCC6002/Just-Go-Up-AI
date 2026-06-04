@@ -157,6 +157,25 @@ def _save_loss_curve(
     print(f"Saved loss curve: {output_path}")
 
 
+def _set_decoder_self_attn_frozen(model: RouteConditionalVAE, frozen: bool) -> int:
+    """Freeze or unfreeze self-attention in every TransformerDecoderLayer.
+
+    Returns the number of affected parameters (0 for parallel decoder or any
+    decoder without a TransformerDecoder backbone).
+    """
+    transformer = getattr(model.decoder, "decoder", None)
+    if transformer is None or not hasattr(transformer, "layers"):
+        return 0
+    count = 0
+    for layer in transformer.layers:
+        sa = getattr(layer, "self_attn", None)
+        if sa is not None:
+            for p in sa.parameters():
+                p.requires_grad_(not frozen)
+                count += p.numel()
+    return count
+
+
 def _build_model(
     vocabs: Any,
     device: torch.device,
@@ -691,6 +710,13 @@ def main() -> None:
                              "to rely on z rather than exploiting categorical/spatial patterns "
                              "in the teacher-forced context. Disabled at inference. "
                              "Suggested range: 0.15–0.25.")
+    parser.add_argument("--freeze-self-attn-epochs", type=int, default=0,
+                        help="Freeze decoder self-attention for this many epochs at the start of "
+                             "training. While frozen, cross-token communication is disabled so the "
+                             "decoder must rely on z (cross-attention) rather than visible-hold "
+                             "context, forcing the encoder to encode richer structure into z early. "
+                             "Self-attention is unfrozen for the remaining epochs. Only meaningful "
+                             "for the masked transformer decoder. Default: 0 (disabled).")
     parser.add_argument("--decoder-mask-rate", type=float, default=0.0,
                         help="Enable masked bidirectional decoder mode. When > 0, replaces this "
                              "fraction of non-padded input holds with a mask token and removes the "
@@ -827,6 +853,24 @@ def main() -> None:
         best_val = float(resume_ckpt.get("best_val", math.inf))
         print(f"Resumed from {resume_path} (next_epoch={start_epoch}, best_val={best_val:.4f})")
 
+    # Self-attention freeze: disabled by default (freeze_self_attn_epochs=0).
+    # When enabled, self-attention weights start frozen so the decoder cannot
+    # aggregate visible-hold context, forcing early z utilisation.  After the
+    # freeze period the weights unfreeze and the decoder learns to complement z.
+    # The optimizer already holds all parameters; frozen ones are simply skipped
+    # (grad=None) until unfrozen, after which Adam accumulates moments normally.
+    # NOTE: must come after resume so start_epoch reflects any loaded checkpoint.
+    freeze_sa_epochs = args.freeze_self_attn_epochs
+    if freeze_sa_epochs > 0:
+        if start_epoch <= freeze_sa_epochs:
+            n = _set_decoder_self_attn_frozen(model, frozen=True)
+            if n > 0:
+                print(f"Self-attention frozen ({n:,} params) for epochs 1–{freeze_sa_epochs}.")
+            else:
+                print("Warning: --freeze-self-attn-epochs set but decoder has no self-attention to freeze.")
+        else:
+            print(f"Resuming past freeze period (epoch {start_epoch} > {freeze_sa_epochs}); self-attention already unfrozen.")
+
     epoch_history: list[int] = []
     train_total_history: list[float] = []
     val_total_history: list[float] = []       # recon + kl_w + floor_pen (adversary excluded — see _compute_batch_losses)
@@ -837,6 +881,11 @@ def main() -> None:
     early_stop_stable_epochs = 0
 
     for epoch in range(start_epoch, args.epochs + 1):
+        if freeze_sa_epochs > 0 and epoch == freeze_sa_epochs + 1:
+            n = _set_decoder_self_attn_frozen(model, frozen=False)
+            if n > 0:
+                print(f"Epoch {epoch:03d}: self-attention unfrozen ({n:,} params).")
+
         kl_beta = _compute_kl_beta(
             epoch=epoch, target_kl_beta=args.kl_beta, kl_warmup_epochs=args.kl_warmup_epochs
         )
