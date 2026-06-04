@@ -47,34 +47,6 @@ class ScalarSinusoidalEmbedding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Adaptive LayerNorm (kept for potential future use)
-# ---------------------------------------------------------------------------
-
-class ConditionAdaLayerNorm(nn.Module):
-    """Adaptive LayerNorm modulated by a route-level condition embedding."""
-
-    def __init__(self, d_model: int, cond_dim: int, eps: float = 1e-5) -> None:
-        super().__init__()
-        self.norm = nn.LayerNorm(d_model, eps=eps, elementwise_affine=False)
-        self.modulation = nn.Sequential(
-            nn.Linear(cond_dim, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model * 2),
-        )
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x:    hidden states [B, L, d_model]
-            cond: condition embedding [B, cond_dim]
-        """
-        gamma_beta = self.modulation(cond)
-        gamma, beta = gamma_beta.chunk(2, dim=-1)
-        x_norm = self.norm(x)
-        return x_norm * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
-
-
-# ---------------------------------------------------------------------------
 # Normalization helpers (module-level, used by both encoder and decoder)
 # ---------------------------------------------------------------------------
 
@@ -292,7 +264,6 @@ def build_model_from_checkpoint(
     enc_cfg.use_absolute_pos = bool(ckpt_args.get("use_absolute_pos", True))
     enc_cfg.use_type_feature = bool(ckpt_args.get("use_type_feature", True))
     enc_cfg.shape_desc_dim = int(ckpt_args.get("shape_desc_dim", 9))
-    enc_cfg.route_pool_mode = "mean_max"
 
     latent_dim = int(
         latent_dim_override if latent_dim_override is not None
@@ -359,7 +330,6 @@ def build_model_from_checkpoint(
 
 __all__ = [
     "ScalarSinusoidalEmbedding",
-    "ConditionAdaLayerNorm",
     "HoldTokenEmbedder",
     "normalize_minmax",
     "normalize_depth",

@@ -20,7 +20,10 @@ class RouteVAEBottleneckConfig:
 
     encoder_embedding_dim: int = 128
     latent_dim: int = 32
-    hidden_dim: int = 128
+    # hidden_dim defaults to None → matches encoder_embedding_dim at init time.
+    # Always pass encoder_embedding_dim explicitly; relying on the 128 default
+    # silently creates a shape-mismatched Linear when d_model != 128.
+    hidden_dim: int | None = None
     dropout: float = 0.1
 
 
@@ -31,14 +34,15 @@ class RouteVAEBottleneck(nn.Module):
         super().__init__()
         self.cfg = cfg
 
+        hidden_dim = cfg.hidden_dim if cfg.hidden_dim is not None else cfg.encoder_embedding_dim
         self.pre = nn.Sequential(
-            nn.Linear(cfg.encoder_embedding_dim, cfg.hidden_dim),
+            nn.Linear(cfg.encoder_embedding_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
-            nn.LayerNorm(cfg.hidden_dim),
+            nn.LayerNorm(hidden_dim),
         )
-        self.to_mu = nn.Linear(cfg.hidden_dim, cfg.latent_dim)
-        self.to_logvar = nn.Linear(cfg.hidden_dim, cfg.latent_dim)
+        self.to_mu = nn.Linear(hidden_dim, cfg.latent_dim)
+        self.to_logvar = nn.Linear(hidden_dim, cfg.latent_dim)
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:

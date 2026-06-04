@@ -78,6 +78,8 @@ class RouteTransformerDecoder(nn.Module):
     - padding_mask (bool, True for padded tokens)
     """
 
+    is_autoregressive: bool = True  # distinguishes from RouteParallelDecoder (is_autoregressive=False)
+
     def __init__(self, cfg: RouteVAEDecoderConfig) -> None:
         super().__init__()
         self.cfg = cfg

@@ -82,8 +82,8 @@ class RouteSample:
     metadata_coverage: float
     tokens: dict[str, torch.Tensor]
     # All (angle → difficulty_average) pairs from climb_stats that passed quality/
-    # ascensionist filters for this route.  Used by the per-angle grade adversary to
-    # supply supervision signals at every angle where community grade data exists.
+    # ascensionist filters for this route.  Used by routes_cluster.py to filter
+    # samples by grade at specific angles (--min-grade / --max-grade flags).
     angle_grades: dict[float, float] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -171,6 +171,8 @@ def _encode_route_tokens(
     board_diag = math.sqrt(board_x_span ** 2 + board_y_span ** 2)
 
     # --- Delta features (move between consecutive HAND holds in y-sorted sequence) ---
+    # NOTE: analysis-only — not consumed by model training (excluded from FEATURE_KEYS
+    # in training_utils.py).  Used by style_analysis.py to derive move_size/step_height.
     # Foot holds receive delta = 0 — they are not part of the hand-sequence moves.
     # Normalised by board span so values are in roughly [-1, 1] regardless of board size.
     delta_x_prev = [0.0] * len(route_tokens)
@@ -186,7 +188,9 @@ def _encode_route_tokens(
             last_hand_y = tok.y
         # foot holds: delta stays 0.0
 
-    # --- k-NN neighbourhood features (encoder-only; requires full sequence) ---
+    # --- k-NN neighbourhood features ---
+    # NOTE: analysis-only — not consumed by model training (excluded from FEATURE_KEYS
+    # in training_utils.py).  Used by style_analysis.py for hold-crowding metrics.
     # For each hold: distances + bearing angles to k=3 nearest other holds.
     # Distances normalised by board diagonal; bearings encoded as (sin, cos).
     # Shape: [N, K*3] = [N, 9]

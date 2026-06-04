@@ -1,5 +1,4 @@
 from .model_utils import (
-    ConditionAdaLayerNorm,
     HoldTokenEmbedder,
     ScalarSinusoidalEmbedding,
     build_model_from_checkpoint,
@@ -28,7 +27,6 @@ from .training_utils import (
 
 __all__ = [
     # model_utils
-    "ConditionAdaLayerNorm",
     "HoldTokenEmbedder",
     "ScalarSinusoidalEmbedding",
     "build_model_from_checkpoint",

@@ -154,8 +154,6 @@ def prepare_cvae_training_batch(
 		ignore_index=ignore_index,
 	)
 
-	angle, grade = build_condition_tensors(samples, device=device)
-
 	batch_size, seq_len = target_batch["padding_mask"].shape
 
 	def _shift_numeric_target(key: str, vmin: float = 0.0, vmax: float = 1.0) -> torch.Tensor:
@@ -185,8 +183,6 @@ def prepare_cvae_training_batch(
 		"decoder_input_batch": decoder_input_batch,
 		"categorical_targets": categorical_targets,
 		"numeric_targets": numeric_targets,
-		"angle": angle,
-		"grade": grade,
 		"valid_numeric_mask": valid_numeric_mask,
 	}
 

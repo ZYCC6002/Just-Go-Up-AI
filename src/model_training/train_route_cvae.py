@@ -209,7 +209,6 @@ def _build_model(
     enc_cfg.use_absolute_pos = use_absolute_pos
     enc_cfg.use_type_feature = use_type_feature
     enc_cfg.shape_desc_dim = shape_desc_dim
-    enc_cfg.route_pool_mode = "mean_max"
 
     bottleneck_cfg = RouteVAEBottleneckConfig(
         encoder_embedding_dim=enc_cfg.d_model,
@@ -443,7 +442,7 @@ def _compute_batch_losses(
             first_out = model(
                 encoder_batch=prepared["encoder_batch"],
                 decoder_batch=prepared["decoder_input_batch"],
-                sample_latent=sample_latent,
+                sample_latent=False,  # use posterior mean so predictions and gradient pass share the same z
             )
         model.train()
         mixed_batch = _mix_predictions_into_batch(
@@ -870,7 +869,10 @@ def main() -> None:
             else:
                 print("Warning: --freeze-self-attn-epochs set but decoder has no self-attention to freeze.")
         else:
-            print(f"Resuming past freeze period (epoch {start_epoch} > {freeze_sa_epochs}); self-attention already unfrozen.")
+            # Explicitly unfreeze in case the checkpoint was saved while SA was still frozen
+            # (e.g. freeze_sa_epochs was lowered between runs).
+            n = _set_decoder_self_attn_frozen(model, frozen=False)
+            print(f"Resuming past freeze period (epoch {start_epoch} > {freeze_sa_epochs}); self-attention unfrozen ({n:,} params).")
 
     epoch_history: list[int] = []
     train_total_history: list[float] = []
@@ -916,7 +918,7 @@ def main() -> None:
                 free_bits=args.free_bits,
                 pairwise_weight=args.pairwise_weight,
                 hole_loss_weight=args.hole_loss_weight,
-                autoregressive=True,
+                autoregressive=False,  # teacher-forced: stable criterion for checkpoint selection
             )
 
         train_recon = train_m.categorical_loss + args.numeric_weight * train_m.numeric_loss
@@ -1015,6 +1017,11 @@ def main() -> None:
     best_ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(best_ckpt["model_state_dict"])
 
+    # Teacher-forced test: feeds ground-truth previous tokens to the AR decoder.
+    # NOT directly comparable to the parallel decoder's 3.8045 (the parallel decoder is a
+    # plain MLP(z) with no token context — it cannot exploit previous-token ground truth at all).
+    # Teacher-forced AR will trivially beat 3.8045 because it has strictly more information.
+    # Use this for debugging and sanity-checking the forward pass, not for baseline comparison.
     with torch.no_grad():
         test_m = _run_epoch(
             model, test_samples,
@@ -1025,17 +1032,45 @@ def main() -> None:
             free_bits=args.free_bits,
             pairwise_weight=args.pairwise_weight,
             hole_loss_weight=args.hole_loss_weight,
-            autoregressive=True,
+            autoregressive=False,  # teacher-forced
         )
     test_recon = test_m.categorical_loss + args.numeric_weight * test_m.numeric_loss
     test_pairwise_w = args.numeric_weight * args.pairwise_weight * test_m.pairwise_loss
     test_kl_w = test_m.total_loss - test_recon - test_pairwise_w
     test_kl_excess = max(test_m.kl_raw - args.free_bits * args.latent_dim, 0.0)
     print(
-        f"Test | total={test_m.total_loss:.4f} recon={test_recon:.4f} kl_w={test_kl_w:.4f} "
+        f"Test (teacher-forced) | total={test_m.total_loss:.4f} recon={test_recon:.4f} kl_w={test_kl_w:.4f} "
         f"cat={test_m.categorical_loss:.4f} num={test_m.numeric_loss:.4f} "
         f"kl={test_m.kl_raw:.4f}(+{test_kl_excess:.4f})"
     )
+
+    # AR generation test: the decoder generates each token from its own previous predictions.
+    # This is the fair comparison to the parallel decoder's 3.8045 — both start from z alone
+    # with no ground-truth token context.  If the AR decoder has learned to generate coherently,
+    # its AR generation recon should be below 3.8045 (z + causal self-context > z alone).
+    # Skipped for the parallel decoder (is_parallel=True) and masked decoder.
+    _is_parallel_dec = not getattr(model.decoder, "is_autoregressive", True)
+    _is_masked_dec   = (not _is_parallel_dec) and getattr(model.decoder.cfg, "mask_rate", 0.0) > 0.0
+    if not _is_parallel_dec and not _is_masked_dec:
+        with torch.no_grad():
+            ar_test_m = _run_epoch(
+                model, test_samples,
+                optimizer=None, device=device, eos_ids=eos_ids,
+                batch_size=args.val_batch_size, kl_beta=args.kl_beta,
+                numeric_weight=args.numeric_weight, grad_clip_norm=args.grad_clip_norm,
+                sample_latent=False,
+                free_bits=args.free_bits,
+                pairwise_weight=args.pairwise_weight,
+                hole_loss_weight=args.hole_loss_weight,
+                autoregressive=True,  # true AR generation
+            )
+        ar_test_recon = ar_test_m.categorical_loss + args.numeric_weight * ar_test_m.numeric_loss
+        ar_test_kl_excess = max(ar_test_m.kl_raw - args.free_bits * args.latent_dim, 0.0)
+        print(
+            f"Test (AR generation)  | recon={ar_test_recon:.4f} "
+            f"cat={ar_test_m.categorical_loss:.4f} num={ar_test_m.numeric_loss:.4f} "
+            f"kl={ar_test_m.kl_raw:.4f}(+{ar_test_kl_excess:.4f})"
+        )
 
 
 if __name__ == "__main__":

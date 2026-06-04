@@ -41,10 +41,6 @@ class RouteVAEEncoderConfig:
     # so it stays consistent with whatever route_preprocessing.py produced.
     shape_desc_dim: int = 9
 
-    # Pooling strategy: mean+max over hold token outputs concatenated → Linear(2*d_model, d_model).
-    # Mean captures aggregate route statistics; max surfaces the most extreme hold per style dimension.
-    route_pool_mode: str = "mean_max"
-
     # Transformer sizes
     d_model: int = 256
     nhead: int = 8
