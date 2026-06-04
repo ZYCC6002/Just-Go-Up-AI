@@ -214,6 +214,7 @@ def _build_model(
     bottleneck_cfg = RouteVAEBottleneckConfig(
         encoder_embedding_dim=enc_cfg.d_model,
         latent_dim=latent_dim,
+        hidden_dim=enc_cfg.d_model,  # match encoder output dim (default 128 would silently compress)
     )
 
     if use_parallel_decoder:

@@ -301,6 +301,7 @@ def build_model_from_checkpoint(
     bottleneck_cfg = RouteVAEBottleneckConfig(
         encoder_embedding_dim=enc_cfg.d_model,
         latent_dim=latent_dim,
+        hidden_dim=int(ckpt_args.get("encoder_d_model", enc_cfg.d_model)),
     )
 
     use_parallel = bool(ckpt_args.get("parallel_decoder", False))
