@@ -327,6 +327,7 @@ def build_model_from_checkpoint(
             use_absolute_pos=enc_cfg.use_absolute_pos,
             use_type_feature=enc_cfg.use_type_feature,
             token_dropout=float(ckpt_args.get("decoder_token_dropout", 0.0)),
+            mask_rate=float(ckpt_args.get("decoder_mask_rate", 0.0)),
             x_min=enc_cfg.x_min,
             x_max=enc_cfg.x_max,
             y_min=enc_cfg.y_min,

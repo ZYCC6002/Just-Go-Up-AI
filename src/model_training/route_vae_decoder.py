@@ -44,6 +44,13 @@ class RouteVAEDecoderConfig:
     # the previous-token context.  Disabled at inference (self.training=False).
     token_dropout: float = 0.0
 
+    # Masked bidirectional mode: when > 0, the decoder operates without a causal
+    # mask and randomly replaces this fraction of non-padded input tokens with
+    # mask_token.  Loss is computed only at masked positions.  token_dropout and
+    # BOS injection are ignored.  Applied at both train and eval so val loss
+    # measures masked-hold reconstruction quality (not trivial full-context recall).
+    mask_rate: float = 0.0
+
     # Decoder transformer sizes
     d_model: int = 128
     nhead: int = 8
@@ -125,8 +132,14 @@ class RouteTransformerDecoder(nn.Module):
         """Project z to a single d_model memory token for cross-attention. Returns [B, 1, d_model]."""
         return self.z_proj(z.to(torch.float32)).unsqueeze(1)
 
-    def _build_decoder_tokens(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Embed hold tokens, add position embeddings, and inject BOS at position 0."""
+    def _build_decoder_tokens(
+        self, batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Embed hold tokens, add position embeddings, then either inject BOS (AR) or mask holds (masked).
+
+        Returns:
+            (tokens, is_masked) where is_masked is [B, L] bool in masked mode, None in AR mode.
+        """
         tokens = self.hold_embedder.embed(batch)
 
         batch_size, seq_len, _ = tokens.shape
@@ -136,13 +149,21 @@ class RouteTransformerDecoder(nn.Module):
         positions = torch.arange(seq_len, device=tokens.device).unsqueeze(0).expand(batch_size, seq_len)
         tokens = tokens + self.sequence_position_embedding(positions)
 
-        # Replace slot 0 with learned BOS token
+        if self.cfg.mask_rate > 0.0:
+            # Masked bidirectional mode: randomly replace holds with mask_token.
+            # Applied at both train and eval so val/test loss stays meaningful.
+            padding_mask = batch["padding_mask"].bool()
+            rng = torch.rand(batch_size, seq_len, device=tokens.device)
+            is_masked = (rng < self.cfg.mask_rate) & ~padding_mask
+            mask_emb = self.mask_token.view(1, 1, -1).expand_as(tokens)
+            tokens = torch.where(is_masked.unsqueeze(-1), mask_emb, tokens)
+            return tokens, is_masked
+
+        # Autoregressive mode: inject BOS at position 0, apply optional token dropout.
         bos = (self.bos_embedding + self.sequence_position_embedding.weight[0])
         bos = bos.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1)
         tokens = torch.cat([bos, tokens[:, 1:, :]], dim=1)
 
-        # Token dropout: replace hold tokens (positions 1+) with learned mask embedding.
-        # BOS is never masked.
         hold_tokens = tokens[:, 1:, :]
         if self.training and self.cfg.token_dropout > 0.0:
             mask_emb = self.mask_token.view(1, 1, -1).expand_as(hold_tokens)
@@ -150,7 +171,7 @@ class RouteTransformerDecoder(nn.Module):
             hold_tokens = torch.where(drop.unsqueeze(-1), mask_emb, hold_tokens)
             tokens = torch.cat([tokens[:, :1, :], hold_tokens], dim=1)
 
-        return tokens
+        return tokens, None
 
     def forward(
         self,
@@ -165,20 +186,28 @@ class RouteTransformerDecoder(nn.Module):
             z:     latent vector [B, latent_dim] — sole conditioning signal
         """
         padding_mask = batch["padding_mask"].bool()
-        tgt = self._build_decoder_tokens(batch)
+        tgt, is_masked = self._build_decoder_tokens(batch)
 
         memory = self._build_condition_memory(z=z)
 
-        tgt_mask = self._causal_mask(tgt.shape[1], tgt.device)
-        decoded = self.decoder(
-            tgt=tgt,
-            memory=memory,
-            tgt_mask=tgt_mask,
-            tgt_key_padding_mask=padding_mask,
-        )
+        if self.cfg.mask_rate > 0.0:
+            # Bidirectional: no causal mask; every token attends to every other.
+            decoded = self.decoder(
+                tgt=tgt,
+                memory=memory,
+                tgt_key_padding_mask=padding_mask,
+            )
+        else:
+            tgt_mask = self._causal_mask(tgt.shape[1], tgt.device)
+            decoded = self.decoder(
+                tgt=tgt,
+                memory=memory,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=padding_mask,
+            )
         decoded = self.final_norm(decoded)
 
-        return {
+        out = {
             "hidden_states": decoded,
             "type_logits": self.type_head(decoded),
             "role_logits": self.role_head(decoded),
@@ -189,6 +218,9 @@ class RouteTransformerDecoder(nn.Module):
             "orientation_cos_pred": torch.sigmoid(self.orientation_cos_head(decoded).squeeze(-1)),
             "size_pred": torch.sigmoid(self.size_head(decoded).squeeze(-1)),
         }
+        if is_masked is not None:
+            out["is_masked"] = is_masked
+        return out
 
 
 __all__ = ["RouteVAEDecoderConfig", "RouteTransformerDecoder"]

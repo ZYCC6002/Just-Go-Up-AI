@@ -173,6 +173,7 @@ def _build_model(
     use_type_feature: bool = True,
     shape_desc_dim: int = 9,
     decoder_token_dropout: float = 0.0,
+    decoder_mask_rate: float = 0.0,
     use_parallel_decoder: bool = False,
 ) -> tuple[RouteConditionalVAE, DecoderEOSIds]:
     if encoder_d_model % encoder_nhead != 0:
@@ -220,6 +221,7 @@ def _build_model(
             use_absolute_pos=use_absolute_pos,
             use_type_feature=use_type_feature,
             token_dropout=decoder_token_dropout,
+            mask_rate=decoder_mask_rate,
             x_min=enc_cfg.x_min,
             x_max=enc_cfg.x_max,
             y_min=enc_cfg.y_min,
@@ -242,6 +244,11 @@ def _build_model(
         print(
             f"Decoder (parallel MLP): d_model={dec_cfg.d_model} "
             f"mlp_depth={dec_cfg.mlp_depth}"
+        )
+    elif decoder_mask_rate > 0.0:
+        print(
+            f"Decoder (masked bidirectional): d_model={dec_cfg.d_model} nhead={dec_cfg.nhead} "
+            f"layers={dec_cfg.num_layers} ffn={dec_cfg.dim_feedforward} mask_rate={dec_cfg.mask_rate}"
         )
     else:
         print(
@@ -402,13 +409,14 @@ def _compute_batch_losses(
         batch_samples, eos_ids=eos_ids, device=device, ignore_index=ignore_index
     )
     is_parallel = not getattr(model.decoder, "is_autoregressive", True)
+    is_masked_decoder = (not is_parallel) and getattr(model.decoder.cfg, "mask_rate", 0.0) > 0.0
 
-    if autoregressive and not is_parallel:
+    if autoregressive and not is_parallel and not is_masked_decoder:
         out = _autoregressive_forward(model, prepared, device=device)
-    elif ss_ratio > 0.0 and model.training and not is_parallel:
+    elif ss_ratio > 0.0 and model.training and not is_parallel and not is_masked_decoder:
         # Two-pass scheduled sampling: first pass (eval, no_grad) gets clean predictions;
         # second pass (train) trains on the mixed ground-truth/own-prediction inputs.
-        # Not applicable to the parallel decoder (no input tokens to mix).
+        # Not applicable to the parallel or masked decoder.
         dec_cfg = model.decoder.cfg
         model.eval()
         with torch.no_grad():
@@ -426,6 +434,13 @@ def _compute_batch_losses(
             decoder_batch=mixed_batch,
             sample_latent=sample_latent,
         )
+    elif is_masked_decoder:
+        # Masked bidirectional: pass unshifted target_batch; masking happens inside the decoder.
+        out = model(
+            encoder_batch=prepared["encoder_batch"],
+            decoder_batch=prepared["target_batch"],
+            sample_latent=sample_latent,
+        )
     else:
         out = model(
             encoder_batch=prepared["encoder_batch"],
@@ -433,26 +448,65 @@ def _compute_batch_losses(
             sample_latent=sample_latent,
         )
 
-    cat_targets = prepared["categorical_targets"]
-    categorical_loss = sum(
-        F.cross_entropy(
-            out[f"{feat}_logits"].reshape(-1, out[f"{feat}_logits"].shape[-1]),
-            cat_targets[f"{feat}_target"].reshape(-1),
+    if is_masked_decoder:
+        # Losses computed only at randomly masked positions; visible holds are inputs, not targets.
+        is_masked_out = out["is_masked"]          # [B, L]
+        target_batch  = prepared["target_batch"]
+        padding_mask  = target_batch["padding_mask"].bool()
+        loss_pos      = is_masked_out & ~padding_mask  # [B, L]
+
+        type_tgt = target_batch["type_encoded_id"].long().masked_fill(~loss_pos, ignore_index)
+        role_tgt = target_batch["role_encoded_id"].long().masked_fill(~loss_pos, ignore_index)
+        hole_tgt = target_batch["hole_encoded_id"].long().masked_fill(~loss_pos, ignore_index)
+
+        categorical_loss = (
+            F.cross_entropy(out["type_logits"].reshape(-1, out["type_logits"].shape[-1]),
+                            type_tgt.reshape(-1), ignore_index=ignore_index)
+            + F.cross_entropy(out["role_logits"].reshape(-1, out["role_logits"].shape[-1]),
+                              role_tgt.reshape(-1), ignore_index=ignore_index)
+            + hole_loss_weight * F.cross_entropy(
+                out["hole_logits"].reshape(-1, out["hole_logits"].shape[-1]),
+                hole_tgt.reshape(-1), ignore_index=ignore_index)
+        )
+
+        dec_cfg = model.decoder.cfg
+        def _norm(v: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
+            return ((v.float() - lo) / (hi - lo)).clamp(0.0, 1.0)
+
+        x_tgt    = _norm(target_batch["x"],               dec_cfg.x_min, dec_cfg.x_max)
+        y_tgt    = _norm(target_batch["y"],               dec_cfg.y_min, dec_cfg.y_max)
+        ori_sin  = _norm(target_batch["orientation_sin"],  -1.0, 1.0)
+        ori_cos  = _norm(target_batch["orientation_cos"],  -1.0, 1.0)
+        size_tgt = _norm(target_batch["size"],             2.0, 5.0)
+
+        numeric_loss = (
+            masked_mse(out["x_pred"],               x_tgt,    loss_pos)
+            + masked_mse(out["y_pred"],             y_tgt,    loss_pos)
+            + masked_mse(out["orientation_sin_pred"], ori_sin, loss_pos)
+            + masked_mse(out["orientation_cos_pred"], ori_cos, loss_pos)
+            + masked_mse(out["size_pred"],          size_tgt, loss_pos)
+        )
+    else:
+        cat_targets = prepared["categorical_targets"]
+        categorical_loss = sum(
+            F.cross_entropy(
+                out[f"{feat}_logits"].reshape(-1, out[f"{feat}_logits"].shape[-1]),
+                cat_targets[f"{feat}_target"].reshape(-1),
+                ignore_index=ignore_index,
+            )
+            for feat in ("type", "role")
+        ) + hole_loss_weight * F.cross_entropy(
+            out["hole_logits"].reshape(-1, out["hole_logits"].shape[-1]),
+            cat_targets["hole_target"].reshape(-1),
             ignore_index=ignore_index,
         )
-        for feat in ("type", "role")
-    ) + hole_loss_weight * F.cross_entropy(
-        out["hole_logits"].reshape(-1, out["hole_logits"].shape[-1]),
-        cat_targets["hole_target"].reshape(-1),
-        ignore_index=ignore_index,
-    )
 
-    num_targets = prepared["numeric_targets"]
-    mask = prepared["valid_numeric_mask"]
-    numeric_loss = sum(
-        masked_mse(out[f"{feat}_pred"], num_targets[f"{feat}_target"], mask)
-        for feat in ("x", "y", "orientation_sin", "orientation_cos", "size")
-    )
+        num_targets = prepared["numeric_targets"]
+        mask = prepared["valid_numeric_mask"]
+        numeric_loss = sum(
+            masked_mse(out[f"{feat}_pred"], num_targets[f"{feat}_target"], mask)
+            for feat in ("x", "y", "orientation_sin", "orientation_cos", "size")
+        )
 
     # kl_unified is a single term: add to total with weight 1.0 — kl_beta and free-bits are baked in.
     # kl_raw is the unweighted KL, used only for logging (kl=X(+Y) diagnostic).
@@ -468,27 +522,36 @@ def _compute_batch_losses(
     # double-counting; padded / EOS tokens are excluded via valid_numeric_mask.
     pairwise_val = 0.0
     if pairwise_weight > 0.0:
-        x_pred_pw = out["x_pred"]                # [B, L+1]
-        y_pred_pw = out["y_pred"]                # [B, L+1]
-        x_true_pw = num_targets["x_target"]      # [B, L+1]
-        y_true_pw = num_targets["y_target"]      # [B, L+1]
-
-        dx_pred = x_pred_pw.unsqueeze(2) - x_pred_pw.unsqueeze(1)   # [B, L+1, L+1]
-        dy_pred = y_pred_pw.unsqueeze(2) - y_pred_pw.unsqueeze(1)
-        d_pred  = torch.sqrt(dx_pred ** 2 + dy_pred ** 2 + 1e-8)
-
-        dx_true = x_true_pw.unsqueeze(2) - x_true_pw.unsqueeze(1)
-        dy_true = y_true_pw.unsqueeze(2) - y_true_pw.unsqueeze(1)
-        d_true  = torch.sqrt(dx_true ** 2 + dy_true ** 2 + 1e-8)
-
-        Lp1 = x_pred_pw.shape[1]
-        triu = torch.triu(
-            torch.ones(Lp1, Lp1, dtype=torch.bool, device=x_pred_pw.device),
-            diagonal=1,
-        )
-        pair_mask = mask.unsqueeze(2) & mask.unsqueeze(1) & triu.unsqueeze(0)
-
         _SQRT2 = 2.0 ** 0.5
+        if is_masked_decoder:
+            # Pairwise over masked positions only (visible holds have trivially accurate x/y).
+            x_pred_pw = out["x_pred"]   # [B, L]
+            y_pred_pw = out["y_pred"]
+            L = x_pred_pw.shape[1]
+            triu = torch.triu(torch.ones(L, L, dtype=torch.bool, device=x_pred_pw.device), diagonal=1)
+            pair_mask = loss_pos.unsqueeze(2) & loss_pos.unsqueeze(1) & triu.unsqueeze(0)
+            dx_pred = x_pred_pw.unsqueeze(2) - x_pred_pw.unsqueeze(1)
+            dy_pred = y_pred_pw.unsqueeze(2) - y_pred_pw.unsqueeze(1)
+            d_pred  = torch.sqrt(dx_pred ** 2 + dy_pred ** 2 + 1e-8)
+            dx_true = x_tgt.unsqueeze(2) - x_tgt.unsqueeze(1)
+            dy_true = y_tgt.unsqueeze(2) - y_tgt.unsqueeze(1)
+            d_true  = torch.sqrt(dx_true ** 2 + dy_true ** 2 + 1e-8)
+        else:
+            x_pred_pw = out["x_pred"]                # [B, L+1]
+            y_pred_pw = out["y_pred"]                # [B, L+1]
+            x_true_pw = num_targets["x_target"]      # [B, L+1]
+            y_true_pw = num_targets["y_target"]      # [B, L+1]
+            dx_pred = x_pred_pw.unsqueeze(2) - x_pred_pw.unsqueeze(1)
+            dy_pred = y_pred_pw.unsqueeze(2) - y_pred_pw.unsqueeze(1)
+            d_pred  = torch.sqrt(dx_pred ** 2 + dy_pred ** 2 + 1e-8)
+            dx_true = x_true_pw.unsqueeze(2) - x_true_pw.unsqueeze(1)
+            dy_true = y_true_pw.unsqueeze(2) - y_true_pw.unsqueeze(1)
+            d_true  = torch.sqrt(dx_true ** 2 + dy_true ** 2 + 1e-8)
+            Lp1 = x_pred_pw.shape[1]
+            triu = torch.triu(
+                torch.ones(Lp1, Lp1, dtype=torch.bool, device=x_pred_pw.device), diagonal=1,
+            )
+            pair_mask = mask.unsqueeze(2) & mask.unsqueeze(1) & triu.unsqueeze(0)
         pairwise_loss = masked_mse(d_pred / _SQRT2, d_true / _SQRT2, pair_mask)
         total = total + numeric_weight * pairwise_weight * pairwise_loss
         pairwise_val = float(pairwise_loss.detach().cpu())
@@ -628,6 +691,13 @@ def main() -> None:
                              "to rely on z rather than exploiting categorical/spatial patterns "
                              "in the teacher-forced context. Disabled at inference. "
                              "Suggested range: 0.15–0.25.")
+    parser.add_argument("--decoder-mask-rate", type=float, default=0.0,
+                        help="Enable masked bidirectional decoder mode. When > 0, replaces this "
+                             "fraction of non-padded input holds with a mask token and removes the "
+                             "causal attention mask. Loss is computed only at masked positions, "
+                             "forcing z to encode spatial structure that cannot be inferred from "
+                             "partial local context. Applied at both train and eval. "
+                             "Mutually exclusive with --parallel-decoder. Suggested: 0.65.")
     parser.add_argument("--scheduled-sampling-ratio", type=float, default=0.0,
                         help="Target probability of replacing each decoder input token with the "
                              "model's own prediction from the previous position (scheduled sampling). "
@@ -714,6 +784,7 @@ def main() -> None:
         use_type_feature=args.use_type_feature,
         shape_desc_dim=shape_desc_dim,
         decoder_token_dropout=args.decoder_token_dropout,
+        decoder_mask_rate=args.decoder_mask_rate,
         use_parallel_decoder=args.parallel_decoder,
     )
 
