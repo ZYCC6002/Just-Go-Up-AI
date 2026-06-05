@@ -135,7 +135,7 @@ class RouteTransformerDecoder(nn.Module):
         return self.z_proj(z.to(torch.float32)).unsqueeze(1)
 
     def _build_decoder_tokens(
-        self, batch: dict[str, torch.Tensor]
+        self, batch: dict[str, torch.Tensor], *, effective_mask_rate: float
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Embed hold tokens, add position embeddings, then either inject BOS (AR) or mask holds (masked).
 
@@ -152,13 +152,14 @@ class RouteTransformerDecoder(nn.Module):
         tokens = tokens + self.sequence_position_embedding(positions)
 
         if self.cfg.mask_rate > 0.0:
-            # Masked bidirectional mode: randomly replace holds with mask_token.
-            # Applied at both train and eval so val/test loss stays meaningful.
+            # Masked bidirectional mode. effective_mask_rate may differ from cfg.mask_rate
+            # when the training loop samples dynamically; cfg.mask_rate is the eval fallback.
             padding_mask = batch["padding_mask"].bool()
             rng = torch.rand(batch_size, seq_len, device=tokens.device)
-            is_masked = (rng < self.cfg.mask_rate) & ~padding_mask
-            mask_emb = self.mask_token.view(1, 1, -1).expand_as(tokens)
-            tokens = torch.where(is_masked.unsqueeze(-1), mask_emb, tokens)
+            is_masked = (rng < effective_mask_rate) & ~padding_mask
+            if effective_mask_rate > 0.0:
+                mask_emb = self.mask_token.view(1, 1, -1).expand_as(tokens)
+                tokens = torch.where(is_masked.unsqueeze(-1), mask_emb, tokens)
             return tokens, is_masked
 
         # Autoregressive mode: inject BOS at position 0, apply optional token dropout.
@@ -180,15 +181,19 @@ class RouteTransformerDecoder(nn.Module):
         batch: dict[str, torch.Tensor],
         *,
         z: torch.Tensor,
+        mask_rate: float | None = None,
     ) -> dict[str, torch.Tensor]:
         """Teacher-forcing forward pass.
 
         Args:
-            batch: tokenized decoder inputs (shifted-right targets with BOS at position 0)
-            z:     latent vector [B, latent_dim] — sole conditioning signal
+            batch:     tokenized decoder inputs
+            z:         latent vector [B, latent_dim] — sole conditioning signal
+            mask_rate: override cfg.mask_rate for this forward pass (used by the training loop
+                       to sample a fresh rate each batch). None → use cfg.mask_rate.
         """
+        effective_mask_rate = mask_rate if mask_rate is not None else self.cfg.mask_rate
         padding_mask = batch["padding_mask"].bool()
-        tgt, is_masked = self._build_decoder_tokens(batch)
+        tgt, is_masked = self._build_decoder_tokens(batch, effective_mask_rate=effective_mask_rate)
 
         memory = self._build_condition_memory(z=z)
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +63,18 @@ def _compute_ss_ratio(*, epoch: int, target_ss_ratio: float, ss_warmup_epochs: i
         return float(target_ss_ratio)
     ratio = min(max(epoch, 0), ss_warmup_epochs) / float(ss_warmup_epochs)
     return float(target_ss_ratio) * ratio
+
+
+def _compute_mask_max(*, epoch: int, warmup_epochs: int) -> float:
+    """Return the upper bound for mask-rate sampling at this epoch.
+
+    During warmup (epoch < warmup_epochs) the maximum mask rate ramps linearly
+    from 0 → 1.  After warmup it stays at 1.0 so each training batch samples
+    mask_rate ~ Uniform[0, 1).
+    """
+    if warmup_epochs <= 0:
+        return 1.0
+    return min(epoch / warmup_epochs, 1.0)
 
 
 def _mix_predictions_into_batch(
@@ -427,6 +440,7 @@ def _compute_batch_losses(
     hole_loss_weight: float = 1.0,
     autoregressive: bool = False,
     ss_ratio: float = 0.0,
+    train_mask_rate: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     prepared = prepare_cvae_training_batch(
         batch_samples, eos_ids=eos_ids, device=device, ignore_index=ignore_index
@@ -459,10 +473,12 @@ def _compute_batch_losses(
         )
     elif is_masked_decoder:
         # Masked bidirectional: pass unshifted target_batch; masking happens inside the decoder.
+        # train_mask_rate overrides cfg.mask_rate when the training loop samples dynamically.
         out = model(
             encoder_batch=prepared["encoder_batch"],
             decoder_batch=prepared["target_batch"],
             sample_latent=sample_latent,
+            mask_rate=train_mask_rate,
         )
     else:
         out = model(
@@ -473,10 +489,15 @@ def _compute_batch_losses(
 
     if is_masked_decoder:
         # Losses computed only at randomly masked positions; visible holds are inputs, not targets.
+        # When mask_rate=0 (early warmup) no positions are masked → fall back to all non-padded
+        # positions so the loss is never degenerate and warmup epochs still train the model.
         is_masked_out = out["is_masked"]          # [B, L]
         target_batch  = prepared["target_batch"]
         padding_mask  = target_batch["padding_mask"].bool()
-        loss_pos      = is_masked_out & ~padding_mask  # [B, L]
+        if is_masked_out.any():
+            loss_pos = is_masked_out & ~padding_mask  # [B, L]: masked & non-padded
+        else:
+            loss_pos = ~padding_mask                  # fallback: all non-padded positions
 
         type_tgt = target_batch["type_encoded_id"].long().masked_fill(~loss_pos, ignore_index)
         role_tgt = target_batch["role_encoded_id"].long().masked_fill(~loss_pos, ignore_index)
@@ -606,7 +627,14 @@ def _run_epoch(
     hole_loss_weight: float = 1.0,
     autoregressive: bool = False,
     ss_ratio: float = 0.0,
+    mask_rate_max: float | None = None,
 ) -> EpochMetrics:
+    """Run one epoch.
+
+    mask_rate_max: when not None, sample mask_rate ~ Uniform[0, mask_rate_max) for each
+    training batch (scheduled masking for the bidirectional masked decoder).  None means
+    use the decoder's cfg.mask_rate unchanged (val/test, or fixed-rate training).
+    """
     is_train = optimizer is not None
     model.train(is_train)
 
@@ -616,6 +644,12 @@ def _run_epoch(
     for batch_samples in iter_minibatches(samples, batch_size, shuffle=is_train):
         if is_train:
             optimizer.zero_grad(set_to_none=True)
+
+        # Sample a fresh mask rate for this batch when dynamic masking is active.
+        if mask_rate_max is not None:
+            batch_mask_rate: float | None = random.uniform(0.0, mask_rate_max)
+        else:
+            batch_mask_rate = None  # use decoder's cfg.mask_rate
 
         with torch.set_grad_enabled(is_train):
             loss, stats = _compute_batch_losses(
@@ -628,6 +662,7 @@ def _run_epoch(
                 hole_loss_weight=hole_loss_weight,
                 autoregressive=autoregressive,
                 ss_ratio=ss_ratio,
+                train_mask_rate=batch_mask_rate,
             )
             if is_train:
                 loss.backward()
@@ -726,12 +761,17 @@ def main() -> None:
                              "Self-attention is unfrozen for the remaining epochs. Only meaningful "
                              "for the masked transformer decoder. Default: 0 (disabled).")
     parser.add_argument("--decoder-mask-rate", type=float, default=0.0,
-                        help="Enable masked bidirectional decoder mode. When > 0, replaces this "
-                             "fraction of non-padded input holds with a mask token and removes the "
-                             "causal attention mask. Loss is computed only at masked positions, "
-                             "forcing z to encode spatial structure that cannot be inferred from "
-                             "partial local context. Applied at both train and eval. "
-                             "Mutually exclusive with --parallel-decoder. Suggested: 0.65.")
+                        help="Eval mask rate for the masked bidirectional decoder. When > 0, enables "
+                             "masked decoder mode: bidirectional attention, loss at masked positions only. "
+                             "At eval/test this exact rate is used (fixed). During training the rate is "
+                             "sampled from Uniform[0, mask_max) each batch when --mask-warmup-epochs > 0, "
+                             "otherwise this fixed rate is used for training too. Suggested: 0.5.")
+    parser.add_argument("--mask-warmup-epochs", type=int, default=0,
+                        help="Epochs over which the training mask-rate maximum ramps from 0 → 1. "
+                             "Each training batch samples mask_rate ~ Uniform[0, epoch/warmup_epochs). "
+                             "After warmup, samples from Uniform[0, 1) — high masking forces z use; "
+                             "low masking gives the model spatial context to refine. "
+                             "Val/test always use the fixed --decoder-mask-rate. Default: 0 (fixed rate).")
     parser.add_argument("--scheduled-sampling-ratio", type=float, default=0.0,
                         help="Target probability of replacing each decoder input token with the "
                              "model's own prediction from the previous position (scheduled sampling). "
@@ -905,6 +945,14 @@ def main() -> None:
             target_ss_ratio=args.scheduled_sampling_ratio,
             ss_warmup_epochs=args.ss_warmup_epochs,
         )
+        # Dynamic masking: sample mask_rate ~ Uniform[0, mask_max) per training batch.
+        # mask_max ramps from 0 → 1 over mask_warmup_epochs.  None = use cfg.mask_rate fixed.
+        is_masked_decoder = args.decoder_mask_rate > 0.0
+        train_mask_max = (
+            _compute_mask_max(epoch=epoch, warmup_epochs=args.mask_warmup_epochs)
+            if is_masked_decoder and args.mask_warmup_epochs > 0
+            else None
+        )
         train_m = _run_epoch(
             model, train_samples,
             optimizer=optimizer, device=device, eos_ids=eos_ids,
@@ -915,6 +963,7 @@ def main() -> None:
             pairwise_weight=args.pairwise_weight,
             hole_loss_weight=args.hole_loss_weight,
             ss_ratio=ss_ratio,
+            mask_rate_max=train_mask_max,
         )
         with torch.no_grad():
             val_m = _run_epoch(
@@ -927,6 +976,7 @@ def main() -> None:
                 pairwise_weight=args.pairwise_weight,
                 hole_loss_weight=args.hole_loss_weight,
                 autoregressive=False,  # teacher-forced: stable criterion for checkpoint selection
+                # mask_rate_max=None: val always uses the fixed cfg.mask_rate for a consistent metric
             )
 
         train_recon = train_m.categorical_loss + args.numeric_weight * train_m.numeric_loss
@@ -947,8 +997,12 @@ def main() -> None:
             if args.pairwise_weight > 0.0 else ""
         )
         ss_str = f" ss={ss_ratio:.3f}" if args.scheduled_sampling_ratio > 0.0 else ""
+        mask_str = (
+            f" mask_max={train_mask_max:.2f}"
+            if train_mask_max is not None else ""
+        )
         print(
-            f"Epoch {epoch:03d} | kl_beta={kl_beta:.6f}{ss_str} "
+            f"Epoch {epoch:03d} | kl_beta={kl_beta:.6f}{ss_str}{mask_str} "
             f"train total={train_m.total_loss:.4f} recon={train_recon:.4f} kl_w={train_kl_w:.4f} "
             f"cat={train_m.categorical_loss:.4f} num={train_m.numeric_loss:.4f} "
             f"kl={train_m.kl_raw:.4f}(+{train_kl_excess:.4f}){pw_str} | "

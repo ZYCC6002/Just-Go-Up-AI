@@ -134,10 +134,11 @@ class RouteConditionalVAE(nn.Module):
         encoder_batch: dict[str, torch.Tensor],
         decoder_batch: dict[str, torch.Tensor],
         sample_latent: bool = True,
+        mask_rate: float | None = None,
     ) -> dict[str, torch.Tensor]:
         enc_out = self.encoder(encoder_batch)
         bottleneck_out = self.bottleneck(enc_out["route_embedding"], sample_latent=sample_latent)
-        dec_out = self.decoder(decoder_batch, z=bottleneck_out["z"])
+        dec_out = self.decoder(decoder_batch, z=bottleneck_out["z"], mask_rate=mask_rate)
 
         return {
             "encoder_token_embeddings": enc_out["token_embeddings"],
