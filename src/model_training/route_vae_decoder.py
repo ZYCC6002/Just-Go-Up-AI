@@ -7,13 +7,12 @@ import torch.nn as nn
 
 from .model_utils import (
     HoldTokenEmbedder,
-    normalize_minmax,
 )
 
 
 @dataclass
 class RouteVAEDecoderConfig:
-    """Configuration for autoregressive route decoder."""
+    """Configuration for the route decoder (AR or masked bidirectional)."""
 
     # Feature vocab sizes
     type_vocab_size: int
@@ -67,18 +66,140 @@ class RouteVAEDecoderConfig:
     y_max: float = 176.0
 
 
+# ---------------------------------------------------------------------------
+# AdaLN building blocks
+# ---------------------------------------------------------------------------
+
+class AdaLNModulation(nn.Module):
+    """Maps a conditioning vector to (scale, shift, gate) for one AdaLN sublayer.
+
+    Implements the full DiT-style modulation:
+      - scale (γ): multiplies the LayerNorm output before the sublayer
+      - shift (β): added to the LayerNorm output before the sublayer
+      - gate (α): multiplies the sublayer output before the residual addition
+
+    All weights and biases are zero-initialised so that at the start of training:
+      scale = 1  (identity normalization)
+      shift = 0  (no offset)
+      gate  = 0  (sublayer contributes nothing — full residual passthrough)
+    This makes each transformer layer a near-identity function at init, giving
+    stable early-training dynamics.  The conditioning signal is gradually learned.
+
+    The conditioning input is the z_mlp output from RouteTransformerDecoder.
+    """
+
+    def __init__(self, cond_dim: int, d_model: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(cond_dim, 3 * d_model)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (scale, shift, gate).
+
+        scale is 1-centred (starts at 1); shift and gate start at 0.
+        """
+        out = self.proj(cond)                          # [B, 3 * d_model]
+        scale, shift, gate = out.chunk(3, dim=-1)
+        return 1.0 + scale, shift, gate                # scale residual: γ=1, β=0, α=0 at init
+
+
+class AdaLNTransformerLayer(nn.Module):
+    """Single transformer layer with AdaLN z-conditioning (no cross-attention).
+
+    z is injected via Adaptive Layer Normalisation (AdaLN) at both the
+    self-attention and feed-forward sub-layers.  Unlike cross-attention —
+    where the decoder can route around z by assigning near-zero attention
+    weight to the z memory token — AdaLN modulates the LayerNorm scale and
+    shift at every token at every layer.  The decoder has no architectural
+    bypass: even if self-attention relies entirely on visible holds, z still
+    reshapes every token's normalised representation before each sublayer.
+
+    AdaLN is applied in the pre-norm position (as in DiT):
+      x ← x + Attn(AdaLN(x, z))
+      x ← x + FF(AdaLN(x, z))
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        layer_norm_eps: float,
+        cond_dim: int,
+    ) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
+        self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps)
+        self.self_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True
+        )
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+        self.adaLN_attn = AdaLNModulation(cond_dim, d_model)
+        self.adaLN_ff   = AdaLNModulation(cond_dim, d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        z_cond: torch.Tensor,
+        *,
+        attn_mask: torch.Tensor | None = None,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x:                [B, L, d_model]
+            z_cond:           [B, cond_dim] — pre-processed z from z_mlp
+            attn_mask:        [L, L] bool (True = mask) for causal AR mode; None for bidirectional
+            key_padding_mask: [B, L] bool (True = padded position)
+        """
+        # ── Self-attention sub-layer: AdaLN → Attn → gate → residual ───────
+        scale1, shift1, gate1 = self.adaLN_attn(z_cond)             # [B, d_model] each
+        normed = scale1.unsqueeze(1) * self.norm1(x) + shift1.unsqueeze(1)
+        attn_out, _ = self.self_attn(
+            normed, normed, normed,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        x = x + gate1.unsqueeze(1) * attn_out                       # α1(z) gates attn residual
+
+        # ── Feed-forward sub-layer: AdaLN → FF → gate → residual ────────────
+        scale2, shift2, gate2 = self.adaLN_ff(z_cond)               # [B, d_model] each
+        normed = scale2.unsqueeze(1) * self.norm2(x) + shift2.unsqueeze(1)
+        x = x + gate2.unsqueeze(1) * self.ff(normed)                # α2(z) gates FF residual
+
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Decoder
+# ---------------------------------------------------------------------------
+
 class RouteTransformerDecoder(nn.Module):
-    """Autoregressive transformer decoder.
+    """Transformer decoder with AdaLN z-conditioning.
 
-    Cross-attention memory comes from latent z (the sole conditioning signal).
+    z is injected via AdaLN (not cross-attention) so it cannot be bypassed
+    regardless of how much visible-hold context self-attention provides.
 
-    Expected teacher-forcing input keys (shifted-right with BOS at position 0):
+    Supports two operating modes selected by cfg.mask_rate:
+      mask_rate = 0  — autoregressive (causal self-attention, BOS token)
+      mask_rate > 0  — masked bidirectional (no causal mask, mask_token injection)
+
+    Expected batch keys (teacher-forcing or masked inputs):
     - type_encoded_id, role_encoded_id, hole_encoded_id
     - x, y, orientation_sin, orientation_cos, size
     - padding_mask (bool, True for padded tokens)
     """
 
-    is_autoregressive: bool = True  # distinguishes from RouteParallelDecoder (is_autoregressive=False)
+    is_autoregressive: bool = True  # distinguishes from RouteParallelDecoder
 
     def __init__(self, cfg: RouteVAEDecoderConfig) -> None:
         super().__init__()
@@ -89,30 +210,36 @@ class RouteTransformerDecoder(nn.Module):
         self.role_eos_id = cfg.role_vocab_size
         self.hole_eos_id = cfg.hole_id_vocab_size
 
-        # Depth and delta features excluded: depth is a physical hold property not reconstructed
-        # by the decoder; delta is derivable from predicted x/y.
+        # Depth excluded: physical hold property not reconstructed by the decoder.
         self.hold_embedder = HoldTokenEmbedder(cfg, use_depth=False)
 
         # Learned sequence position embedding
         self.sequence_position_embedding = nn.Embedding(cfg.max_seq_len, cfg.d_model)
-        # Learned BOS anchor token
+        # Learned BOS anchor token (AR mode only — position 0 of the shifted sequence)
         self.bos_embedding = nn.Parameter(torch.randn(cfg.d_model) * 0.02)
-        # Learned mask token: substituted for dropped hold tokens during training.
+        # Learned mask token (masked bidirectional mode and token dropout)
         self.mask_token = nn.Parameter(torch.zeros(cfg.d_model))
 
-        # Project z into a single d_model-dim memory token for cross-attention.
-        self.z_proj = nn.Linear(cfg.latent_dim, cfg.d_model)
-
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=cfg.d_model,
-            nhead=cfg.nhead,
-            dim_feedforward=cfg.dim_feedforward,
-            dropout=cfg.dropout,
-            activation="gelu",
-            layer_norm_eps=cfg.layer_norm_eps,
-            batch_first=True,
+        # z pre-processor: latent_dim → d_model, shared across all AdaLN layers.
+        # A single SiLU linear is sufficient; per-layer AdaLN projections add
+        # further expressivity on top of this shared representation.
+        self.z_mlp = nn.Sequential(
+            nn.Linear(cfg.latent_dim, cfg.d_model),
+            nn.SiLU(),
         )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=cfg.num_layers)
+
+        # AdaLN transformer layers — no cross-attention sublayer.
+        self.layers = nn.ModuleList([
+            AdaLNTransformerLayer(
+                d_model=cfg.d_model,
+                nhead=cfg.nhead,
+                dim_feedforward=cfg.dim_feedforward,
+                dropout=cfg.dropout,
+                layer_norm_eps=cfg.layer_norm_eps,
+                cond_dim=cfg.d_model,   # z_mlp output dim matches d_model
+            )
+            for _ in range(cfg.num_layers)
+        ])
         self.final_norm = nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps)
 
         # Output heads: 3 categorical (base vocab + EOS) + 5 numeric
@@ -127,17 +254,15 @@ class RouteTransformerDecoder(nn.Module):
 
     @staticmethod
     def _causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+        """Upper-triangular bool mask (True = do not attend) for causal AR."""
         mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
         return torch.triu(mask, diagonal=1)
-
-    def _build_condition_memory(self, *, z: torch.Tensor) -> torch.Tensor:
-        """Project z to a single d_model memory token for cross-attention. Returns [B, 1, d_model]."""
-        return self.z_proj(z.to(torch.float32)).unsqueeze(1)
 
     def _build_decoder_tokens(
         self, batch: dict[str, torch.Tensor], *, effective_mask_rate: float
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Embed hold tokens, add position embeddings, then either inject BOS (AR) or mask holds (masked).
+        """Embed hold tokens, add position embeddings, then either inject BOS (AR)
+        or mask holds (masked bidirectional).
 
         Returns:
             (tokens, is_masked) where is_masked is [B, L] bool in masked mode, None in AR mode.
@@ -183,11 +308,11 @@ class RouteTransformerDecoder(nn.Module):
         z: torch.Tensor,
         mask_rate: float | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Teacher-forcing forward pass.
+        """Forward pass.
 
         Args:
             batch:     tokenized decoder inputs
-            z:         latent vector [B, latent_dim] — sole conditioning signal
+            z:         latent vector [B, latent_dim] — sole conditioning signal, injected via AdaLN
             mask_rate: override cfg.mask_rate for this forward pass (used by the training loop
                        to sample a fresh rate each batch). None → use cfg.mask_rate.
         """
@@ -195,24 +320,21 @@ class RouteTransformerDecoder(nn.Module):
         padding_mask = batch["padding_mask"].bool()
         tgt, is_masked = self._build_decoder_tokens(batch, effective_mask_rate=effective_mask_rate)
 
-        memory = self._build_condition_memory(z=z)
+        # Pre-process z once; each AdaLN layer projects from this shared representation.
+        z_cond = self.z_mlp(z.to(torch.float32))  # [B, d_model]
 
+        x = tgt
         if self.cfg.mask_rate > 0.0:
-            # Bidirectional: no causal mask; every token attends to every other.
-            decoded = self.decoder(
-                tgt=tgt,
-                memory=memory,
-                tgt_key_padding_mask=padding_mask,
-            )
+            # Masked bidirectional: no causal mask — every token attends to every other.
+            for layer in self.layers:
+                x = layer(x, z_cond, key_padding_mask=padding_mask)
         else:
-            tgt_mask = self._causal_mask(tgt.shape[1], tgt.device)
-            decoded = self.decoder(
-                tgt=tgt,
-                memory=memory,
-                tgt_mask=tgt_mask,
-                tgt_key_padding_mask=padding_mask,
-            )
-        decoded = self.final_norm(decoded)
+            # Autoregressive: causal self-attention mask prevents attending to future tokens.
+            causal_mask = self._causal_mask(tgt.shape[1], tgt.device)
+            for layer in self.layers:
+                x = layer(x, z_cond, attn_mask=causal_mask, key_padding_mask=padding_mask)
+
+        decoded = self.final_norm(x)
 
         out = {
             "hidden_states": decoded,
@@ -230,4 +352,9 @@ class RouteTransformerDecoder(nn.Module):
         return out
 
 
-__all__ = ["RouteVAEDecoderConfig", "RouteTransformerDecoder"]
+__all__ = [
+    "AdaLNModulation",
+    "AdaLNTransformerLayer",
+    "RouteVAEDecoderConfig",
+    "RouteTransformerDecoder",
+]

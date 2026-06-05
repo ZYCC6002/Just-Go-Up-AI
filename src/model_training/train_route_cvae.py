@@ -279,12 +279,12 @@ def _build_model(
         )
     elif decoder_mask_rate > 0.0:
         print(
-            f"Decoder (masked bidirectional): d_model={dec_cfg.d_model} nhead={dec_cfg.nhead} "
+            f"Decoder (masked bidirectional + AdaLN): d_model={dec_cfg.d_model} nhead={dec_cfg.nhead} "
             f"layers={dec_cfg.num_layers} ffn={dec_cfg.dim_feedforward} mask_rate={dec_cfg.mask_rate}"
         )
     else:
         print(
-            f"Decoder (autoregressive): d_model={dec_cfg.d_model} nhead={dec_cfg.nhead} "
+            f"Decoder (autoregressive + AdaLN): d_model={dec_cfg.d_model} nhead={dec_cfg.nhead} "
             f"layers={dec_cfg.num_layers} ffn={dec_cfg.dim_feedforward}"
         )
     print(f"Total parameters: {total_params:,}")
