@@ -47,8 +47,30 @@ class EpochMetrics:
     pairwise_loss: float = 0.0  # unweighted pairwise distance MSE (0 when pairwise_weight=0)
 
 
-def _compute_kl_beta(*, epoch: int, target_kl_beta: float, kl_warmup_epochs: int) -> float:
-    """Linear KL annealing from 0 -> target_kl_beta over warmup epochs."""
+def _compute_kl_beta(
+    *,
+    epoch: int,
+    target_kl_beta: float,
+    kl_warmup_epochs: int,
+    kl_cycle_epochs: int = 0,
+    kl_cycle_ratio: float = 0.5,
+) -> float:
+    """Compute the KL beta for this epoch.
+
+    Cyclic annealing (kl_cycle_epochs > 0): each cycle linearly ramps beta from
+    0 → target over the first (cycle_epochs × ratio) epochs, then holds at target
+    for the remainder.  Repeats every kl_cycle_epochs epochs throughout training.
+    This forces repeated z-expansion phases where the decoder must learn to use z.
+
+    Linear warmup fallback (kl_cycle_epochs == 0): single ramp from 0 → target
+    over kl_warmup_epochs epochs, then constant.
+    """
+    if kl_cycle_epochs > 0:
+        cycle_pos = (epoch - 1) % kl_cycle_epochs   # 0-indexed within current cycle
+        ramp_len = max(1, int(kl_cycle_epochs * kl_cycle_ratio))
+        if cycle_pos < ramp_len:
+            return float(target_kl_beta) * (cycle_pos / ramp_len)
+        return float(target_kl_beta)
     if kl_warmup_epochs <= 0:
         return float(target_kl_beta)
     ratio = min(max(epoch, 0), kl_warmup_epochs) / float(kl_warmup_epochs)
@@ -171,11 +193,27 @@ def _save_loss_curve(
 
 
 def _set_decoder_self_attn_frozen(model: RouteConditionalVAE, frozen: bool) -> int:
-    """Freeze or unfreeze self-attention in every TransformerDecoderLayer.
+    """Freeze or unfreeze self-attention in every decoder layer.
 
+    Supports both the old nn.TransformerDecoder backbone (model.decoder.decoder)
+    and the new AdaLN decoder (model.decoder.layers with AdaLNTransformerLayer).
     Returns the number of affected parameters (0 for parallel decoder or any
-    decoder without a TransformerDecoder backbone).
+    decoder without identifiable self-attention layers).
     """
+    # New AdaLN decoder: model.decoder.layers is a ModuleList of AdaLNTransformerLayer
+    layers_direct = getattr(model.decoder, "layers", None)
+    if layers_direct is not None and hasattr(layers_direct, "__iter__"):
+        count = 0
+        for layer in layers_direct:
+            sa = getattr(layer, "self_attn", None)
+            if sa is not None:
+                for p in sa.parameters():
+                    p.requires_grad_(not frozen)
+                    count += p.numel()
+        if count > 0:
+            return count
+
+    # Legacy fallback: old nn.TransformerDecoder backbone (model.decoder.decoder)
     transformer = getattr(model.decoder, "decoder", None)
     if transformer is None or not hasattr(transformer, "layers"):
         return 0
@@ -628,12 +666,18 @@ def _run_epoch(
     autoregressive: bool = False,
     ss_ratio: float = 0.0,
     mask_rate_max: float | None = None,
+    mask_rate_min: float = 0.0,
 ) -> EpochMetrics:
     """Run one epoch.
 
-    mask_rate_max: when not None, sample mask_rate ~ Uniform[0, mask_rate_max) for each
-    training batch (scheduled masking for the bidirectional masked decoder).  None means
-    use the decoder's cfg.mask_rate unchanged (val/test, or fixed-rate training).
+    mask_rate_max: when not None, sample mask_rate ~ Uniform[mask_rate_min, mask_rate_max)
+    for each training batch.  None means use the decoder's cfg.mask_rate unchanged
+    (val/test, or fixed-rate training).
+
+    mask_rate_min: lower bound for the sampled training mask rate.  Default 0.0 (original
+    behaviour).  Raising this (e.g. to 0.5) removes easy low-masking batches where the
+    decoder can ignore z entirely and reconstruct from dense visible-hold context.
+    Val/test always use cfg.mask_rate regardless of this value.
     """
     is_train = optimizer is not None
     model.train(is_train)
@@ -647,7 +691,8 @@ def _run_epoch(
 
         # Sample a fresh mask rate for this batch when dynamic masking is active.
         if mask_rate_max is not None:
-            batch_mask_rate: float | None = random.uniform(0.0, mask_rate_max)
+            lo = min(mask_rate_min, mask_rate_max)  # guard against lo > hi edge case
+            batch_mask_rate: float | None = random.uniform(lo, mask_rate_max)
         else:
             batch_mask_rate = None  # use decoder's cfg.mask_rate
 
@@ -768,10 +813,17 @@ def main() -> None:
                              "otherwise this fixed rate is used for training too. Suggested: 0.5.")
     parser.add_argument("--mask-warmup-epochs", type=int, default=0,
                         help="Epochs over which the training mask-rate maximum ramps from 0 → 1. "
-                             "Each training batch samples mask_rate ~ Uniform[0, epoch/warmup_epochs). "
-                             "After warmup, samples from Uniform[0, 1) — high masking forces z use; "
-                             "low masking gives the model spatial context to refine. "
+                             "Each training batch samples mask_rate ~ Uniform[mask_rate_min, epoch/warmup_epochs). "
+                             "After warmup, samples from Uniform[mask_rate_min, 1). "
                              "Val/test always use the fixed --decoder-mask-rate. Default: 0 (fixed rate).")
+    parser.add_argument("--mask-rate-min", type=float, default=0.0,
+                        help="Minimum training mask rate when dynamic masking is active. "
+                             "Training batches sample mask_rate ~ Uniform[mask_rate_min, mask_max). "
+                             "Default 0.0 samples the full range [0, 1). "
+                             "Raising this (e.g. 0.5) removes easy low-masking batches where the "
+                             "decoder can ignore z and reconstruct from dense visible-hold context, "
+                             "forcing z to contribute on every training step. "
+                             "Val/test always use the fixed --decoder-mask-rate regardless.")
     parser.add_argument("--scheduled-sampling-ratio", type=float, default=0.0,
                         help="Target probability of replacing each decoder input token with the "
                              "model's own prediction from the previous position (scheduled sampling). "
@@ -785,7 +837,19 @@ def main() -> None:
                         help="Epochs to linearly ramp scheduled-sampling-ratio from 0 to its target. "
                              "Defaults to --kl-warmup-epochs if not set.")
     parser.add_argument("--kl-warmup-epochs", type=int, default=None,
-                        help="Linear KL warmup epochs. Defaults to 40%% of total epochs.")
+                        help="Linear KL warmup epochs. Defaults to 40%% of total epochs. "
+                             "Ignored when --kl-cycle-epochs > 0.")
+    parser.add_argument("--kl-cycle-epochs", type=int, default=0,
+                        help="Cyclic KL annealing: cycle length in epochs.  Each cycle linearly "
+                             "ramps beta 0 → kl-beta over (kl-cycle-epochs × kl-cycle-ratio) "
+                             "epochs, then holds at kl-beta for the rest.  Repeats throughout "
+                             "training, giving repeated z-expansion phases where the decoder is "
+                             "forced to learn z-dependent pathways before KL pressure compresses z. "
+                             "When > 0, overrides --kl-warmup-epochs.  Default 0 (disabled).")
+    parser.add_argument("--kl-cycle-ratio", type=float, default=0.5,
+                        help="Fraction of each cycle spent ramping beta 0 → max.  "
+                             "E.g. 0.5 with --kl-cycle-epochs 60 → 30 ramp + 30 plateau per cycle.  "
+                             "Default 0.5.")
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint-path", type=str, default=str(PROJECT_ROOT / "data/route_cvae.pt"))
@@ -938,7 +1002,8 @@ def main() -> None:
                 print(f"Epoch {epoch:03d}: self-attention unfrozen ({n:,} params).")
 
         kl_beta = _compute_kl_beta(
-            epoch=epoch, target_kl_beta=args.kl_beta, kl_warmup_epochs=args.kl_warmup_epochs
+            epoch=epoch, target_kl_beta=args.kl_beta, kl_warmup_epochs=args.kl_warmup_epochs,
+            kl_cycle_epochs=args.kl_cycle_epochs, kl_cycle_ratio=args.kl_cycle_ratio,
         )
         ss_ratio = _compute_ss_ratio(
             epoch=epoch,
@@ -964,6 +1029,7 @@ def main() -> None:
             hole_loss_weight=args.hole_loss_weight,
             ss_ratio=ss_ratio,
             mask_rate_max=train_mask_max,
+            mask_rate_min=args.mask_rate_min,
         )
         with torch.no_grad():
             val_m = _run_epoch(
@@ -998,7 +1064,7 @@ def main() -> None:
         )
         ss_str = f" ss={ss_ratio:.3f}" if args.scheduled_sampling_ratio > 0.0 else ""
         mask_str = (
-            f" mask_max={train_mask_max:.2f}"
+            f" mask=[{args.mask_rate_min:.2f},{train_mask_max:.2f})"
             if train_mask_max is not None else ""
         )
         print(
