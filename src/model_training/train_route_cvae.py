@@ -296,6 +296,8 @@ def _load_or_build_samples_and_vocabs(args: argparse.Namespace) -> tuple[list[An
         "require_full_metadata": args.require_full_metadata,
         "max_routes": args.max_routes,
         "min_holds": args.min_holds,
+        "min_quality_average": args.min_quality_average,
+        "min_ascensionist_count": args.min_ascensionist_count,
     }
 
     if cache_path.exists() and not args.rebuild_cache:
@@ -312,6 +314,8 @@ def _load_or_build_samples_and_vocabs(args: argparse.Namespace) -> tuple[list[An
         metadata_product_id=args.metadata_product_id,
         max_routes=args.max_routes,
         min_holds=args.min_holds,
+        min_quality_average=args.min_quality_average,
+        min_ascensionist_count=args.min_ascensionist_count,
     )
     torch.save({"cache_key": cache_key, "samples": samples, "vocabs": vocabs}, cache_path)
     print(f"Saved preprocessed dataset cache: {cache_path}")
@@ -657,6 +661,10 @@ def main() -> None:
     parser.add_argument("--require-full-metadata", action="store_true")
     parser.add_argument("--max-routes", type=int, default=1000000)
     parser.add_argument("--min-holds", type=int, default=1)
+    parser.add_argument("--min-quality-average", type=float, default=2.5,
+                        help="Minimum quality_average (0–4 scale) to include a route. Default 2.5.")
+    parser.add_argument("--min-ascensionist-count", type=int, default=15,
+                        help="Minimum number of ascents to include a route. Default 15.")
     parser.add_argument("--cache-path", type=str, default=str(PROJECT_ROOT / "data/preprocessed_routes_cache.pt"))
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--epochs", type=int, default=10)
