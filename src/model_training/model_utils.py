@@ -263,6 +263,9 @@ def build_model_from_checkpoint(
     )
     enc_cfg.use_absolute_pos = bool(ckpt_args.get("use_absolute_pos", True))
     enc_cfg.use_type_feature = bool(ckpt_args.get("use_type_feature", True))
+    enc_cfg.use_cls_token = bool(ckpt_args.get("encoder_use_cls_token", False))
+    if enc_cfg.use_cls_token:
+        enc_cfg.shape_desc_dim = int(ckpt_args.get("shape_desc_dim", 9))
 
     latent_dim = int(
         latent_dim_override if latent_dim_override is not None

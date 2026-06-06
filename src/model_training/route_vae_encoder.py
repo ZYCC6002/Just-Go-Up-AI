@@ -37,6 +37,14 @@ class RouteVAEEncoderConfig:
     use_absolute_pos: bool = True   # if False, x/y sinusoidal embeddings are dropped
     use_type_feature: bool = True   # if False, hold-type embedding is dropped
 
+    # CLS token: prepend a route-level summary token (shape_desc → MLP → d_model) at
+    # position 0.  All hold tokens attend to/from this token so every layer has access
+    # to the global route descriptor.  CLS is excluded from pooling; only hold-token
+    # outputs contribute to the route_embedding / z.
+    # Requires "shape_desc" in the collated batch (always present when built from cache).
+    use_cls_token: bool = False
+    shape_desc_dim: int = 9        # shape_desc width; ignored when use_cls_token=False
+
     # Transformer sizes
     d_model: int = 256
     nhead: int = 8
@@ -98,6 +106,15 @@ class RouteTransformerEncoder(nn.Module):
         # Mean+max pooling: concat mean and max over hold tokens → Linear(2*d_model, d_model).
         self.pool_proj = nn.Linear(2 * cfg.d_model, cfg.d_model)
 
+        if cfg.use_cls_token:
+            self.shape_token_mlp: nn.Sequential | None = nn.Sequential(
+                nn.Linear(cfg.shape_desc_dim, cfg.d_model),
+                nn.GELU(),
+                nn.LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps),
+            )
+        else:
+            self.shape_token_mlp = None
+
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Encode hold-token sequences.
 
@@ -110,22 +127,33 @@ class RouteTransformerEncoder(nn.Module):
         padding_mask = batch["padding_mask"].bool()   # [B, L]
         tokens = self.hold_embedder.embed(batch)       # [B, L, d_model]
         # Zero out padding positions before they enter the transformer.
-        # Without this, pad tokens carry real-looking embeddings (type=0 → jug,
-        # x=0 → near board origin) and flow through all layers as fake holds.
         tokens = tokens.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
-        encoded = self.encoder(tokens, src_key_padding_mask=padding_mask)  # [B, L, d_model]
+        if self.shape_token_mlp is not None:
+            shape_token = self.shape_token_mlp(
+                batch["shape_desc"].to(torch.float32)
+            ).unsqueeze(1)                                                  # [B, 1, d_model]
+            tokens = torch.cat([shape_token, tokens], dim=1)               # [B, L+1, d_model]
+            cls_pad = torch.zeros(
+                tokens.shape[0], 1, dtype=torch.bool, device=padding_mask.device
+            )
+            attn_mask = torch.cat([cls_pad, padding_mask], dim=1)          # [B, L+1]
+        else:
+            attn_mask = padding_mask
+
+        encoded = self.encoder(tokens, src_key_padding_mask=attn_mask)     # [B, L(+1), d_model]
         encoded = self.final_norm(encoded)
 
-        # Route embedding: mean+max pool over non-padded hold tokens.
-        valid = (~padding_mask).unsqueeze(-1).to(encoded.dtype)            # [B, L, 1]
-        mean_pooled = (encoded * valid).sum(1) / valid.sum(1).clamp(min=1.0)
-        max_pooled = encoded.masked_fill(
+        # Route embedding: mean+max pool over hold tokens only (exclude CLS at position 0).
+        hold_enc = encoded[:, 1:, :] if self.shape_token_mlp is not None else encoded
+        valid = (~padding_mask).unsqueeze(-1).to(hold_enc.dtype)           # [B, L, 1]
+        mean_pooled = (hold_enc * valid).sum(1) / valid.sum(1).clamp(min=1.0)
+        max_pooled = hold_enc.masked_fill(
             padding_mask.unsqueeze(-1), float("-inf")
         ).max(dim=1).values
         route_embedding = self.pool_proj(torch.cat([mean_pooled, max_pooled], dim=-1))
 
-        return {"token_embeddings": encoded, "route_embedding": route_embedding}
+        return {"token_embeddings": hold_enc, "route_embedding": route_embedding}
 
 
 def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
@@ -159,6 +187,10 @@ def collate_hold_token_batch(samples: list[dict[str, Any]]) -> dict[str, torch.T
     for i, length in enumerate(lengths):
         padding_mask[i, :length] = False
     batch["padding_mask"] = padding_mask
+
+    # shape_desc is per-sample (not per-hold) — stack without padding.
+    if "shape_desc" in samples[0]:
+        batch["shape_desc"] = torch.stack([s["shape_desc"] for s in samples], dim=0)
 
     # Cast types
     for key in CATEGORICAL_KEYS:

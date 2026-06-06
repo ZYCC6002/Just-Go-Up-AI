@@ -241,6 +241,8 @@ def _build_model(
     decoder_dim_feedforward: int,
     use_absolute_pos: bool = True,
     use_type_feature: bool = True,
+    use_cls_token: bool = False,
+    shape_desc_dim: int = 9,
     decoder_token_dropout: float = 0.0,
     decoder_mask_rate: float = 0.0,
     use_parallel_decoder: bool = False,
@@ -258,6 +260,9 @@ def _build_model(
     )
     enc_cfg.use_absolute_pos = use_absolute_pos
     enc_cfg.use_type_feature = use_type_feature
+    enc_cfg.use_cls_token = use_cls_token
+    if use_cls_token:
+        enc_cfg.shape_desc_dim = shape_desc_dim
 
     bottleneck_cfg = RouteVAEBottleneckConfig(
         encoder_embedding_dim=enc_cfg.d_model,
@@ -765,6 +770,12 @@ def main() -> None:
         help="Include hold-type categorical embedding and type fractions in shape_desc. "
              "Set --no-use-type-feature to ablate (forces z to encode geometry, not hold type).",
     )
+    parser.add_argument(
+        "--encoder-use-cls-token", action=argparse.BooleanOptionalAction, default=False,
+        help="Prepend a CLS token (shape_desc → MLP → d_model) at position 0 of the encoder "
+             "sequence.  All hold tokens attend to this global route summary at every layer. "
+             "CLS is excluded from pooling.  shape_desc_dim is auto-detected from the cache.",
+    )
     # Encoder architecture (saved in checkpoint — must be restored exactly for resume/inference)
     parser.add_argument("--encoder-d-model", type=int, default=256,
                         help="Encoder transformer model dimension. Must be divisible by --encoder-nhead.")
@@ -900,6 +911,11 @@ def main() -> None:
     )
     print(f"Routes: total={len(samples)} train={len(train_samples)} val={len(val_samples)} test={len(test_samples)}")
 
+    shape_desc_dim = 9
+    if args.encoder_use_cls_token:
+        shape_desc_dim = int(samples[0].tokens["shape_desc"].shape[0])
+        print(f"shape_desc_dim={shape_desc_dim} (auto-detected from cache)")
+
     model, eos_ids = _build_model(
         vocabs, device,
         latent_dim=args.latent_dim,
@@ -912,6 +928,8 @@ def main() -> None:
         decoder_dim_feedforward=args.decoder_dim_feedforward,
         use_absolute_pos=args.use_absolute_pos,
         use_type_feature=args.use_type_feature,
+        use_cls_token=args.encoder_use_cls_token,
+        shape_desc_dim=shape_desc_dim,
         decoder_token_dropout=args.decoder_token_dropout,
         decoder_mask_rate=args.decoder_mask_rate,
         use_parallel_decoder=args.parallel_decoder,
