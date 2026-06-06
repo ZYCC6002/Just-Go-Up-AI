@@ -302,6 +302,7 @@ class RouteTransformerDecoder(nn.Module):
         if self.training and self.cfg.token_dropout > 0.0:
             mask_emb = self.mask_token.view(1, 1, -1).expand_as(hold_tokens)
             drop = torch.rand(batch_size, hold_tokens.shape[1], device=tokens.device) < self.cfg.token_dropout
+            drop = drop & ~padding_mask[:, 1:]
             hold_tokens = torch.where(drop.unsqueeze(-1), mask_emb, hold_tokens)
             tokens = torch.cat([tokens[:, :1, :], hold_tokens], dim=1)
 
