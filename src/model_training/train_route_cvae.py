@@ -241,7 +241,6 @@ def _build_model(
     decoder_dim_feedforward: int,
     use_absolute_pos: bool = True,
     use_type_feature: bool = True,
-    shape_desc_dim: int = 9,
     decoder_token_dropout: float = 0.0,
     decoder_mask_rate: float = 0.0,
     use_parallel_decoder: bool = False,
@@ -259,7 +258,6 @@ def _build_model(
     )
     enc_cfg.use_absolute_pos = use_absolute_pos
     enc_cfg.use_type_feature = use_type_feature
-    enc_cfg.shape_desc_dim = shape_desc_dim
 
     bottleneck_cfg = RouteVAEBottleneckConfig(
         encoder_embedding_dim=enc_cfg.d_model,
@@ -902,12 +900,6 @@ def main() -> None:
     )
     print(f"Routes: total={len(samples)} train={len(train_samples)} val={len(val_samples)} test={len(test_samples)}")
 
-    # Auto-detect shape_desc_dim from data so the model always matches the cache.
-    shape_desc_dim = int(samples[0].tokens["shape_desc"].shape[0])
-    print(f"shape_desc_dim={shape_desc_dim} (auto-detected from cache)")
-    # Save back so it is persisted in the checkpoint args.
-    args.shape_desc_dim = shape_desc_dim
-
     model, eos_ids = _build_model(
         vocabs, device,
         latent_dim=args.latent_dim,
@@ -920,7 +912,6 @@ def main() -> None:
         decoder_dim_feedforward=args.decoder_dim_feedforward,
         use_absolute_pos=args.use_absolute_pos,
         use_type_feature=args.use_type_feature,
-        shape_desc_dim=shape_desc_dim,
         decoder_token_dropout=args.decoder_token_dropout,
         decoder_mask_rate=args.decoder_mask_rate,
         use_parallel_decoder=args.parallel_decoder,

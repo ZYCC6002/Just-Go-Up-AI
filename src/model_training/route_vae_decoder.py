@@ -273,13 +273,19 @@ class RouteTransformerDecoder(nn.Module):
         if seq_len > self.cfg.max_seq_len:
             raise ValueError(f"Sequence length {seq_len} exceeds max_seq_len={self.cfg.max_seq_len}.")
 
+        padding_mask = batch["padding_mask"].bool()  # [B, L], True = padding
+
         positions = torch.arange(seq_len, device=tokens.device).unsqueeze(0).expand(batch_size, seq_len)
         tokens = tokens + self.sequence_position_embedding(positions)
+        # Zero out padding positions after embedding + positional encoding.
+        # Padding slots would otherwise carry type=0/x=0 embeddings that look like
+        # real holds near the board origin; key_padding_mask blocks their attention
+        # contribution, but zero-vectors are inert regardless of mask propagation.
+        tokens = tokens.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
         if self.cfg.mask_rate > 0.0:
             # Masked bidirectional mode. effective_mask_rate may differ from cfg.mask_rate
             # when the training loop samples dynamically; cfg.mask_rate is the eval fallback.
-            padding_mask = batch["padding_mask"].bool()
             rng = torch.rand(batch_size, seq_len, device=tokens.device)
             is_masked = (rng < effective_mask_rate) & ~padding_mask
             if effective_mask_rate > 0.0:
