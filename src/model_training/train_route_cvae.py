@@ -32,7 +32,7 @@ from model_training.route_vae_bottleneck import (
     kl_divergence_loss,
 )
 from model_training.route_vae_decoder import RouteTransformerDecoder, RouteVAEDecoderConfig
-from model_training.route_vae_encoder import RouteTransformerEncoder
+from model_training.route_vae_encoder import RouteTransformerEncoder, RouteMlpEncoderConfig, RouteMlpEncoder
 from model_training.route_vae_parallel_decoder import RouteParallelDecoder, RouteVAEParallelDecoderConfig
 from model_training.training_utils import DecoderEOSIds, masked_mse, prepare_cvae_training_batch
 
@@ -243,38 +243,63 @@ def _build_model(
     use_type_feature: bool = True,
     use_cls_token: bool = False,
     shape_desc_dim: int = 9,
+    use_mlp_encoder: bool = False,
     decoder_token_dropout: float = 0.0,
     decoder_mask_rate: float = 0.0,
     use_parallel_decoder: bool = False,
 ) -> tuple[RouteConditionalVAE, DecoderEOSIds]:
-    if encoder_d_model % encoder_nhead != 0:
-        raise ValueError(
-            f"--encoder-d-model ({encoder_d_model}) must be divisible by --encoder-nhead ({encoder_nhead})"
+    # --- Build encoder ---
+    if use_mlp_encoder:
+        mlp_enc_cfg = RouteMlpEncoderConfig(
+            shape_desc_dim=shape_desc_dim,
+            d_model=encoder_d_model,
+            num_layers=encoder_num_layers,
         )
-
-    enc_cfg = vocabs.to_transformer_config(
-        d_model=encoder_d_model,
-        nhead=encoder_nhead,
-        num_layers=encoder_num_layers,
-        dim_feedforward=encoder_dim_feedforward,
-    )
-    enc_cfg.use_absolute_pos = use_absolute_pos
-    enc_cfg.use_type_feature = use_type_feature
-    enc_cfg.use_cls_token = use_cls_token
-    if use_cls_token:
-        enc_cfg.shape_desc_dim = shape_desc_dim
+        encoder: RouteTransformerEncoder | RouteMlpEncoder = RouteMlpEncoder(mlp_enc_cfg)
+        enc_d_model = encoder_d_model
+        # Vocab sizes still needed for decoder heads; borrow from vocabs.
+        _vcfg = vocabs.to_transformer_config(d_model=encoder_d_model, nhead=8,
+                                              num_layers=1, dim_feedforward=256)
+        type_vocab_size   = _vcfg.type_vocab_size
+        role_vocab_size   = _vcfg.role_vocab_size
+        hole_id_vocab_size = _vcfg.hole_id_vocab_size
+        x_min, x_max = _vcfg.x_min, _vcfg.x_max
+        y_min, y_max = _vcfg.y_min, _vcfg.y_max
+    else:
+        if encoder_d_model % encoder_nhead != 0:
+            raise ValueError(
+                f"--encoder-d-model ({encoder_d_model}) must be divisible by --encoder-nhead ({encoder_nhead})"
+            )
+        enc_cfg = vocabs.to_transformer_config(
+            d_model=encoder_d_model,
+            nhead=encoder_nhead,
+            num_layers=encoder_num_layers,
+            dim_feedforward=encoder_dim_feedforward,
+        )
+        enc_cfg.use_absolute_pos = use_absolute_pos
+        enc_cfg.use_type_feature = use_type_feature
+        enc_cfg.use_cls_token = use_cls_token
+        if use_cls_token:
+            enc_cfg.shape_desc_dim = shape_desc_dim
+        encoder = RouteTransformerEncoder(enc_cfg)
+        enc_d_model        = enc_cfg.d_model
+        type_vocab_size    = enc_cfg.type_vocab_size
+        role_vocab_size    = enc_cfg.role_vocab_size
+        hole_id_vocab_size = enc_cfg.hole_id_vocab_size
+        x_min, x_max = enc_cfg.x_min, enc_cfg.x_max
+        y_min, y_max = enc_cfg.y_min, enc_cfg.y_max
 
     bottleneck_cfg = RouteVAEBottleneckConfig(
-        encoder_embedding_dim=enc_cfg.d_model,
+        encoder_embedding_dim=enc_d_model,
         latent_dim=latent_dim,
-        hidden_dim=enc_cfg.d_model,  # match encoder output dim (default 128 would silently compress)
+        hidden_dim=enc_d_model,
     )
 
     if use_parallel_decoder:
         dec_cfg: RouteVAEParallelDecoderConfig | RouteVAEDecoderConfig = RouteVAEParallelDecoderConfig(
-            type_vocab_size=enc_cfg.type_vocab_size,
-            role_vocab_size=enc_cfg.role_vocab_size,
-            hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
+            type_vocab_size=type_vocab_size,
+            role_vocab_size=role_vocab_size,
+            hole_id_vocab_size=hole_id_vocab_size,
             latent_dim=latent_dim,
             d_model=decoder_d_model,
             mlp_depth=decoder_num_layers,
@@ -284,9 +309,9 @@ def _build_model(
         if decoder_d_model % 8 != 0:
             raise ValueError(f"--decoder-d-model ({decoder_d_model}) must be divisible by nhead=8")
         dec_cfg = RouteVAEDecoderConfig(
-            type_vocab_size=enc_cfg.type_vocab_size,
-            role_vocab_size=enc_cfg.role_vocab_size,
-            hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
+            type_vocab_size=type_vocab_size,
+            role_vocab_size=role_vocab_size,
+            hole_id_vocab_size=hole_id_vocab_size,
             latent_dim=latent_dim,
             d_model=decoder_d_model,
             num_layers=decoder_num_layers,
@@ -295,24 +320,28 @@ def _build_model(
             use_type_feature=use_type_feature,
             token_dropout=decoder_token_dropout,
             mask_rate=decoder_mask_rate,
-            x_min=enc_cfg.x_min,
-            x_max=enc_cfg.x_max,
-            y_min=enc_cfg.y_min,
-            y_max=enc_cfg.y_max,
+            x_min=x_min, x_max=x_max,
+            y_min=y_min, y_max=y_max,
         )
         decoder = RouteTransformerDecoder(dec_cfg)
 
     model = RouteConditionalVAE(
-        encoder=RouteTransformerEncoder(enc_cfg),
+        encoder=encoder,
         bottleneck=RouteVAEBottleneck(bottleneck_cfg),
         decoder=decoder,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(
-        f"Encoder: d_model={enc_cfg.d_model} nhead={enc_cfg.nhead} "
-        f"layers={enc_cfg.num_layers} ffn={enc_cfg.dim_feedforward}"
-    )
+    if use_mlp_encoder:
+        print(
+            f"Encoder (MLP baseline): shape_desc_dim={mlp_enc_cfg.shape_desc_dim} "
+            f"d_model={mlp_enc_cfg.d_model} layers={mlp_enc_cfg.num_layers}"
+        )
+    else:
+        print(
+            f"Encoder: d_model={enc_cfg.d_model} nhead={enc_cfg.nhead} "
+            f"layers={enc_cfg.num_layers} ffn={enc_cfg.dim_feedforward}"
+        )
     if use_parallel_decoder:
         print(
             f"Decoder (parallel MLP): d_model={dec_cfg.d_model} "
@@ -771,6 +800,13 @@ def main() -> None:
              "Set --no-use-type-feature to ablate (forces z to encode geometry, not hold type).",
     )
     parser.add_argument(
+        "--mlp-encoder", action=argparse.BooleanOptionalAction, default=False,
+        help="Replace the transformer encoder with a shallow MLP that maps shape_desc directly "
+             "to route_embedding.  Baseline to measure reconstruction loss achievable from "
+             "hand-crafted route statistics alone.  Reuses --encoder-d-model and "
+             "--encoder-num-layers for MLP width/depth; all other encoder args are ignored.",
+    )
+    parser.add_argument(
         "--encoder-use-cls-token", action=argparse.BooleanOptionalAction, default=False,
         help="Prepend a CLS token (shape_desc → MLP → d_model) at position 0 of the encoder "
              "sequence.  All hold tokens attend to this global route summary at every layer. "
@@ -912,7 +948,7 @@ def main() -> None:
     print(f"Routes: total={len(samples)} train={len(train_samples)} val={len(val_samples)} test={len(test_samples)}")
 
     shape_desc_dim = 9
-    if args.encoder_use_cls_token:
+    if args.encoder_use_cls_token or args.mlp_encoder:
         shape_desc_dim = int(samples[0].tokens["shape_desc"].shape[0])
         print(f"shape_desc_dim={shape_desc_dim} (auto-detected from cache)")
 
@@ -930,6 +966,7 @@ def main() -> None:
         use_type_feature=args.use_type_feature,
         use_cls_token=args.encoder_use_cls_token,
         shape_desc_dim=shape_desc_dim,
+        use_mlp_encoder=args.mlp_encoder,
         decoder_token_dropout=args.decoder_token_dropout,
         decoder_mask_rate=args.decoder_mask_rate,
         use_parallel_decoder=args.parallel_decoder,

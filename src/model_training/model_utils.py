@@ -239,7 +239,7 @@ def build_model_from_checkpoint(
       2. Runtime ``vocabs`` argument — used for old checkpoints that predate the
          embedded-vocabs change, and during training itself (before the first save).
     """
-    from .route_vae_encoder import RouteTransformerEncoder
+    from .route_vae_encoder import RouteTransformerEncoder, RouteMlpEncoderConfig, RouteMlpEncoder
     from .route_vae_decoder import RouteTransformerDecoder, RouteVAEDecoderConfig
     from .route_vae_parallel_decoder import RouteParallelDecoder, RouteVAEParallelDecoderConfig
     from .route_vae_bottleneck import RouteConditionalVAE, RouteVAEBottleneck, RouteVAEBottleneckConfig
@@ -255,24 +255,57 @@ def build_model_from_checkpoint(
     if ckpt_vocabs is not None and ckpt_vocabs is not vocabs:
         print("build_model_from_checkpoint: using checkpoint-embedded vocabs.")
 
-    enc_cfg = effective_vocabs.to_transformer_config(
-        d_model=int(ckpt_args.get("encoder_d_model", 256)),
-        nhead=int(ckpt_args.get("encoder_nhead", 8)),
-        num_layers=int(ckpt_args.get("encoder_num_layers", 6)),
-        dim_feedforward=int(ckpt_args.get("encoder_dim_feedforward", 1024)),
-    )
-    enc_cfg.use_absolute_pos = bool(ckpt_args.get("use_absolute_pos", True))
-    enc_cfg.use_type_feature = bool(ckpt_args.get("use_type_feature", True))
-    enc_cfg.use_cls_token = bool(ckpt_args.get("encoder_use_cls_token", False))
-    if enc_cfg.use_cls_token:
-        enc_cfg.shape_desc_dim = int(ckpt_args.get("shape_desc_dim", 9))
+    use_mlp_encoder = bool(ckpt_args.get("mlp_encoder", False))
+    encoder_d_model = int(ckpt_args.get("encoder_d_model", 256))
+
+    if use_mlp_encoder:
+        shape_desc_dim = int(ckpt_args.get("shape_desc_dim", 9))
+        mlp_enc_cfg = RouteMlpEncoderConfig(
+            shape_desc_dim=shape_desc_dim,
+            d_model=encoder_d_model,
+            num_layers=int(ckpt_args.get("encoder_num_layers", 3)),
+        )
+        encoder: RouteTransformerEncoder | RouteMlpEncoder = RouteMlpEncoder(mlp_enc_cfg)
+        enc_d_model = encoder_d_model
+        # Still need vocab sizes for the decoder; use a throw-away config.
+        _vcfg = effective_vocabs.to_transformer_config(
+            d_model=encoder_d_model, nhead=8, num_layers=1, dim_feedforward=256
+        )
+        type_vocab_size    = _vcfg.type_vocab_size
+        role_vocab_size    = _vcfg.role_vocab_size
+        hole_id_vocab_size = _vcfg.hole_id_vocab_size
+        x_min, x_max = _vcfg.x_min, _vcfg.x_max
+        y_min, y_max = _vcfg.y_min, _vcfg.y_max
+        use_absolute_pos = bool(ckpt_args.get("use_absolute_pos", True))
+        use_type_feature = bool(ckpt_args.get("use_type_feature", True))
+    else:
+        enc_cfg = effective_vocabs.to_transformer_config(
+            d_model=encoder_d_model,
+            nhead=int(ckpt_args.get("encoder_nhead", 8)),
+            num_layers=int(ckpt_args.get("encoder_num_layers", 6)),
+            dim_feedforward=int(ckpt_args.get("encoder_dim_feedforward", 1024)),
+        )
+        enc_cfg.use_absolute_pos = bool(ckpt_args.get("use_absolute_pos", True))
+        enc_cfg.use_type_feature = bool(ckpt_args.get("use_type_feature", True))
+        enc_cfg.use_cls_token = bool(ckpt_args.get("encoder_use_cls_token", False))
+        if enc_cfg.use_cls_token:
+            enc_cfg.shape_desc_dim = int(ckpt_args.get("shape_desc_dim", 9))
+        encoder = RouteTransformerEncoder(enc_cfg)
+        enc_d_model        = enc_cfg.d_model
+        type_vocab_size    = enc_cfg.type_vocab_size
+        role_vocab_size    = enc_cfg.role_vocab_size
+        hole_id_vocab_size = enc_cfg.hole_id_vocab_size
+        x_min, x_max = enc_cfg.x_min, enc_cfg.x_max
+        y_min, y_max = enc_cfg.y_min, enc_cfg.y_max
+        use_absolute_pos = enc_cfg.use_absolute_pos
+        use_type_feature = enc_cfg.use_type_feature
 
     latent_dim = int(
         latent_dim_override if latent_dim_override is not None
         else ckpt_args.get("latent_dim", 32)
     )
     bottleneck_cfg = RouteVAEBottleneckConfig(
-        encoder_embedding_dim=enc_cfg.d_model,
+        encoder_embedding_dim=enc_d_model,
         latent_dim=latent_dim,
         hidden_dim=int(ckpt_args.get("encoder_d_model", enc_cfg.d_model)),
     )
@@ -280,9 +313,9 @@ def build_model_from_checkpoint(
     use_parallel = bool(ckpt_args.get("parallel_decoder", False))
     if use_parallel:
         dec_cfg: RouteVAEParallelDecoderConfig | RouteVAEDecoderConfig = RouteVAEParallelDecoderConfig(
-            type_vocab_size=enc_cfg.type_vocab_size,
-            role_vocab_size=enc_cfg.role_vocab_size,
-            hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
+            type_vocab_size=type_vocab_size,
+            role_vocab_size=role_vocab_size,
+            hole_id_vocab_size=hole_id_vocab_size,
             latent_dim=latent_dim,
             d_model=int(ckpt_args.get("decoder_d_model", 128)),
             mlp_depth=int(ckpt_args.get("decoder_num_layers", 2)),
@@ -290,27 +323,25 @@ def build_model_from_checkpoint(
         decoder: RouteParallelDecoder | RouteTransformerDecoder = RouteParallelDecoder(dec_cfg)
     else:
         dec_cfg = RouteVAEDecoderConfig(
-            type_vocab_size=enc_cfg.type_vocab_size,
-            role_vocab_size=enc_cfg.role_vocab_size,
-            hole_id_vocab_size=enc_cfg.hole_id_vocab_size,
+            type_vocab_size=type_vocab_size,
+            role_vocab_size=role_vocab_size,
+            hole_id_vocab_size=hole_id_vocab_size,
             latent_dim=latent_dim,
             d_model=int(ckpt_args.get("decoder_d_model", 128)),
             num_layers=int(ckpt_args.get("decoder_num_layers", 4)),
             dim_feedforward=int(ckpt_args.get("decoder_dim_feedforward", 512)),
             type_embed_dim=int(ckpt_args.get("type_embed_dim", 32)),
-            use_absolute_pos=enc_cfg.use_absolute_pos,
-            use_type_feature=enc_cfg.use_type_feature,
+            use_absolute_pos=use_absolute_pos,
+            use_type_feature=use_type_feature,
             token_dropout=float(ckpt_args.get("decoder_token_dropout", 0.0)),
             mask_rate=float(ckpt_args.get("decoder_mask_rate", 0.0)),
-            x_min=enc_cfg.x_min,
-            x_max=enc_cfg.x_max,
-            y_min=enc_cfg.y_min,
-            y_max=enc_cfg.y_max,
+            x_min=x_min, x_max=x_max,
+            y_min=y_min, y_max=y_max,
         )
         decoder = RouteTransformerDecoder(dec_cfg)
 
     model = RouteConditionalVAE(
-        encoder=RouteTransformerEncoder(enc_cfg),
+        encoder=encoder,
         bottleneck=RouteVAEBottleneck(bottleneck_cfg),
         decoder=decoder,
     ).to(device)
