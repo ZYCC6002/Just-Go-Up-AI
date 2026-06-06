@@ -52,6 +52,7 @@ def _compute_kl_beta(
     epoch: int,
     target_kl_beta: float,
     kl_warmup_epochs: int,
+    kl_warmup_offset: int = 0,
     kl_cycle_epochs: int = 0,
     kl_cycle_ratio: float = 0.5,
 ) -> float:
@@ -62,8 +63,9 @@ def _compute_kl_beta(
     for the remainder.  Repeats every kl_cycle_epochs epochs throughout training.
     This forces repeated z-expansion phases where the decoder must learn to use z.
 
-    Linear warmup fallback (kl_cycle_epochs == 0): single ramp from 0 → target
-    over kl_warmup_epochs epochs, then constant.
+    Linear warmup fallback (kl_cycle_epochs == 0): kl_beta stays at 0 for the
+    first kl_warmup_offset epochs, then ramps linearly from 0 → target over the
+    next kl_warmup_epochs epochs, then holds at target.
     """
     if kl_cycle_epochs > 0:
         cycle_pos = (epoch - 1) % kl_cycle_epochs   # 0-indexed within current cycle
@@ -71,9 +73,12 @@ def _compute_kl_beta(
         if cycle_pos < ramp_len:
             return float(target_kl_beta) * (cycle_pos / ramp_len)
         return float(target_kl_beta)
+    if epoch <= kl_warmup_offset:
+        return 0.0
     if kl_warmup_epochs <= 0:
         return float(target_kl_beta)
-    ratio = min(max(epoch, 0), kl_warmup_epochs) / float(kl_warmup_epochs)
+    ramp_epoch = epoch - kl_warmup_offset
+    ratio = min(max(ramp_epoch, 0), kl_warmup_epochs) / float(kl_warmup_epochs)
     return float(target_kl_beta) * ratio
 
 
@@ -884,6 +889,10 @@ def main() -> None:
     parser.add_argument("--kl-warmup-epochs", type=int, default=None,
                         help="Linear KL warmup epochs. Defaults to 40%% of total epochs. "
                              "Ignored when --kl-cycle-epochs > 0.")
+    parser.add_argument("--kl-warmup-offset", type=int, default=0,
+                        help="Epochs to hold kl_beta=0 before the linear warmup ramp begins. "
+                             "Useful for letting the model converge as an autoencoder first. "
+                             "Checkpoints are only saved after offset + warmup epochs. Default 0.")
     parser.add_argument("--kl-cycle-epochs", type=int, default=0,
                         help="Cyclic KL annealing: cycle length in epochs.  Each cycle linearly "
                              "ramps beta 0 → kl-beta over (kl-cycle-epochs × kl-cycle-ratio) "
@@ -1011,6 +1020,16 @@ def main() -> None:
         best_val = float(resume_ckpt.get("best_val", math.inf))
         print(f"Resumed from {resume_path} (next_epoch={start_epoch}, best_val={best_val:.4f})")
 
+    # When kl_warmup_epochs > 0 the best-of-warmup model is essentially a kl_beta≈0
+    # autoencoder whose total loss will always beat any post-warmup model.  Track
+    # warmup completion so we reset best_val at the boundary and only save checkpoints
+    # from the post-warmup regime.  If resuming past the boundary, treat as complete
+    # immediately so best_val from the checkpoint carries over normally.
+    warmup_completed: bool = (
+        (args.kl_warmup_epochs <= 0 and args.kl_warmup_offset <= 0)
+        or start_epoch > args.kl_warmup_offset + args.kl_warmup_epochs
+    )
+
     # Self-attention freeze: disabled by default (freeze_self_attn_epochs=0).
     # When enabled, self-attention weights start frozen so the decoder cannot
     # aggregate visible-hold context, forcing early z utilisation.  After the
@@ -1049,6 +1068,7 @@ def main() -> None:
 
         kl_beta = _compute_kl_beta(
             epoch=epoch, target_kl_beta=args.kl_beta, kl_warmup_epochs=args.kl_warmup_epochs,
+            kl_warmup_offset=args.kl_warmup_offset,
             kl_cycle_epochs=args.kl_cycle_epochs, kl_cycle_ratio=args.kl_cycle_ratio,
         )
         ss_ratio = _compute_ss_ratio(
@@ -1131,9 +1151,21 @@ def main() -> None:
         train_kl_history.append(train_kl_w)
         val_kl_history.append(val_kl_w)
 
+        # Only save checkpoints after KL warmup completes.  Reset best_val at the boundary
+        # so post-warmup epochs compete on their own terms (not against the near-zero-KL
+        # autoencoder loss from early warmup epochs).
+        is_post_warmup = (
+            (args.kl_warmup_epochs <= 0 and args.kl_warmup_offset <= 0)
+            or epoch > args.kl_warmup_offset + args.kl_warmup_epochs
+        )
+        if is_post_warmup and not warmup_completed:
+            warmup_completed = True
+            best_val = math.inf
+            print(f"Epoch {epoch:03d}: KL warmup complete — tracking best post-warmup checkpoint.")
+
         # val_m.total_loss = recon + kl_w + floor_pen (adversary excluded at compute time).
         # This is the right checkpoint criterion: lower = better reconstruction and more active dims.
-        if val_m.total_loss < best_val:
+        if is_post_warmup and val_m.total_loss < best_val:
             best_val = val_m.total_loss
             checkpoint = {
                 "epoch": epoch,
