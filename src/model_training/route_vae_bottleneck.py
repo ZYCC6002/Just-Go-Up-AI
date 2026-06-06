@@ -138,7 +138,20 @@ class RouteConditionalVAE(nn.Module):
     ) -> dict[str, torch.Tensor]:
         enc_out = self.encoder(encoder_batch)
         bottleneck_out = self.bottleneck(enc_out["route_embedding"], sample_latent=sample_latent)
-        dec_out = self.decoder(decoder_batch, z=bottleneck_out["z"], mask_rate=mask_rate)
+        # Only pass mask_rate to decoder.forward if the decoder supports it.
+        # RouteParallelDecoder.forward does not accept mask_rate, so detect
+        # the parameter dynamically to maintain a common call site.
+        try:
+            from inspect import signature
+
+            sig = signature(self.decoder.forward)
+            if "mask_rate" in sig.parameters:
+                dec_out = self.decoder(decoder_batch, z=bottleneck_out["z"], mask_rate=mask_rate)
+            else:
+                dec_out = self.decoder(decoder_batch, z=bottleneck_out["z"]) 
+        except Exception:
+            # Fallback: call without mask_rate if any inspection error occurs.
+            dec_out = self.decoder(decoder_batch, z=bottleneck_out["z"]) 
 
         return {
             "encoder_token_embeddings": enc_out["token_embeddings"],
