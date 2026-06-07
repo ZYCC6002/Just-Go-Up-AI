@@ -910,6 +910,9 @@ def main() -> None:
     parser.add_argument("--loss-plot-path", type=str, default=str(PROJECT_ROOT / "data/route_cvae_loss_curve.png"))
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resume-path", type=str, default=None)
+    parser.add_argument("--reset-best-val", action="store_true",
+                        help="When resuming, reset best_val to inf so the new training regime "
+                             "can save checkpoints. Use when changing kl_beta/free_bits mid-run.")
     parser.add_argument("--early-stop-delta", type=float, default=None)
     parser.add_argument("--early-stop-patience", type=int, default=1)
     parser.add_argument("--free-bits", type=float, default=0.0,
@@ -1018,7 +1021,11 @@ def main() -> None:
             optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
         start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
         best_val = float(resume_ckpt.get("best_val", math.inf))
-        print(f"Resumed from {resume_path} (next_epoch={start_epoch}, best_val={best_val:.4f})")
+        if args.reset_best_val:
+            best_val = math.inf
+            print(f"Resumed from {resume_path} (next_epoch={start_epoch}, best_val reset to inf)")
+        else:
+            print(f"Resumed from {resume_path} (next_epoch={start_epoch}, best_val={best_val:.4f})")
 
     # When kl_warmup_epochs > 0 the best-of-warmup model is essentially a kl_beta≈0
     # autoencoder whose total loss will always beat any post-warmup model.  Track
