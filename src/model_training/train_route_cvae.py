@@ -910,6 +910,12 @@ def main() -> None:
     parser.add_argument("--loss-plot-path", type=str, default=str(PROJECT_ROOT / "data/route_cvae_loss_curve.png"))
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resume-path", type=str, default=None)
+    parser.add_argument("--freeze-encoder", action="store_true",
+                        help="Freeze encoder + bottleneck weights so only the decoder is trained. "
+                             "When combined with --resume, loads encoder/bottleneck weights from the "
+                             "checkpoint with strict=False (decoder keys missing from the checkpoint "
+                             "are initialised randomly). Use to train a new decoder on a pretrained "
+                             "frozen encoder. Implies --reset-best-val.")
     parser.add_argument("--reset-best-val", action="store_true",
                         help="When resuming, reset best_val to inf so the new training regime "
                              "can save checkpoints. Use when changing kl_beta/free_bits mid-run.")
@@ -1016,16 +1022,37 @@ def main() -> None:
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         resume_ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        model.load_state_dict(resume_ckpt["model_state_dict"])
-        if "optimizer_state_dict" in resume_ckpt:
+        # strict=False when freeze_encoder: encoder/bottleneck keys load normally;
+        # decoder keys absent from the checkpoint (new architecture) are skipped and
+        # left at their random init.  Unexpected keys (old decoder) are also ignored.
+        missing, unexpected = model.load_state_dict(resume_ckpt["model_state_dict"], strict=not args.freeze_encoder)
+        if args.freeze_encoder and (missing or unexpected):
+            print(f"  Partial load: {len(missing)} missing decoder keys (random init), {len(unexpected)} unexpected (ignored)")
+        if not args.freeze_encoder and "optimizer_state_dict" in resume_ckpt:
             optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
         start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
         best_val = float(resume_ckpt.get("best_val", math.inf))
-        if args.reset_best_val:
+        if args.reset_best_val or args.freeze_encoder:
             best_val = math.inf
             print(f"Resumed from {resume_path} (next_epoch={start_epoch}, best_val reset to inf)")
         else:
             print(f"Resumed from {resume_path} (next_epoch={start_epoch}, best_val={best_val:.4f})")
+
+    # Freeze encoder + bottleneck: only the decoder is trained.
+    # Must come after resume so encoder weights are loaded before being frozen.
+    # Rebuilds optimizer so frozen params never receive gradient updates or
+    # accumulate Adam momentum — cleaner than keeping them in the optimizer.
+    if args.freeze_encoder:
+        for p in model.encoder.parameters():
+            p.requires_grad_(False)
+        for p in model.bottleneck.parameters():
+            p.requires_grad_(False)
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        n_frozen = sum(p.numel() for p in model.encoder.parameters()) + \
+                   sum(p.numel() for p in model.bottleneck.parameters())
+        n_trainable = sum(p.numel() for p in trainable_params)
+        print(f"Encoder + bottleneck frozen ({n_frozen:,} params). Decoder only: {n_trainable:,} trainable params.")
 
     # When kl_warmup_epochs > 0 the best-of-warmup model is essentially a kl_beta≈0
     # autoencoder whose total loss will always beat any post-warmup model.  Track
