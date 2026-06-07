@@ -1030,7 +1030,9 @@ def main() -> None:
             print(f"  Partial load: {len(missing)} missing decoder keys (random init), {len(unexpected)} unexpected (ignored)")
         if not args.freeze_encoder and "optimizer_state_dict" in resume_ckpt:
             optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
-        start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
+        # freeze_encoder: fresh decoder training — epoch counter restarts from 1.
+        # Regular resume: continue from where the checkpoint left off.
+        start_epoch = 1 if args.freeze_encoder else int(resume_ckpt.get("epoch", 0)) + 1
         best_val = float(resume_ckpt.get("best_val", math.inf))
         if args.reset_best_val or args.freeze_encoder:
             best_val = math.inf
