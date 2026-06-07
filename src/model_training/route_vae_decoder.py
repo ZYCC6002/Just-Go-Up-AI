@@ -276,7 +276,8 @@ class RouteTransformerDecoder(nn.Module):
         padding_mask = batch["padding_mask"].bool()  # [B, L], True = padding
 
         positions = torch.arange(seq_len, device=tokens.device).unsqueeze(0).expand(batch_size, seq_len)
-        tokens = tokens + self.sequence_position_embedding(positions)
+        pos_embs = self.sequence_position_embedding(positions)   # [B, L, d_model] — reused below
+        tokens = tokens + pos_embs
         # Zero out padding positions after embedding + positional encoding.
         # Padding slots would otherwise carry type=0/x=0 embeddings that look like
         # real holds near the board origin; key_padding_mask blocks their attention
@@ -293,9 +294,6 @@ class RouteTransformerDecoder(nn.Module):
                 # uniquely identifiable. Without this, all masked tokens are identical
                 # and self-attention across them is uninformative (uniform weights).
                 # This follows the MAE / BERT convention: mask_token + pos_embedding[i].
-                pos_embs = self.sequence_position_embedding(
-                    torch.arange(seq_len, device=tokens.device).unsqueeze(0).expand(batch_size, seq_len)
-                )
                 mask_emb = self.mask_token.view(1, 1, -1) + pos_embs  # [B, L, d_model]
                 tokens = torch.where(is_masked.unsqueeze(-1), mask_emb, tokens)
             return tokens, is_masked
