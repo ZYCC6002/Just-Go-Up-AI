@@ -289,7 +289,14 @@ class RouteTransformerDecoder(nn.Module):
             rng = torch.rand(batch_size, seq_len, device=tokens.device)
             is_masked = (rng < effective_mask_rate) & ~padding_mask
             if effective_mask_rate > 0.0:
-                mask_emb = self.mask_token.view(1, 1, -1).expand_as(tokens)
+                # Add position embedding to mask_token so each masked position is
+                # uniquely identifiable. Without this, all masked tokens are identical
+                # and self-attention across them is uninformative (uniform weights).
+                # This follows the MAE / BERT convention: mask_token + pos_embedding[i].
+                pos_embs = self.sequence_position_embedding(
+                    torch.arange(seq_len, device=tokens.device).unsqueeze(0).expand(batch_size, seq_len)
+                )
+                mask_emb = self.mask_token.view(1, 1, -1) + pos_embs  # [B, L, d_model]
                 tokens = torch.where(is_masked.unsqueeze(-1), mask_emb, tokens)
             return tokens, is_masked
 
