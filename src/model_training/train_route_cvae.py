@@ -44,7 +44,8 @@ class EpochMetrics:
     numeric_loss: float
     kl_raw: float       # unweighted KL — for kl=X(+Y) diagnostics, not the loss contribution
     num_batches: int
-    pairwise_loss: float = 0.0  # unweighted pairwise distance MSE (0 when pairwise_weight=0)
+    pairwise_loss: float = 0.0      # unweighted pairwise distance MSE (0 when pairwise_weight=0)
+    move_vector_loss: float = 0.0   # unweighted move-vector MSE (0 when move_vector_weight=0)
 
 
 def _compute_kl_beta(
@@ -90,6 +91,43 @@ def _compute_ss_ratio(*, epoch: int, target_ss_ratio: float, ss_warmup_epochs: i
         return float(target_ss_ratio)
     ratio = min(max(epoch, 0), ss_warmup_epochs) / float(ss_warmup_epochs)
     return float(target_ss_ratio) * ratio
+
+
+def _compute_move_vector_loss(
+    x_pred: torch.Tensor,
+    y_pred: torch.Tensor,
+    x_tgt: torch.Tensor,
+    y_tgt: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """MSE on consecutive directed move vectors (Δx, Δy) in sequence order.
+
+    Unlike pairwise distance loss (which is rotation-invariant and cannot distinguish
+    left-leaning from right-leaning routes), move vectors directly supervise the
+    directional shape features that ``step_x_var`` and ``move_size`` measure.
+
+    Args:
+        x_pred, y_pred: predicted positions [B, L], normalised to [0, 1].
+        x_tgt,  y_tgt:  target  positions  [B, L], normalised to [0, 1].
+        valid_mask:     [B, L] bool — True for non-padded positions.
+
+    Returns:
+        Scalar mean loss (0.0 when fewer than 2 valid positions per sample).
+    """
+    if x_pred.shape[1] < 2:
+        return x_pred.new_tensor(0.0)
+
+    dx_pred = x_pred[:, 1:] - x_pred[:, :-1]   # [B, L-1]
+    dy_pred = y_pred[:, 1:] - y_pred[:, :-1]
+    dx_tgt  = x_tgt[:, 1:]  - x_tgt[:, :-1]
+    dy_tgt  = y_tgt[:, 1:]  - y_tgt[:, :-1]
+
+    # Include a pair only when both adjacent positions are non-padded.
+    pair_mask = valid_mask[:, 1:] & valid_mask[:, :-1]   # [B, L-1]
+    if not pair_mask.any():
+        return x_pred.new_tensor(0.0)
+
+    return masked_mse(dx_pred, dx_tgt, pair_mask) + masked_mse(dy_pred, dy_tgt, pair_mask)
 
 
 def _compute_mask_max(*, epoch: int, warmup_epochs: int) -> float:
@@ -512,6 +550,7 @@ def _compute_batch_losses(
     sample_latent: bool = True,
     free_bits: float = 0.0,
     pairwise_weight: float = 0.0,
+    move_vector_weight: float = 0.0,
     hole_loss_weight: float = 1.0,
     autoregressive: bool = False,
     ss_ratio: float = 0.0,
@@ -605,6 +644,10 @@ def _compute_batch_losses(
             + masked_mse(out["orientation_cos_pred"], ori_cos, loss_pos)
             + masked_mse(out["size_pred"],          size_tgt, loss_pos)
         )
+        # Variables for move-vector loss (all non-padded positions, not just masked).
+        _mv_x_tgt  = x_tgt
+        _mv_y_tgt  = y_tgt
+        _mv_valid  = ~padding_mask
     else:
         cat_targets = prepared["categorical_targets"]
         categorical_loss = sum(
@@ -626,6 +669,10 @@ def _compute_batch_losses(
             masked_mse(out[f"{feat}_pred"], num_targets[f"{feat}_target"], mask)
             for feat in ("x", "y", "orientation_sin", "orientation_cos", "size")
         )
+        # Variables for move-vector loss.
+        _mv_x_tgt = num_targets["x_target"]
+        _mv_y_tgt = num_targets["y_target"]
+        _mv_valid  = mask
 
     # kl_unified is a single term: add to total with weight 1.0 — kl_beta and free-bits are baked in.
     # kl_raw is the unweighted KL, used only for logging (kl=X(+Y) diagnostic).
@@ -675,12 +722,26 @@ def _compute_batch_losses(
         total = total + numeric_weight * pairwise_weight * pairwise_loss
         pairwise_val = float(pairwise_loss.detach().cpu())
 
+    # Move-vector loss: MSE on directed Δx/Δy between consecutive holds.
+    # Captures directional shape (step_x_var, move_size) that pairwise distance loss misses.
+    # Scaled identically to pairwise: numeric_weight * move_vector_weight * loss.
+    move_vector_val = 0.0
+    if move_vector_weight > 0.0:
+        mv_loss = _compute_move_vector_loss(
+            out["x_pred"], out["y_pred"],
+            _mv_x_tgt, _mv_y_tgt,
+            _mv_valid,
+        )
+        total = total + numeric_weight * move_vector_weight * mv_loss
+        move_vector_val = float(mv_loss.detach().cpu())
+
     stats = {
         "total": float(total.detach().cpu()),
         "categorical": float(categorical_loss.detach().cpu()),
         "numeric": float(numeric_loss.detach().cpu()),
         "kl_raw": float(kl_raw.detach().cpu()),
         "pairwise": pairwise_val,
+        "move_vector": move_vector_val,
     }
     return total, stats
 
@@ -699,6 +760,7 @@ def _run_epoch(
     sample_latent: bool,
     free_bits: float = 0.0,
     pairwise_weight: float = 0.0,
+    move_vector_weight: float = 0.0,
     hole_loss_weight: float = 1.0,
     autoregressive: bool = False,
     ss_ratio: float = 0.0,
@@ -719,7 +781,7 @@ def _run_epoch(
     is_train = optimizer is not None
     model.train(is_train)
 
-    loss_sum = cat_sum = num_sum = kl_raw_sum = pairwise_sum = 0.0
+    loss_sum = cat_sum = num_sum = kl_raw_sum = pairwise_sum = move_vector_sum = 0.0
     batches = 0
 
     for batch_samples in iter_minibatches(samples, batch_size, shuffle=is_train):
@@ -741,6 +803,7 @@ def _run_epoch(
                 sample_latent=sample_latent,
                 free_bits=free_bits,
                 pairwise_weight=pairwise_weight,
+                move_vector_weight=move_vector_weight,
                 hole_loss_weight=hole_loss_weight,
                 autoregressive=autoregressive,
                 ss_ratio=ss_ratio,
@@ -756,6 +819,7 @@ def _run_epoch(
         num_sum += stats["numeric"]
         kl_raw_sum += stats["kl_raw"]
         pairwise_sum += stats["pairwise"]
+        move_vector_sum += stats["move_vector"]
         batches += 1
 
     if batches == 0:
@@ -767,6 +831,7 @@ def _run_epoch(
         kl_raw=kl_raw_sum / batches,
         num_batches=batches,
         pairwise_loss=pairwise_sum / batches,
+        move_vector_loss=move_vector_sum / batches,
     )
 
 
@@ -933,6 +998,15 @@ def main() -> None:
                              "normalised by √2. Creates gradient signal for inter-hold spatial "
                              "structure which per-token x/y MSE alone cannot provide. "
                              "Suggested starting value: 1.0–4.0.")
+    parser.add_argument("--move-vector-weight", type=float, default=0.0,
+                        help="Weight for move-vector loss (compounded with --numeric-weight). "
+                             "Effective contribution = numeric_weight × move_vector_weight × MSE. "
+                             "Computes MSE on directed Δx/Δy between consecutive holds in sequence "
+                             "order, supervising step direction and size. Unlike pairwise distance "
+                             "loss (rotation-invariant), this directly penalises wrong move "
+                             "directionality and captures step_x_var and move_size. "
+                             "Use instead of or alongside --pairwise-weight. "
+                             "Suggested starting value: 2.0–4.0.")
     parser.add_argument("--hole-loss-weight", type=float, default=1.0,
                         help="Multiplier on the hole cross-entropy term in the reconstruction loss. "
                              "Hole vocab size is 593 (log₂(593)≈9.2 bits) vs type=7 and role=~5, so "
@@ -1128,6 +1202,7 @@ def main() -> None:
             sample_latent=True,
             free_bits=args.free_bits,
             pairwise_weight=args.pairwise_weight,
+            move_vector_weight=args.move_vector_weight,
             hole_loss_weight=args.hole_loss_weight,
             ss_ratio=ss_ratio,
             mask_rate_max=train_mask_max,
@@ -1142,6 +1217,7 @@ def main() -> None:
                 sample_latent=False,
                 free_bits=args.free_bits,
                 pairwise_weight=args.pairwise_weight,
+                move_vector_weight=args.move_vector_weight,
                 hole_loss_weight=args.hole_loss_weight,
                 autoregressive=False,  # teacher-forced: stable criterion for checkpoint selection
                 # mask_rate_max=None: val always uses the fixed cfg.mask_rate for a consistent metric
@@ -1164,6 +1240,10 @@ def main() -> None:
             f" pw={train_m.pairwise_loss:.4f}/{val_m.pairwise_loss:.4f}"
             if args.pairwise_weight > 0.0 else ""
         )
+        mv_str = (
+            f" mv={train_m.move_vector_loss:.4f}/{val_m.move_vector_loss:.4f}"
+            if args.move_vector_weight > 0.0 else ""
+        )
         ss_str = f" ss={ss_ratio:.3f}" if args.scheduled_sampling_ratio > 0.0 else ""
         mask_str = (
             f" mask=[{args.mask_rate_min:.2f},{train_mask_max:.2f})"
@@ -1173,7 +1253,7 @@ def main() -> None:
             f"Epoch {epoch:03d} | kl_beta={kl_beta:.6f}{ss_str}{mask_str} "
             f"train total={train_m.total_loss:.4f} recon={train_recon:.4f} kl_w={train_kl_w:.4f} "
             f"cat={train_m.categorical_loss:.4f} num={train_m.numeric_loss:.4f} "
-            f"kl={train_m.kl_raw:.4f}(+{train_kl_excess:.4f}){pw_str} | "
+            f"kl={train_m.kl_raw:.4f}(+{train_kl_excess:.4f}){pw_str}{mv_str} | "
             f"val total={val_m.total_loss:.4f} recon={val_recon:.4f} kl_w={val_kl_w:.4f} "
             f"cat={val_m.categorical_loss:.4f} num={val_m.numeric_loss:.4f} "
             f"kl={val_m.kl_raw:.4f}(+{val_kl_excess:.4f})"
@@ -1273,6 +1353,7 @@ def main() -> None:
             sample_latent=False,
             free_bits=args.free_bits,
             pairwise_weight=args.pairwise_weight,
+            move_vector_weight=args.move_vector_weight,
             hole_loss_weight=args.hole_loss_weight,
             autoregressive=False,  # teacher-forced
         )

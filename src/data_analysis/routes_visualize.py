@@ -28,6 +28,8 @@ def run_analysis(
     output_path: str,
     show_plot: bool,
     click_to_visualize: bool,
+    checkpoint_path: str | None,
+    n_dims: int,
     umap_n_neighbors: int,
     umap_min_dist: float,
     tsne_perplexity: float,
@@ -35,6 +37,43 @@ def run_analysis(
     tsne_learning_rate: float | Literal["auto"],
     tsne_metric: str,
 ) -> None:
+    # Build decoded-route callback if a checkpoint was supplied.
+    visualize_decoded = None
+    if click_to_visualize and checkpoint_path is not None:
+        import torch as _torch
+        from generate_route import decode_z_to_holds, visualize_generated_route
+        from model_training import DecoderEOSIds, build_model_from_checkpoint, prepare_cvae_training_batch
+
+        _device = _torch.device("cpu")
+        _model, _ = build_model_from_checkpoint(checkpoint_path, vocabs=None, device=_device)
+        _model.eval()
+        _ckpt = _torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        _vocabs = _ckpt["vocabs"]
+        _db_path = PROJECT_ROOT / "data" / "raw" / "kilter_database.sqlite"
+        _images_root = PROJECT_ROOT / "data" / "raw" / "kilter_images"
+        _eos_ids = DecoderEOSIds(
+            type_eos_id=_model.decoder.type_eos_id,
+            role_eos_id=_model.decoder.role_eos_id,
+            hole_eos_id=_model.decoder.hole_eos_id,
+        )
+
+        def visualize_decoded(sample) -> None:
+            batch = prepare_cvae_training_batch([sample], eos_ids=_eos_ids, device=_device)
+            with _torch.no_grad():
+                enc_out = _model.encoder(batch["encoder_batch"])
+                bn_out = _model.bottleneck(enc_out["route_embedding"], sample_latent=False)
+            z = bn_out["z"]  # [1, latent_dim] — posterior mean, no sampling
+            holds = decode_z_to_holds(_model, _vocabs, z, sample.num_holds, _device)
+            print(f"  → {len(holds)} holds decoded")
+            visualize_generated_route(
+                holds,
+                db_path=_db_path,
+                images_root=_images_root,
+                title=f"Decoded: {sample.name}",
+            )
+
+        print(f"Loaded decoder checkpoint for click-to-decode: {checkpoint_path}")
+
     samples, latent_matrix, cluster_ids, _payload = load_cluster_cache(cluster_cache_path)
     samples, latent_matrix, cluster_ids = subset_cluster_cache(
         samples, latent_matrix, cluster_ids, max_routes=max_routes
@@ -53,23 +92,24 @@ def run_analysis(
 
     extra_info = ""
 
+    dim_label = f"{n_dims}D"
+
     if method == "pca":
         from sklearn.decomposition import PCA
 
-        pca = PCA(n_components=2, random_state=seed)
+        pca = PCA(n_components=n_dims, random_state=seed)
         projected_2d = pca.fit_transform(latent_matrix)
         ev = pca.explained_variance_ratio_
-        extra_info = f"Explained variance: PC1={ev[0]:.4f}, PC2={ev[1]:.4f}"
-        title = "Clustered Latents PCA (2D)"
-        axis_labels = ("PC1", "PC2")
+        ev_str = "  ".join(f"PC{i+1}={v:.4f}" for i, v in enumerate(ev))
+        extra_info = f"Explained variance: {ev_str}"
+        title = f"Clustered Latents PCA ({dim_label})"
+        axis_labels = tuple(f"PC{i+1}" for i in range(n_dims))
 
     elif method == "umap":
         if pre_reduced_matrix is not None:
-            # Re-project from the stored pre-reduced embedding (same manifold
-            # HDBSCAN ran on) so clusters appear coherent in the 2D view.
             pre_reduce_dims = int(_payload.get("pre_reduce_dims", pre_reduced_matrix.shape[1]))
             print(
-                f"Projecting stored {pre_reduce_dims}D pre-reduced embedding → 2D UMAP "
+                f"Projecting stored {pre_reduce_dims}D pre-reduced embedding → {dim_label} UMAP "
                 f"(anchored to clustering space)."
             )
             umap_input = pre_reduced_matrix
@@ -79,13 +119,13 @@ def run_analysis(
         projected_2d = reduce_dimensions(
             umap_input,
             method="umap",
-            n_components=2,
+            n_components=n_dims,
             seed=seed,
             umap_n_neighbors=umap_n_neighbors,
             umap_min_dist=umap_min_dist,
         )
-        title = "Clustered Latents UMAP (2D)"
-        axis_labels = ("UMAP-1", "UMAP-2")
+        title = f"Clustered Latents UMAP ({dim_label})"
+        axis_labels = tuple(f"UMAP-{i+1}" for i in range(n_dims))
 
     elif method == "tsne":
         from sklearn.manifold import TSNE
@@ -96,7 +136,7 @@ def run_analysis(
                 f"sample count ({len(samples)})."
             )
         tsne = TSNE(
-            n_components=2,
+            n_components=n_dims,
             perplexity=tsne_perplexity,
             learning_rate=tsne_learning_rate,
             init=tsne_init,
@@ -104,8 +144,8 @@ def run_analysis(
             random_state=seed,
         )
         projected_2d = tsne.fit_transform(latent_matrix)
-        title = "Clustered Latents t-SNE (2D)"
-        axis_labels = ("t-SNE-1", "t-SNE-2")
+        title = f"Clustered Latents t-SNE ({dim_label})"
+        axis_labels = tuple(f"t-SNE-{i+1}" for i in range(n_dims))
 
     else:
         raise ValueError(f"Unknown visualization method: {method!r}. Choose 'pca', 'umap', or 'tsne'.")
@@ -114,18 +154,21 @@ def run_analysis(
     if output_path == "__auto__":
         output_path = str(PROJECT_ROOT / f"data/routes_latent_{method}.png")
 
-    plot_2d_latents(
-        projected_2d,
-        cluster_ids,
-        samples,
+    plot_kwargs: dict = dict(
         title=title,
         output_path=output_path,
         show_plot=show_plot,
         click_to_visualize=click_to_visualize,
+        visualize_decoded=visualize_decoded,
+        n_dims=n_dims,
         extra_info=extra_info,
         x_label=axis_labels[0],
         y_label=axis_labels[1],
     )
+    if n_dims == 3:
+        plot_kwargs["z_label"] = axis_labels[2]
+
+    plot_2d_latents(projected_2d, cluster_ids, samples, **plot_kwargs)
 
 
 def main() -> None:
@@ -157,6 +200,21 @@ def main() -> None:
         "--disable-click-visualizer",
         action="store_true",
         help="Disable click-to-open route visualizer.",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        default=None,
+        help="Path to a VAE checkpoint (.pt). When provided, a Real/Decoded radio button "
+             "appears on the scatter plot — clicking 'Decoded' shows the VAE reconstruction "
+             "of the selected route instead of the real climb.",
+    )
+    parser.add_argument(
+        "--n-dims",
+        type=int,
+        choices=[2, 3],
+        default=2,
+        help="Projection dimensionality: 2 for a flat scatter, 3 for a rotatable 3D plot. Default: 2.",
     )
 
     # UMAP-specific
@@ -200,6 +258,8 @@ def main() -> None:
         output_path=args.output_path,
         show_plot=args.show,
         click_to_visualize=not args.disable_click_visualizer,
+        checkpoint_path=args.checkpoint_path,
+        n_dims=args.n_dims,
         umap_n_neighbors=args.umap_n_neighbors,
         umap_min_dist=args.umap_min_dist,
         tsne_perplexity=args.tsne_perplexity,

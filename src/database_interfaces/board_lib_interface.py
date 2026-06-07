@@ -223,32 +223,23 @@ class BoardLibInterface:
 		)
 		return selected_id, board_edges
 
-	def resolve_image_paths_for_climb(
+	def resolve_image_paths(
 		self,
-		climb: Climb,
+		layout_id: int,
+		set_ids: list[int],
+		climb_edges: tuple[int, int, int, int],
+		product_id: int,
 		images_root: Path,
 	) -> tuple[list[Path], tuple[int, int, int, int]]:
-		"""Return compositable image layers and board bounds for a climb."""
-		if not climb.frames:
-			raise ValueError("Climb has no frame data.")
+		"""Return compositable image layers and board bounds for explicit parameters.
 
-		layout_id = int(climb.layout_id)
-		set_ids = self.decode_hsm_set_ids(layout_id, int(climb.hsm or 0))
-		if not set_ids:
-			raise ValueError(f"Could not decode hold sets from hsm for layout_id={layout_id}.")
-
-		climb_edges = climb.edges
-
-		if climb.product_id is None:
-			raise ValueError("Climb object is missing product_id.")
-		product_id = int(climb.product_id)
+		Unlike ``resolve_image_paths_for_climb``, this does not require a Climb
+		object — useful when board bounds are computed from generated hold positions
+		rather than from a stored climb.
+		"""
 		selected_product_size_id, board_edges = self.select_product_size(
-			layout_id,
-			set_ids,
-			climb_edges,
-			product_id=product_id,
+			layout_id, set_ids, climb_edges, product_id=product_id,
 		)
-
 		set_placeholders = ",".join(["?"] * len(set_ids))
 		rows = self.fetchall(
 			f"""
@@ -264,20 +255,33 @@ class BoardLibInterface:
 				f"No images found for layout_id={layout_id}, "
 				f"product_size_id={selected_product_size_id}, set_ids={set_ids}."
 			)
-
 		image_paths: list[Path] = []
 		for _set_id, image_filename in rows:
 			image_path = images_root / str(image_filename)
 			if not image_path.exists():
 				raise FileNotFoundError(f"Image file not found: {image_path}")
 			image_paths.append(image_path)
-
-		if len(image_paths) != len(set_ids):
-			raise ValueError(
-				f"Missing one or more image layers for layout_id={layout_id}, product_size_id={selected_product_size_id}."
-			)
-
 		return image_paths, board_edges
+
+	def resolve_image_paths_for_climb(
+		self,
+		climb: Climb,
+		images_root: Path,
+	) -> tuple[list[Path], tuple[int, int, int, int]]:
+		"""Return compositable image layers and board bounds for a climb."""
+		if not climb.frames:
+			raise ValueError("Climb has no frame data.")
+		if climb.product_id is None:
+			raise ValueError("Climb object is missing product_id.")
+
+		layout_id = int(climb.layout_id)
+		set_ids = self.decode_hsm_set_ids(layout_id, int(climb.hsm or 0))
+		if not set_ids:
+			raise ValueError(f"Could not decode hold sets from hsm for layout_id={layout_id}.")
+
+		return self.resolve_image_paths(
+			layout_id, set_ids, climb.edges, int(climb.product_id), images_root,
+		)
 
 	@staticmethod
 	def parse_frames(frames: str) -> list[tuple[int, int]]:
@@ -304,9 +308,24 @@ class BoardLibInterface:
 				out.append((placement_id, role_id))
 		return out
 
-	def _role_map(self) -> dict[int, str]:
+	def role_map(self) -> dict[int, str]:
+		"""Return {role_id: role_name} for all placement roles."""
 		rows = self.fetchall("SELECT id, name FROM placement_roles;")
 		return {int(r[0]): str(r[1]) for r in rows}
+
+	def _role_map(self) -> dict[int, str]:
+		return self.role_map()
+
+	def get_hole_positions(self, hole_ids: list[int]) -> dict[int, tuple[int, int]]:
+		"""Return {hole_id: (x, y)} for the given hole ids."""
+		if not hole_ids:
+			return {}
+		placeholders = ",".join("?" * len(hole_ids))
+		rows = self.fetchall(
+			f"SELECT id, x, y FROM holes WHERE id IN ({placeholders})",
+			hole_ids,
+		)
+		return {int(row[0]): (int(row[1]), int(row[2])) for row in rows}
 
 	def _table_exists(self, table_name: str) -> bool:
 		row = self.execute(

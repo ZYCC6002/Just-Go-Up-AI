@@ -61,69 +61,142 @@ def enable_hover_annotations(
 	ax: Axes,
 	fig: Figure,
 	scatter,
-	projected_2d: np.ndarray,
+	projected: np.ndarray,
 	samples: list[RouteSample],
 	cluster_ids: np.ndarray,
 ) -> None:
-	annotation = ax.annotate(
-		"",
-		xy=(0, 0),
-		xytext=(10, 10),
-		textcoords="offset points",
-		bbox={"boxstyle": "round", "fc": "white", "ec": "black", "alpha": 0.9},
-		arrowprops={"arrowstyle": "->", "lw": 0.8},
-	)
-	annotation.set_visible(False)
+	n_dims = projected.shape[1]
 
 	def _label(i: int) -> str:
 		name = samples[i].name.strip() if samples[i].name else "<unnamed route>"
-		grade = samples[i].grade if samples[i].grade is not None else "<ungraded route>"
-		angle = samples[i].angle if samples[i].angle is not None else "<no angle route>"
-		if len(name) > 80:
-			name = name[:77] + "..."
-		return f"{name}\ngrade={grade}\nangle={angle}\ncluster={int(cluster_ids[i])}"
+		grade = samples[i].grade if samples[i].grade is not None else "<ungraded>"
+		angle = samples[i].angle if samples[i].angle is not None else "?"
+		if len(name) > 60:
+			name = name[:57] + "..."
+		return f"{name} | grade={grade} | angle={angle} | cluster={int(cluster_ids[i])}"
 
-	def _on_move(event) -> None:
-		if event.inaxes != ax:
-			if annotation.get_visible():
-				annotation.set_visible(False)
+	if n_dims == 3:
+		# In 3D use a fixed status text at the bottom — avoids 3D annotation
+		# placement issues while still showing route info on hover.
+		from mpl_toolkits.mplot3d import proj3d
+		xs_3d = projected[:, 0].astype(float)
+		ys_3d = projected[:, 1].astype(float)
+		zs_3d = projected[:, 2].astype(float)
+		status = fig.text(
+			0.5, 0.01, "", ha="center", va="bottom", fontsize=8.5,
+			bbox={"boxstyle": "round", "fc": "white", "ec": "gray", "alpha": 0.85},
+		)
+		status.set_visible(False)
+
+		def _on_move(event) -> None:
+			if event.x is None or event.y is None:
+				return
+			try:
+				renderer = fig.canvas.get_renderer()
+				bbox_ax = ax.get_window_extent(renderer)
+				x2d, y2d, _ = proj3d.proj_transform(xs_3d, ys_3d, zs_3d, ax.get_proj())
+				# proj_transform output is in normalized [-1,1] projected space;
+				# map to pixel coords using the axes bounding box.
+				x_px = bbox_ax.x0 + (x2d + 1) / 2 * bbox_ax.width
+				y_px = bbox_ax.y0 + (y2d + 1) / 2 * bbox_ax.height
+				dists = np.hypot(x_px - event.x, y_px - event.y)
+				idx = int(np.argmin(dists))
+				if dists[idx] < 15:
+					status.set_text(_label(idx))
+					status.set_visible(True)
+				else:
+					status.set_visible(False)
 				fig.canvas.draw_idle()
-			return
+			except Exception:
+				pass
+	else:
+		annotation = ax.annotate(
+			"",
+			xy=(0, 0),
+			xytext=(10, 10),
+			textcoords="offset points",
+			bbox={"boxstyle": "round", "fc": "white", "ec": "black", "alpha": 0.9},
+			arrowprops={"arrowstyle": "->", "lw": 0.8},
+		)
+		annotation.set_visible(False)
 
-		contains, info = scatter.contains(event)
-		if not contains:
-			if annotation.get_visible():
-				annotation.set_visible(False)
-				fig.canvas.draw_idle()
-			return
-
-		idx = int(info["ind"][0])
-		x, y = projected_2d[idx]
-		annotation.xy = (x, y)
-		annotation.set_text(_label(idx))
-		annotation.set_visible(True)
-		fig.canvas.draw_idle()
+		def _on_move(event) -> None:
+			if event.inaxes != ax:
+				if annotation.get_visible():
+					annotation.set_visible(False)
+					fig.canvas.draw_idle()
+				return
+			contains, info = scatter.contains(event)
+			if not contains:
+				if annotation.get_visible():
+					annotation.set_visible(False)
+					fig.canvas.draw_idle()
+				return
+			idx = int(info["ind"][0])
+			x, y = projected[idx]
+			annotation.xy = (x, y)
+			annotation.set_text(_label(idx))
+			annotation.set_visible(True)
+			fig.canvas.draw_idle()
 
 	fig.canvas.mpl_connect("motion_notify_event", _on_move)
 
 
 
-def enable_click_to_visualize(*, ax: Axes, fig: Figure, scatter, samples: list[RouteSample], visualize_route) -> None:
-	def _on_click(event) -> None:
-		if event.inaxes != ax:
-			return
-		contains, info = scatter.contains(event)
-		if not contains:
-			return
-		idx = int(info["ind"][0])
-		sample = samples[idx]
-		print(f"Opening route visualizer for: {sample.name} ({sample.uuid})")
-		try:
-			visualize_route(sample.name, sample=sample)
-		except Exception as exc:
-			print(f"Failed to visualize route '{sample.name}': {exc}")
+def enable_click_to_visualize(
+	*,
+	ax: Axes,
+	fig: Figure,
+	scatter,
+	samples: list[RouteSample],
+	visualize_route,
+	visualize_decoded=None,
+	n_dims: int = 2,
+) -> list[str]:
+	"""Wire left-click to open the real or decoded route.
 
-	fig.canvas.mpl_connect("button_press_event", _on_click)
+	Returns a mutable ``mode`` list so the caller can wire a toggle widget:
+	``mode[0]`` is ``"Real"`` or ``"Decoded"``.
+
+	In 3D mode the scatter must have ``picker=True`` set — click detection uses
+	``pick_event`` because ``scatter.contains()`` is unreliable for 3D artists.
+	"""
+	mode: list[str] = ["Real"]
+
+	def _dispatch(idx: int) -> None:
+		sample = samples[idx]
+		if mode[0] == "Decoded" and visualize_decoded is not None:
+			print(f"Decoding route: {sample.name} ({sample.uuid})")
+			try:
+				visualize_decoded(sample)
+			except Exception as exc:
+				print(f"Failed to decode route '{sample.name}': {exc}")
+		else:
+			print(f"Opening route visualizer for: {sample.name} ({sample.uuid})")
+			try:
+				visualize_route(sample.name, sample=sample)
+			except Exception as exc:
+				print(f"Failed to visualize route '{sample.name}': {exc}")
+
+	if n_dims == 3:
+		def _on_pick(event) -> None:
+			if event.artist is not scatter:
+				return
+			if event.mouseevent.button != 1:  # ignore scroll (button="up"/"down")
+				return
+			_dispatch(int(event.ind[0]))
+		fig.canvas.mpl_connect("pick_event", _on_pick)
+	else:
+		def _on_click(event) -> None:
+			if event.inaxes != ax:
+				return
+			contains, info = scatter.contains(event)
+			if not contains:
+				return
+			_dispatch(int(info["ind"][0]))
+		fig.canvas.mpl_connect("button_press_event", _on_click)
+
+	return mode
 
 
 
@@ -176,29 +249,14 @@ def plot_2d_latents(
 	output_path: str,
 	show_plot: bool,
 	click_to_visualize: bool,
+	visualize_decoded=None,
+	n_dims: int = 2,
 	extra_info: str = "",
 	x_label: str = "Dim 1",
 	y_label: str = "Dim 2",
+	z_label: str = "Dim 3",
 ) -> None:
-	"""Render a 2-D scatter plot of latent vectors coloured by cluster.
-
-	Handles HDBSCAN noise points (label ``-1``) as grey dots excluded from
-	the legend.  Wires hover-annotation and (optionally) click-to-visualize
-	interactions.
-
-	Args:
-		projected_2d:       2-D projection [N, 2].
-		cluster_ids:        Cluster labels [N]; may include ``-1`` (noise).
-		samples:            Corresponding :class:`RouteSample` objects.
-		title:              Figure title.
-		output_path:        Where to save the PNG.
-		show_plot:          Whether to call ``plt.show()``.
-		click_to_visualize: Whether to wire the click handler.
-		extra_info:         Extra string printed to stdout after save (e.g.
-		                    explained-variance ratios).
-		x_label:            X-axis label (default ``"Dim 1"``).
-		y_label:            Y-axis label (default ``"Dim 2"``).
-	"""
+	"""Render a 2-D or 3-D scatter plot of latent vectors coloured by cluster."""
 	import matplotlib.patches as mpatches
 
 	from route_visualizer import visualize_route
@@ -207,10 +265,6 @@ def plot_2d_latents(
 	noise_mask = cluster_ids == -1
 	cluster_labels = unique_labels[unique_labels != -1]
 
-	# Build per-point RGBA colour and size arrays so a single scatter covers
-	# all points.  This is critical: scatter.contains() returns indices into
-	# the scatter's own data, so splitting noise vs. cluster into separate
-	# scatter calls breaks the index mapping used by hover/click handlers.
 	cmap = plt.cm.get_cmap("tab10", max(len(cluster_labels), 1))
 	label_to_rgba: dict[int, np.ndarray] = {}
 	for i, lbl in enumerate(cluster_labels):
@@ -226,15 +280,46 @@ def plot_2d_latents(
 	])
 	point_sizes = np.where(noise_mask, 5, 8).astype(float)
 
-	fig = plt.figure(figsize=(10, 8))
-	ax = fig.add_subplot(111)
+	if n_dims == 3:
+		fig = plt.figure(figsize=(12, 9))
+		ax = fig.add_subplot(111, projection="3d")
+		scatter = ax.scatter(
+			projected_2d[:, 0],
+			projected_2d[:, 1],
+			projected_2d[:, 2],
+			c=point_colors,
+			s=point_sizes,
+			picker=True,
+			pickradius=5,
+		)
+		ax.set_axis_off()
 
-	scatter = ax.scatter(
-		projected_2d[:, 0],
-		projected_2d[:, 1],
-		c=point_colors,
-		s=point_sizes,
-	)
+		# Scroll-to-zoom: scale all three axis ranges around their centres.
+		def _on_scroll(event) -> None:
+			if event.inaxes != ax:
+				return
+			scale = 0.9 if event.button == "up" else 1.1
+			for get, set_ in (
+				(ax.get_xlim, ax.set_xlim),
+				(ax.get_ylim, ax.set_ylim),
+				(ax.get_zlim, ax.set_zlim),
+			):
+				lo, hi = get()
+				mid = (lo + hi) / 2
+				half = (hi - lo) / 2 * scale
+				set_(mid - half, mid + half)
+			fig.canvas.draw_idle()
+
+		fig.canvas.mpl_connect("scroll_event", _on_scroll)
+	else:
+		fig = plt.figure(figsize=(10, 8))
+		ax = fig.add_subplot(111)
+		scatter = ax.scatter(
+			projected_2d[:, 0],
+			projected_2d[:, 1],
+			c=point_colors,
+			s=point_sizes,
+		)
 
 	# Legend — one patch per cluster, plus noise count if present
 	legend_handles = [
@@ -248,27 +333,43 @@ def plot_2d_latents(
 	ax.legend(handles=legend_handles, title="Cluster", loc="best")
 
 	ax.set_title(title)
-	ax.set_xlabel(x_label)
-	ax.set_ylabel(y_label)
+	if n_dims == 2:
+		ax.set_xlabel(x_label)
+		ax.set_ylabel(y_label)
 
 	enable_hover_annotations(
 		ax=ax,
 		fig=fig,
 		scatter=scatter,
-		projected_2d=projected_2d,
+		projected=projected_2d,
 		samples=samples,
 		cluster_ids=cluster_ids,
 	)
+	mode = None
 	if click_to_visualize:
-		enable_click_to_visualize(
+		mode = enable_click_to_visualize(
 			ax=ax,
 			fig=fig,
 			scatter=scatter,
 			samples=samples,
 			visualize_route=visualize_route,
+			visualize_decoded=visualize_decoded,
+			n_dims=n_dims,
 		)
 
 	fig.tight_layout()
+
+	# Radio button to toggle Real / Decoded.
+	if click_to_visualize and visualize_decoded is not None and mode is not None:
+		from matplotlib.widgets import RadioButtons
+		if n_dims == 2:
+			fig.subplots_adjust(left=0.16)
+		rax = fig.add_axes([0.01, 0.44, 0.13, 0.13])
+		rax.set_facecolor("#f0f0f0")
+		radio = RadioButtons(rax, ["Real", "Decoded"], active=0)
+		radio.on_clicked(lambda label: mode.__setitem__(0, label))
+		fig._click_mode_radio = radio  # keep alive — matplotlib GC's unreferenced widgets
+
 	out = Path(output_path)
 	out.parent.mkdir(parents=True, exist_ok=True)
 	fig.savefig(out, dpi=180)
