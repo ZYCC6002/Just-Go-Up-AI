@@ -239,7 +239,8 @@ def build_model_from_checkpoint(
       2. Runtime ``vocabs`` argument — used for old checkpoints that predate the
          embedded-vocabs change, and during training itself (before the first save).
     """
-    from .route_vae_encoder import RouteTransformerEncoder, RouteMlpEncoderConfig, RouteMlpEncoder
+    from .route_vae_encoder import RouteTransformerEncoder
+    from .route_vae_mlp_encoder import RouteMlpEncoderConfig, RouteMlpEncoder
     from .route_vae_decoder import RouteTransformerDecoder, RouteVAEDecoderConfig
     from .route_vae_parallel_decoder import RouteParallelDecoder, RouteVAEParallelDecoderConfig
     from .route_vae_bottleneck import RouteConditionalVAE, RouteVAEBottleneck, RouteVAEBottleneckConfig

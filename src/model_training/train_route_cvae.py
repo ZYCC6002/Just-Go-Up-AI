@@ -32,7 +32,8 @@ from model_training.route_vae_bottleneck import (
     kl_divergence_loss,
 )
 from model_training.route_vae_decoder import RouteTransformerDecoder, RouteVAEDecoderConfig
-from model_training.route_vae_encoder import RouteTransformerEncoder, RouteMlpEncoderConfig, RouteMlpEncoder
+from model_training.route_vae_encoder import RouteTransformerEncoder
+from model_training.route_vae_mlp_encoder import RouteMlpEncoderConfig, RouteMlpEncoder
 from model_training.route_vae_parallel_decoder import RouteParallelDecoder, RouteVAEParallelDecoderConfig
 from model_training.training_utils import DecoderEOSIds, masked_mse, prepare_cvae_training_batch
 
