@@ -981,6 +981,12 @@ def main() -> None:
                              "checkpoint with strict=False (decoder keys missing from the checkpoint "
                              "are initialised randomly). Use to train a new decoder on a pretrained "
                              "frozen encoder. Implies --reset-best-val.")
+    parser.add_argument("--transfer-encoder-only", action="store_true",
+                        help="Load encoder + bottleneck weights from --resume-path with strict=False "
+                             "(new decoder is randomly initialised) but keep the encoder trainable. "
+                             "Use when resuming from a checkpoint whose decoder architecture differs "
+                             "from the current model (e.g. parallel → transformer). "
+                             "Implies --reset-best-val. Does not require --resume.")
     parser.add_argument("--reset-best-val", action="store_true",
                         help="When resuming, reset best_val to inf so the new training regime "
                              "can save checkpoints. Use when changing kl_beta/free_bits mid-run.")
@@ -1091,24 +1097,29 @@ def main() -> None:
     checkpoint_path = Path(args.checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.resume:
+    if args.resume or args.transfer_encoder_only:
         resume_path = Path(args.resume_path) if args.resume_path else checkpoint_path
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         resume_ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        # strict=False when freeze_encoder: encoder/bottleneck keys load normally;
-        # decoder keys absent from the checkpoint (new architecture) are skipped and
-        # left at their random init.  Unexpected keys (old decoder) are also ignored.
-        missing, unexpected = model.load_state_dict(resume_ckpt["model_state_dict"], strict=not args.freeze_encoder)
-        if args.freeze_encoder and (missing or unexpected):
+        # strict=False when freeze_encoder or transfer_encoder_only: encoder/bottleneck
+        # keys load normally; decoder keys absent from the checkpoint (new architecture)
+        # are skipped and left at their random init.  Unexpected keys (old decoder
+        # architecture, e.g. parallel → transformer) are also ignored.
+        partial_load = args.freeze_encoder or args.transfer_encoder_only
+        missing, unexpected = model.load_state_dict(resume_ckpt["model_state_dict"], strict=not partial_load)
+        if partial_load and (missing or unexpected):
             print(f"  Partial load: {len(missing)} missing decoder keys (random init), {len(unexpected)} unexpected (ignored)")
-        if not args.freeze_encoder and "optimizer_state_dict" in resume_ckpt:
+        # Optimizer state only carries over for a full resume — partial loads start a
+        # fresh decoder (and possibly a different architecture), so prior Adam momentum
+        # would be meaningless / shape-mismatched.
+        if not partial_load and "optimizer_state_dict" in resume_ckpt:
             optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
-        # freeze_encoder: fresh decoder training — epoch counter restarts from 1.
+        # Partial loads (fresh decoder): epoch counter restarts from 1.
         # Regular resume: continue from where the checkpoint left off.
-        start_epoch = 1 if args.freeze_encoder else int(resume_ckpt.get("epoch", 0)) + 1
+        start_epoch = 1 if partial_load else int(resume_ckpt.get("epoch", 0)) + 1
         best_val = float(resume_ckpt.get("best_val", math.inf))
-        if args.reset_best_val or args.freeze_encoder:
+        if args.reset_best_val or partial_load:
             best_val = math.inf
             print(f"Resumed from {resume_path} (next_epoch={start_epoch}, best_val reset to inf)")
         else:

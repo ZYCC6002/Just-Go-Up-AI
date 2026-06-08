@@ -311,6 +311,10 @@ def build_model_from_checkpoint(
     )
 
     use_parallel = bool(ckpt_args.get("parallel_decoder", False))
+    # Back-compat: old checkpoints may not have saved parallel_decoder in args.
+    # Detect from state_dict keys — parallel decoder always has decoder.mlp.0.weight.
+    if not use_parallel and "decoder.mlp.0.weight" in ckpt["model_state_dict"]:
+        use_parallel = True
     if use_parallel:
         dec_cfg: RouteVAEParallelDecoderConfig | RouteVAEDecoderConfig = RouteVAEParallelDecoderConfig(
             type_vocab_size=type_vocab_size,
