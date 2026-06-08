@@ -9,8 +9,9 @@ All scripts are run with `uv run`. The `src/` directory is not an installed pack
 ```bash
 # Train CVAE (locally — usually done on Colab via notebooks/train_route_cvae.ipynb)
 uv run src/model_training/train_route_cvae.py \
-  --latent-dim 16 --free-bits 0.5 --kl-warmup-epochs 5 \
-  --grade-adversary-weight 2.0 --grade-adversary-alpha 2.0 --decoder-z-memory-tokens 8
+  --latent-dim 16 --free-bits 1.0 --kl-beta 0.1 \
+  --no-encoder-use-cond-adaln --no-decoder-use-cond-adaln \
+  --decoder-token-dropout 0.5
 
 # Build a KMeans cluster cache (required before visualization)
 uv run src/data_analysis/routes_cluster.py \
@@ -74,12 +75,10 @@ RouteConditionalVAE
 
 Key design decisions:
 - **`HoldTokenEmbedder`** (in `model_utils.py`) is instantiated inside both encoder and decoder configs but is logically identical — each hold becomes one token by concatenating independent embeddings for type/role/hole_id (learned tables) and x/y (sinusoidal) then projecting to `d_model`. The `function` feature was removed (it was 100% derivable from `type`: `foot` type → function `foot`, everything else → `both`).
-- **Encoder sees condition** (`encoder_use_condition=True`): grade/angle are injected into both encoder (via AdaLN) and decoder. The encoder uses grade context to normalise hold-token representations so z learns grade-relative style ("big move for this grade") rather than absolute spatial features that are grade-confounded. The adversary ensures residual grade doesn't leak into z. If z collapses onto grade, increase `--grade-adversary-weight` / `--grade-adversary-alpha`.
-- **Post-only AdaLN**: the decoder has a single AdaLN after the transformer stack (not before). A pre-decoder AdaLN was removed because it let the decoder reconstruct from angle/grade alone, causing posterior collapse.
-- **Free bits** (`--free-bits 0.5`): each latent dimension's KL is clamped from below at 0.5 nats. With `latent_dim=16` this forces KL ≥ 8.0 nats total, making full posterior collapse impossible.
-- **Adversarial disentanglement**: `GradeAngleAdversaryHead` + gradient reversal layer (GRL) in `route_vae_bottleneck.py` pushes both grade AND angle out of z. Two heads share a GRL-reversed trunk: (1) grade_head [B] — MSE against the route's own grade at its stored angle; (2) angle_head [B] — MSE against normalised angle. Grade is predicted at the route's stored angle only (not all 15 listed angles): with `encoder_use_condition=True`, z = f(route, angle_A), so only grade_A is directly encoded in z — grades at other angles are only weakly correlated via route difficulty and do not add meaningful adversarial signal. Combined adversary loss = grade_adv_loss + angle_adv_loss, weighted by `--grade-adversary-weight`. Requires free_bits to be effective.
-- **Encoder post-AdaLN scope**: `post_encoder_adaln` is applied only to hold tokens (indices 1:), NOT the CLS token at index 0. The CLS token becomes `route_embedding → z`; conditioning it post-transformer would bake grade/angle directly into z, making the adversary fight a hard-coded injection. The `pre_encoder_adaln` (applied before the transformer) still modulates all tokens including CLS, normalising hold features by grade/angle context before attention runs.
-- **Route embedding pooling** (`--route-pool-mode`): controls how the encoder produces the single `route_embedding` vector fed to the bottleneck. `"attention"` (default) — a single learned query vector (`pool_query`, `pool_attn`) attends over all hold token outputs via multi-head attention; the model learns which holds are most style-discriminating and produces a soft weighted summary. Hold tokens only — the shape/CLS token at position 0 is deliberately excluded, preventing shortcutting via pre-computed `shape_desc` statistics. `"cls"` — shape/CLS token at position 0; kept only for backward compatibility with checkpoints trained before attention pooling was added (those have no `pool_query`/`pool_attn` weights, so `build_model_from_checkpoint` defaults to `"cls"` for them).
+- **Fully unconditional VAE**: grade/angle are **not** injected into the encoder or decoder (`encoder_use_cond_adaln=False`, `decoder_use_cond_adaln=False`). The AdaLN machinery exists in the code but is disabled. z is the sole conditioning signal for the decoder, delivered via cross-attention on the projected latent vector. This means z must capture all route-level structure; grade/angle are encoded implicitly if the route tokens carry enough signal.
+- **Free bits** (`--free-bits 1.0`): each latent dimension's KL is clamped from below at 1.0 nats. With `latent_dim=16` this forces KL ≥ 16.0 nats total, making full posterior collapse impossible.
+- **Token dropout** (`--decoder-token-dropout 0.5`): during training, each decoder input token at positions 1+ is replaced with a learned `mask_token` embedding with probability 0.5. Forces the decoder to rely on z for hold structure rather than exploiting teacher-forced categorical/spatial context. Disabled at inference (`self.training=False`). BOS token at position 0 is never masked.
+- **Route embedding pooling** (`--route-pool-mode mean_max`): the encoder produces `route_embedding` by concatenating the mean and max of all hold token outputs → `Linear(2×d_model, d_model)`. The shape/CLS token at position 0 is excluded from pooling.
 
 ### `RouteSample` fields
 
@@ -103,24 +102,33 @@ Training runs on GPU via `notebooks/train_route_cvae.ipynb`. The notebook cell `
 
 ```python
 "latent_dim": 16,
-"free_bits": 2.0,               # 2.0 nats/dim → KL floor = 32 nats total; prevents collapse
-"kl_beta": 0.5,
+"free_bits": 1.0,               # 1.0 nats/dim → KL floor = 16.0 nats total; prevents collapse
+"kl_beta": 0.1,
 "kl_warmup_epochs": 0,
-"encoder_use_condition": True,  # Encoder sees grade/angle via AdaLN → grade-normalised style in z
-"grade_adversary_weight": 4.0,  # Strong adversary needed since encoder now has direct grade access
-"grade_adversary_alpha": 3.0,
 "batch_size": 32,
-"decoder_z_memory_tokens": 8,
-# Route embedding pooling: learned query attends over hold tokens — avoids CLS shortcutting
-"route_pool_mode": "attention",
+"val_batch_size": 256,          # larger OK: autoregressive val has no backprop memory pressure
+"numeric_weight": 10,
+"pairwise_weight": 5.0,
+"hole_loss_weight": 0.1,
+"decoder_token_dropout": 0.5,
+# Fully unconditional VAE — no grade/angle injected into encoder or decoder
+"encoder_use_cond_adaln": False,
+"decoder_use_cond_adaln": False,
+# Adversary disabled
+"grade_adversary_weight": 0.0,
+# Route embedding pooling: mean+max concatenated → Linear(2*d_model, d_model)
+"route_pool_mode": "mean_max",
 # Feature flags:
-#   use_absolute_pos=False  → no sinusoidal x/y in hold tokens; spatial info via deltas + knn only
+#   use_absolute_pos=True   → sinusoidal x/y embeddings in hold tokens
 #   use_type_feature=True   → hold-type embedding (jug/sloper/crimp/pinch) in tokens + type
 #                             fractions in shape_desc (9D CLS token)
-#   delta features (Δx, Δy) are always ON in the encoder (no flag; hardcoded use_delta=True)
+#   use_delta_features=False → Δx/Δy excluded from encoder tokens
+#   use_knn_features=False   → knn distance/bearing features excluded from encoder tokens
 # IMPORTANT: changing use_type_feature requires --rebuild-cache (shape_desc changes 5D ↔ 9D)
-"use_absolute_pos": False,
+"use_absolute_pos": True,
 "use_type_feature": True,
+"use_delta_features": False,
+"use_knn_features": False,
 # Encoder architecture (all exposed as CLI args, saved in checkpoint)
 "encoder_d_model": 256,          # 32 dims/head, richer per-hold representations
 "encoder_nhead": 8,
@@ -141,14 +149,14 @@ Training runs on GPU via `notebooks/train_route_cvae.ipynb`. The notebook cell `
 - `mean_move_norm` in `shape_desc` → divided by half the board diagonal → range [0, 1]
 - `x`, `y` raw coordinates are stored as-is; normalised at model time by `RouteVAEEncoderConfig.x_min/x_max/y_min/y_max` (corrected to [−20, 164] and [4, 176] from the actual `holes` table range).
 
-**Per-hold token projection dims** (current config: `use_type_feature=True`, `use_absolute_pos=False`):
-- Encoder: type(32) + role(8) + hole(16) + depth(8) + ori_sin(8) + ori_cos(8) + size(8) + Δx(8) + Δy(8) + knn(16) = **120 → projected to d_model**
-- Decoder: same minus knn and Δx/Δy = **72 → projected to d_model**
-- `x`/`y` sinusoidal embeddings omitted (`use_absolute_pos=False`); spatial info comes from Δx/Δy move deltas and knn distances/bearings only.
+**Per-hold token projection dims** (current config: `use_type_feature=True`, `use_absolute_pos=True`, `use_delta_features=False`, `use_knn_features=False`):
+- Encoder: type(32) + role(8) + hole(16) + depth(8) + ori_sin(8) + ori_cos(8) + size(8) + x_sin(16) + y_sin(16) = **120 → projected to d_model**
+- Decoder: same minus depth = type(32) + role(8) + hole(16) + ori_sin(8) + ori_cos(8) + size(8) + x_sin(16) + y_sin(16) = **112 → projected to d_model**
+- `x`/`y` sinusoidal embeddings included (`use_absolute_pos=True`); no delta (Δx/Δy) or knn features.
 - shape_desc = [x_std, y_std, foot_frac, hand_density, move_size, jug_frac, sloper_frac, crimp_frac, pinch_frac] → **9D**
   - Indices 0–4 are identical to the old 5D layout; old checkpoints truncate `[:5]` safely.
 
 After training, verify:
 - **KL** per epoch should remain ≥ `free_bits × latent_dim` (≥ 16.0 with free_bits=1.0, latent_dim=16). If KL collapses, increase free_bits.
-- **No adversary** in this config — grade/angle structure in z is intentional. Verify via Ridge probe in style_analysis.py: global cache should show moderate-high grade/angle R² (model encoded difficulty); micro-cluster cache should show near-zero grade/angle R² (grade/angle controlled).
+- **Grade/angle not injected**: neither encoder nor decoder receives grade/angle; z encodes whatever route-level structure is present in the hold tokens. Grade/angle R² in a Ridge probe of z reflects implicit encoding via hold features (harder routes tend to have different hold distributions), not explicit conditioning.
 - **Style feature R²** in micro-cluster analysis: foot_frac, move_size, crowding should be >0.1 (★) or >0.3 (★★) indicating z captures style.

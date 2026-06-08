@@ -2,10 +2,22 @@
 
 JustGoUpAI is a machine learning project built for climbers to augment their Kilter board training!
 
-This project aims to:
-1. Learn a route "style space" so climbs can be grouped by movement feel (dynamic, crimpy, powerful, etc.)
-2. Generate route ideas based on angle/grade preferences or similar existing climbs
-3. Eventually connect to send history for weakness analysis and anti-style recommendations
+Route style is continuous — most climbs blend multiple movement qualities rather than belonging cleanly to one category. The latent space reflects this: routes lie along a smooth manifold where neighbours share genuine stylistic similarity and cluster boundaries are soft.
+
+**Analysis** — a VAE encoder maps every route to a 16D style vector `z`, enabling:
+- Style clustering: group routes by movement feel (dynamic, crimpy, footwork-heavy)
+- Route similarity search: find climbs with genuinely similar style in latent space
+- Style profiling: characterise what makes each cluster distinctive across grip type, foot density, move size
+
+**Generation** (in progress) — a NAT decoder conditioned on `z` produces new routes, enabling:
+- Style-conditioned generation: sample from a cluster and decode to a novel climb
+- Route interpolation: blend two routes' style vectors to produce a hybrid
+- Style variation: perturb a route's `z` to generate similar alternatives
+- Partial route completion: aid route setters by completing partial climbs given some holds already placed
+
+**Personalisation** (future) — connecting send history to the analysis encoder:
+- Anti-style detection: identify style clusters a climber rarely visits
+- Weakness-targeted generation: produce routes that deliberately target gaps in a training diet
 
 ---
 
@@ -14,7 +26,7 @@ This project aims to:
 Primary data source:
 
 https://github.com/lemeryfertitta/BoardLib
-Unofficial wrapper to interact with Board APIs 
+Unofficial wrapper to interact with Board APIs
 
 Auxiliary metadata source:
 
@@ -23,81 +35,119 @@ Contains labelled data for the standard 12x12 Kilter board holds
 
 ---
 
-## Feature engineering
+## Architecture overview
 
-Quality filters: Only publicly available routes are used. Routes are also filtered by quality_average and ascenscionist_count. This intentionally biases training toward established routes with stronger community consensus.
+```
+SQLite DB (kilter_database.sqlite)
+    └─ database_interfaces/board_lib_interface.py   ← thin DB wrapper
+        └─ data_preprocessing/route_preprocessing.py  ← builds RouteSample list + vocabs
+            └─ model_training/train_route_cvae.py      ← trains VAE, saves checkpoint
+                └─ data_analysis/routes_cluster.py   ← extracts latents, KMeans or HDBSCAN
+                    ├─ data_analysis/routes_visualize.py         ← PCA / UMAP / t-SNE scatter
+                    ├─ data_analysis/style_analysis.py           ← cluster style profiling
+                    └─ data_analysis/route_neighbor_analysis.py  ← z-space neighbor validation
+src/route_visualizer.py  ← standalone board image renderer (clickable from scatter plots)
+```
 
-Per-Hold Token Construction: Each hold is embedded as a single token by independently embedding all features and concatenating before projection.
+The **VAE model** (`RouteConditionalVAE`) pairs one encoder with one decoder:
 
-Categorical features (type, role, hole_id) each get their own learned embedding table, allowing the model to learn dense geometric relationships between categories from co-occurrence in routes.
+```
+RouteConditionalVAE
+  ├── Encoder (choose one):
+  │     RouteTransformerEncoder  — bidirectional transformer over per-hold tokens
+  │     RouteMlpEncoder          — shallow MLP over the 9D shape_desc (baseline)
+  ├── RouteVAEBottleneck         — MLP → (mu, logvar) → reparameterised z [B, latent_dim]
+  └── Decoder (choose one):
+        RouteTransformerDecoder  — transformer cross-attending z; two modes:
+          · AR mode   (mask_rate=0)   — autoregressive with causal self-attention
+          · NAT mode  (mask_rate>0)   — masked bidirectional; no causal mask, mask_token injection
+        RouteParallelDecoder     — non-autoregressive MLP, predicts all positions independently from z
+```
 
-Coordinates use sinusoidal positional encoding on normalised values, providing multi-scale spatial representation across both fine-grained proximity and coarse board zones.
-
-### Encoder feature improvements
-
-**Problem solved**: The original encoder embedded each hold in isolation — it had no signal about how far apart holds are, or what the overall route shape looks like. Without these signals, the latent space had no way to distinguish a "deadpoint jug route" from a "technical footwork route" even when grade and angle were identical.
-
-**Hold sequence ordering**: Holds are sorted bottom-to-top by y-coordinate before encoding, creating a canonical climbing sequence. This makes the transformer's attention over the sequence correspond to the actual movement order on the wall.
-
-**Move delta features** (`delta_x_prev`, `delta_y_prev`): The horizontal and vertical distance from each hold to the previous one in the sorted sequence. These give the encoder a direct signal for move size — large deltas indicate dynamic/reachy moves; small deltas indicate technical, close-distance footwork. Available to both encoder and decoder (only prior context required).
-
-**Nearest-neighbour distance** (`dist_to_nearest`): The distance from each hold to the closest other hold on the route. This captures local density — a cluster of foot holds near a hand hold has a very different nearest-neighbour profile than an isolated deadpoint target.
-
-**Type embedding capacity** (`type_embed_dim` 16→32): The hold type is the most style-discriminating categorical feature, so its embedding dimension was doubled to give the model more representational capacity for distinguishing jug routes from crimp routes from sloper routes.
-
-**Route-level shape descriptor (CLS token)**: A 9-dimensional vector is computed from the full hold set and prepended to the hold sequence as a learned "shape token." The transformer attends to this token at every layer, giving each per-hold representation access to global route context. The 9 dimensions are:
-
-| Dim | Feature | Style signal |
-|-----|---------|-------------|
-| 0 | x-spread (std of x coords) | Compression / wide traverses |
-| 1 | y-spread (std of y coords) | Long vertical routes |
-| 2 | foot fraction (holds with foot role) | Technical footwork density |
-| 3 | hand count norm (hand holds / 20) | Endurance / route length |
-| 4 | jug fraction | Power / pump routes |
-| 5 | sloper fraction | Friction / balance routes |
-| 6 | crimp fraction | Crimp-intensive routes |
-| 7 | pinch fraction | Pinch-dominant routes |
-| 8 | mean pairwise move norm | Dynamic / reachy vs. technical |
-
-The shape token's output at position 0 is used as the `route_embedding` passed to the VAE bottleneck, replacing the previous masked mean-pool. This means the bottleneck encodes a global shape summary rather than an average of per-hold states.
+The transformer encoder + parallel decoder is the primary model for latent space analysis. Using a MLP decoder prevents posterior collapse and forces z to learn style. The generator model uses the frozen analysis encoder and NAT decoder. The MLP encoder and parallel decoder also act as fast baselines for ablation.
 
 ---
 
-## Model selection and considerations
+## Feature engineering
 
-### Why CVAE with transformer encoder/decoder
+### Quality filtering
 
-A CVAE was chosen to perform analysis and clustering of route data.
+Only publicly available routes are used. Routes are filtered by `quality_average` and `ascensionist_count` — training is intentionally biased toward established routes with strong community consensus.
 
-Reasoning:
+### Per-hold token construction
 
-- Latent Space analysis: We want a meaningful latent space for clustering/search.
-- Sequential Modelling: Routes are sequences, and transformers can model hold order and relationships between holds instead of treating each hold independently.
-- Context-conditioned routes: We want the learned representation to depend on context, since angle and grade change the route distribution.
-- Non-linear structure: The CVAE can capture non-linear relationships in route data that linear methods like PCA may miss.
-- Generative Capabilities: Because the latent space is continuous, we can sample from it to generate new routes as well as cluster existing ones.
+Each hold is embedded as a single token by independently embedding all features, concatenating them, and projecting to `d_model` via a linear layer (`HoldTokenEmbedder`).
 
-### Challenges Faced
+**Encoder token** (120 dims → projected to d_model):
 
-Posterior collapse: The decoder can reconstruct routes from the angle/grade AdaLN condition alone without reading z via cross-attention. Once it discovers this shortcut, z receives no gradient signal and collapses to the prior N(0, I) — the latent space becomes pure noise.
+| Feature | Dims | Encoding |
+|---------|------|----------|
+| type | 32 | learned embedding (jug / sloper / crimp / pinch / foot / …) |
+| role | 8 | learned embedding (hand / foot / start / finish) |
+| hole_id | 16 | learned embedding (593-way vocab) |
+| depth | 8 | learned embedding |
+| orientation sin/cos | 8+8 | sinusoidal |
+| size | 8 | learned embedding |
+| x sin/cos | 16 | sinusoidal positional on normalised coordinate |
+| y sin/cos | 16 | sinusoidal positional on normalised coordinate |
 
-Grade/angle entanglement: Even when angle and grade are provided as explicit conditions, the encoder can still embed them into z because it improves reconstruction. This means the dominant axis of the latent space tracks difficulty rather than style — KMeans clustering then just slices the difficulty gradient into bands instead of discovering movement patterns.
+Note: The embedding dimensions have additional capacity which could be optimized, but has low practical cost as is.
 
-Latent space quality is hard to evaluate: good reconstruction loss does not necessarily mean the latent space is useful for clustering or generation.
+### Route-level shape descriptor
 
-C-shaped manifold structure: PCA on the extracted latent vectors consistently revealed curved, C-shaped arcs rather than a compact spherical blob. The arcs are smooth, continuous manifold where nearby points correspond to similar climbing styles. However, it exposed a fundamental limitation of K-means clustering: the two tips of a C-arc can land in the same cluster simply because they're close in straight-line distance, even though they're far apart along the manifold and represent very different movement styles.
+A 9-dimensional summary of the full hold set (CLS token) is prepended to the sequence as a learned shape token, giving every per-hold representation access to global route context through transformer self-attention, providing an initial signal to speed up training:
 
-### Steps taken
+| Dim | Feature |
+|-----|---------|
+| 0 | x-spread (std / board_x_span) |
+| 1 | y-spread (std / board_y_span) |
+| 2 | foot fraction |
+| 3 | hand density (hand holds / 20) |
+| 4 | mean move norm |
+| 5 | jug fraction |
+| 6 | sloper fraction |
+| 7 | crimp fraction |
+| 8 | pinch fraction |
 
-KL annealing: KL pressure is increased gradually during training so the model first learns to reconstruct routes well, then is pushed toward a smooth, informative latent space. Beta is kept at 0.25 (rather than 1.0) to give z more capacity for style information.
+---
 
-Free bits (minimum KL per dimension): Each latent dimension's KL is clamped from below at a minimum threshold (λ = 0.5 nats) before summing. This prevents any dimension from fully collapsing to the prior — the encoder is forced to keep every z dimension active. With latent_dim=16 and λ=0.5, z must carry at least 8 nats of information, making the collapsed solution infeasible. Controlled by `--free-bits` (default 0.5).
+## Model design decisions
 
-Post-only AdaLN: Adaptive LayerNorm injects angle and grade into the decoder **after** the transformer stack (not before it). An earlier design applied AdaLN both before and after — this gave the decoder a powerful shortcut to satisfy reconstruction without ever reading z through cross-attention. Removing the pre-decoder AdaLN weakened this shortcut enough that the decoder must attend to z to reconstruct routes accurately, which keeps z informative.
+### Preventing posterior collapse
 
-Adversarial disentanglement: A small MLP adversary head is trained alongside the model to predict normalised grade and angle from z. A gradient reversal layer (GRL) sits between z and the adversary: the adversary's own weights are updated normally (it learns to predict grade/angle), but the gradient that flows back through z into the encoder is negated. This causes the encoder to actively hide grade/angle information from z, freeing the latent dimensions to capture style instead. Free bits are required for this to be effective — without them, z collapses to noise before the adversary can apply any pressure. Controlled by `--grade-adversary-weight` (default 0.5).
+Without explicit safeguards the decoder can reconstruct routes from the teacher-forced token sequence alone, ignoring `z` entirely. Two mechanisms prevent this:
 
-UMAP + HDBSCAN clustering: To address the C-shaped manifold problem, UMAP is applied as a pre-reduction step before clustering. UMAP is a manifold learning algorithm that "unfolds" curved structures and preserves the topological relationships between points, so that distances in the reduced space better reflect distances along the route style manifold. HDBSCAN is then applied to the UMAP-reduced representation. Unlike K-means, HDBSCAN finds clusters as regions of high density without assuming any particular cluster shape or count, and can label sparse inter-cluster routes as noise (label −1) — a route that doesn't cleanly fit any style archetype.
+**Free bits** (`--free-bits`, recommended 1.0): each latent dimension's KL is clamped from below at 1.0 nats before summing. With `latent_dim=16` this forces KL ≥ 16.0 nats total, making full collapse infeasible.
+
+**Decoder token dropout** (`--decoder-token-dropout`, recommended 0.5): during training, each decoder input token at positions 1+ is replaced with a learned `mask_token` embedding with probability 0.5. This forces the decoder to rely on `z` for hold structure rather than exploiting teacher-forced context. Dropout is disabled at inference.
+
+### Route embedding pooling
+
+`route_embedding` — the vector passed into the VAE bottleneck — is produced by concatenating the **mean and max** of all hold token outputs (shape token at position 0 excluded), then projecting through `Linear(2 × d_model, d_model)`. This `mean_max` pooling preserves both the average character of the route and its extremes (most unusual hold), giving the bottleneck a richer summary than either mean-only or CLS-only pooling.
+
+### KL scheduling
+
+KL pressure is ramped up gradually during training (`--kl-warmup-epochs`) so the model first learns reconstruction, then is pushed toward a smooth, informative latent space. `--kl-beta` (typically 0.03–0.1) keeps beta below 1.0 to preserve style capacity in `z` relative to a standard VAE.
+
+---
+
+## Clustering and analysis
+
+### Cluster cache
+
+`routes_cluster.py` loads a trained checkpoint, encodes all routes, standardises the latent vectors, and saves a `.pt` cluster cache. Every downstream tool reads from this cache — the model is never reloaded after this step.
+
+Supported clustering methods:
+- **KMeans** — fast, simple, works well for spherical cluster geometry
+- **HDBSCAN with UMAP pre-reduction** — originally motivated by arc-shaped manifold geometry that appeared when grade/angle leaked into z; UMAP unfolds curved structure before HDBSCAN finds density-based clusters without requiring a fixed cluster count; less critical with the current unconditional VAE but still available
+
+### Style analysis (`style_analysis.py`)
+
+Profiles each cluster's movement character along interpretable style axes:
+- Ridge regression probe: how well do aggregate features predict grade, hold count, and spatial spread from `z`? Reports R² and flags genuinely informative principal components
+- Per-cluster feature heatmap: z-score normalised means across foot fraction, move size, hold density, grip composition, etc.
+- Grade distribution per cluster
+- PCA scatter coloured by cluster
 
 ---
 
@@ -108,112 +158,192 @@ Requirements:
 - Python >= 3.13
 - Dependencies listed in [pyproject.toml](pyproject.toml)
 
-Install with your preferred workflow (for example `uv` or `pip`) using the project dependencies.
-
 ---
 
 ## Usage
 
-### 1) Train CVAE
+### 1) Train VAE
 
-Run:
+```bash
+python src/model_training/train_route_cvae.py \
+  --latent-dim 16 --free-bits 1.0 --kl-beta 0.1 \
+  --decoder-token-dropout 0.5
+```
 
-`python src/model_training/train_route_cvae.py`
+Key options:
 
-Useful options:
-
-- `--rebuild-cache`
-- `--checkpoint-path data/route_cvae.pt`
-- `--resume`
-- `--resume-path <path>`
-- `--epochs`, `--batch-size`, `--lr`, `--weight-decay`, `--latent-dim`
-- `--numeric-weight`, `--kl-beta`, `--kl-warmup-epochs`
-- `--encoder-use-condition`, `--encoder-use-cond-adaln`, `--decoder-use-cond-adaln`
-- `--decoder-z-memory-tokens`, `--grad-clip-norm`, `--seed`
-- `--max-routes`
-- `--grade-adversary-weight` — adversarial disentanglement strength (0 = disabled, 0.5 recommended)
-- `--grade-adversary-alpha` — gradient reversal layer scale factor
-- `--free-bits` — minimum KL per latent dimension in nats (0 = disabled, 0.5 recommended)
-
-Tip: if you change preprocessing filters, rebuild the cache and retrain so the checkpoint vocabularies still match.
+| Flag | Purpose |
+|------|---------|
+| `--rebuild-cache` | Regenerate preprocessed route cache from DB |
+| `--resume` / `--resume-path` | Continue training from checkpoint |
+| `--transfer-encoder-only` | Load encoder+bottleneck only; reinitialise decoder (use when decoder architecture changes) |
+| `--freeze-encoder` | Keep encoder weights fixed while training decoder |
+| `--reset-best-val` | Reset best-val tracking when resuming |
+| `--latent-dim` | Latent space dimensionality (recommended 16) |
+| `--free-bits` | Minimum KL per latent dim in nats (recommended 1.0) |
+| `--kl-beta` | KL weight (recommended 0.03–0.1) |
+| `--kl-warmup-epochs` | Epochs to ramp KL from 0 to `kl_beta` |
+| `--decoder-token-dropout` | Fraction of decoder input tokens masked during training (recommended 0.5) |
+| `--decoder-mask-rate` | Alternative: mask this fixed fraction of tokens regardless of position |
+| `--numeric-weight` | Weight on coordinate MSE in reconstruction loss |
+| `--move-vector-weight` | Additional loss on move-vector MSE (scaled by `numeric_weight`) |
+| `--hole-loss-weight` | Weight on hole-ID cross-entropy (reduce from 1.0 to shift gradient toward spatial structure) |
+| `--encoder-d-model` / `--encoder-nhead` / `--encoder-num-layers` | Encoder transformer size |
+| `--decoder-d-model` / `--decoder-num-layers` | Decoder transformer size |
+| `--use-type-feature` / `--no-use-type-feature` | Toggle hold-type embedding (changing this requires `--rebuild-cache`) |
+| `--use-absolute-pos` / `--no-use-absolute-pos` | Toggle sinusoidal x/y embeddings |
+| `--mlp-encoder` / `--no-mlp-encoder` | Use MLP encoder baseline instead of transformer encoder |
+| `--parallel-decoder` / `--no-parallel-decoder` | Use non-autoregressive parallel MLP decoder instead of transformer decoder |
 
 ### 2) Cluster the latent space
 
-First build a cluster cache. K-means is simple and fast; UMAP + HDBSCAN is better for the curved arc geometry:
-
 ```bash
 # K-means (6 clusters, all routes)
-python src/data_analysis/routes_cluster.py --method kmeans --n-clusters 6
+python src/data_analysis/routes_cluster.py \
+  --method kmeans --n-clusters 6 \
+  --cluster-cache-path data/routes_kmeans_original.pt
+
+# K-means filtered to V6 @ 40°
+python src/data_analysis/routes_cluster.py \
+  --method kmeans --n-clusters 6 \
+  --min-grade 22 --max-grade 22 --min-angle 40 --max-angle 40 \
+  --cluster-cache-path data/routes_v6_40deg_kmeans.pt
 
 # HDBSCAN with UMAP pre-reduction (recommended for manifold data)
 python src/data_analysis/routes_cluster.py \
   --method hdbscan --pre-reduce --pre-reduce-method umap --pre-reduce-dims 5 \
-  --min-grade 22 --max-grade 22 --min-angle 40 --max-angle 40 \
-  --hdbscan-min-cluster-size 20 --hdbscan-min-samples 2
-
-# Filter by grade/angle before clustering (e.g. V6 at 40°)
-python src/data_analysis/routes_cluster.py \
-  --method kmeans --n-clusters 6 --min-grade 22 --max-grade 22 --min-angle 40 --max-angle 40
+  --umap-n-neighbors 50 --umap-min-dist 0.0 \
+  --hdbscan-min-cluster-size 200 --hdbscan-min-samples 15 --no-noise \
+  --cluster-cache-path data/routes_hdbscan_umap.pt
 ```
 
 ### 3) Visualize clustered latents
 
-Visualization reads the precomputed cluster cache — it does not reload the model. PCA, UMAP, and t-SNE projections are all available:
-
 ```bash
-python src/data_analysis/routes_visualize.py --method pca  --cluster-cache-path data/routes_clustered.pt --show
-python src/data_analysis/routes_visualize.py --method umap --cluster-cache-path data/routes_clustered.pt --show
-python src/data_analysis/routes_visualize.py --method tsne --cluster-cache-path data/routes_clustered.pt --show
+python src/data_analysis/routes_visualize.py --method pca  --cluster-cache-path data/routes_kmeans_original.pt --show
+python src/data_analysis/routes_visualize.py --method umap --cluster-cache-path data/routes_hdbscan_umap.pt --show
+python src/data_analysis/routes_visualize.py --method tsne --cluster-cache-path data/routes_kmeans_original.pt --show
+
+# 3D rotatable plot
+python src/data_analysis/routes_visualize.py --method umap --cluster-cache-path data/routes_kmeans_original.pt --n-dims 3 --show
 ```
 
-Common options: `--max-routes`, `--disable-click-visualizer`.
+Click any point in the scatter plot to render that route on a board image. Add `--n-dims 3` for a rotatable 3D projection (default is 2).
 
-### 4) Route visualization
+### 4) Style analysis
 
-Run:
+```bash
+python src/data_analysis/style_analysis.py \
+  --cluster-cache-path data/routes_v6_40deg_kmeans.pt \
+  --output-path data/style_analysis.png
+```
 
-`python src/route_visualizer.py --climb-name "Alberts dream"`
+Produces a multi-panel figure (UMAP scatter, PCA variance, feature heatmap, PCA scatter, grade distributions, Ridge diagnostics) and prints a per-cluster summary table to stdout.
+
+### 5) Neighbor analysis
+
+```bash
+python src/data_analysis/route_neighbor_analysis.py \
+  --cluster-cache-path data/routes_kmeans_original.pt \
+  --climb-name "Alberts dream" --climb-name "undermine" \
+  --k 5 --max-routes 1500
+
+# Random queries instead of named climbs
+python src/data_analysis/route_neighbor_analysis.py \
+  --cluster-cache-path data/routes_kmeans_original.pt \
+  --num-random-queries 5 --k 5 --n-pairs 200
+```
+
+### 6) Visualize a single route
+
+```bash
+python src/route_visualizer.py --climb-name "Alberts dream"
+```
+
+---
+
+## Latent space analysis
+
+Analysis figures are generated with `style_analysis.py` from cluster caches built using `analysis_model.pt` (transformer encoder + parallel MLP decoder, latent_dim=16, epoch 368). All figures use K-means with 6 clusters.
+
+### Global — all routes (n=5,000)
+
+![Global style analysis](data/analysis/style_global.png)
+
+Key diagnostics:
+- **Grade R² from z**: 0.38 — grade is moderately recoverable from latent, not dominant
+- **Genuine style PCs**: 7/16 — latent space carries more than just difficulty signal
+- **Strongly encoded features** (R² ≥ 0.3): `num_holds` (0.72), `jug_frac` (0.69), `step_height` (0.68), `foot_frac` (0.65), `crowding` (0.63), `crimp_frac` (0.44), `knn_move_dist` (0.35)
+
+---
+
+### Micro — V6 @ 40° (n=903, all available)
+
+![V6 @ 40° style analysis](data/analysis/style_v6_40deg.png)
+
+With grade and angle held constant, the latent space organises purely around movement style
+
+Key diagnostics:
+- **Genuine style PCs**: 8/16 — more style PCs than in the global case (no difficulty gradient consuming capacity)
+- **Strongly encoded features** (R² ≥ 0.3): `num_holds` (0.88), `foot_frac` (0.68), `jug_frac` (0.66), `step_height` (0.66), `crowding` (0.64), `crimp_frac` (0.50), `knn_move_dist` (0.20)
+
+To regenerate:
+
+```bash
+# Global (5,000 routes)
+python src/data_analysis/routes_cluster.py \
+  --checkpoint-path data/models/analysis_model.pt \
+  --method kmeans --n-clusters 6 --max-routes 5000 \
+  --cluster-cache-path data/analysis/global_kmeans.pt
+
+python src/data_analysis/style_analysis.py \
+  --cluster-cache-path data/analysis/global_kmeans.pt \
+  --output-path data/analysis/style_global.png
+
+# V6 @ 40° (all ~903 available routes)
+python src/data_analysis/routes_cluster.py \
+  --checkpoint-path data/models/analysis_model.pt \
+  --method kmeans --n-clusters 6 --max-routes 5000 \
+  --min-grade 22 --max-grade 22 --min-angle 40 --max-angle 40 \
+  --cluster-cache-path data/analysis/v6_40deg_kmeans.pt
+
+python src/data_analysis/style_analysis.py \
+  --cluster-cache-path data/analysis/v6_40deg_kmeans.pt \
+  --output-path data/analysis/style_v6_40deg.png \
+  --no-grade-panel
+```
 
 ---
 
 ## Current status
 
-- End-to-end flow is in place (data → train → cluster → visualize).
-- Clustering and visualization are separated into two scripts (`routes_cluster.py`, `routes_visualize.py`) sharing a precomputed cache — clustering is done once and all projection methods read the same labels.
-- Supports K-means and HDBSCAN clustering, with optional UMAP/PCA pre-reduction; PCA, UMAP, and t-SNE visualization.
-- Preprocessing filters by route quality and ascensionist count by default.
-- Adversarial disentanglement (GRL) added to prevent grade/angle from dominating z.
-- Free bits (λ=0.5 nats/dim) added to prevent posterior collapse.
-- Encoder feature improvements (delta moves, grip category, shape CLS token) added to capture style signals beyond hold position.
-- Post-only AdaLN in decoder removes the conditioning shortcut that caused posterior collapse in earlier runs.
+**Analysis pipeline** — complete end-to-end:
+- VAE encoder produces a 16D style latent `z` per route, independent of grade and angle
+- KMeans and HDBSCAN+UMAP clustering with reusable `.pt` cluster caches
+- Style profiling via Ridge regression probes and feature heatmaps (`style_analysis.py`)
+- z-space neighbor validation against Earth Mover's Distance ground truth (`route_neighbor_analysis.py`)
+- PCA / UMAP / t-SNE scatter visualization with optional 3D projection and click-to-render
 
-### Latent space quality (current model)
-
-After the encoder feature improvements and architectural fixes, PCA on 5,000 extracted latents shows:
-
-| Metric | Before | After |
-|--------|--------|-------|
-| PC1 explained variance | 73% | 42.5% |
-| Effective dimensionality (95% variance) | ~1–2 dims | ~4 dims |
-| t-SNE cluster structure | Scattered islands | Contiguous regions |
-
-With grade and angle held constant (V6 @ 40°, n=256 routes), the 6 KMeans clusters differentiate on style axes rather than difficulty:
-
-- **Foot-type hold density** (0% vs 41% foot-type holds across clusters) — technical footwork vs. power route
-- **Move size** (mean pairwise move norm 0.558 vs 0.612) — tight/compressed vs. dynamic/reachy
-- **Route length** (8.4 vs 13.8 mean holds) — short power problems vs. sustained endurance routes
-- **Grip composition** (jug-dominant vs. mixed hand/foot) — juggy pull routes vs. coordinated movement routes
-
----
+**Generation pipeline** — functional baseline:
+- NAT decoder conditioned on frozen analysis encoder's `z` can reconstruct and generate routes
+- Style-conditioned generation by sampling near cluster centroids
 
 ## Future goals
 
-<!-- 1. **Generation quality**: make decoded routes feel more climbable and intentional.
-2. **Recommendations**: suggest routes by style similarity and training goals.
-3. **Evaluation**: build practical metrics for novelty, feasibility, and difficulty calibration.
-4. **Coverage**: improve performance across underrepresented angle/grade slices.
-5. **Reproducibility**: tighten experiment tracking for model/data/version comparisons.
-6. **Productization**: expose route search/generation through a simple CLI or API. -->
+**Personalisation**
+- Connect send history to the analysis encoder to build per-climber style profiles
+- Anti-style detection: surface style clusters the climber rarely visits
+- Weakness-targeted route generation: sample from underrepresented style regions
+
+**Generation quality**
+- Make decoded routes feel more climbable and intentional (hold sequencing, reachability)
+- Grade transfer: encode a route's style at one grade, shift difficulty, decode
+- Route completion: given partial holds already placed, condition `z` to suggest the remainder
+- Evaluation metrics for novelty, feasibility, and difficulty calibration
+
+**Productisation**
+- Expose route search, similarity, and generation through a web app
+- Tighten experiment tracking for model/data/version comparisons
 
 ---
 
