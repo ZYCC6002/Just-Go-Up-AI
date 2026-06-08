@@ -11,7 +11,6 @@ Style characterisation panels (what is the style?):
   · PC1 vs PC2 scatter (latent PCA space, coloured by cluster)
   · Feature heatmap per cluster (9 interpretable features, row-normalised)
   · Grade distribution per cluster (confirms grade control in micro-clusters)
-  · move_size vs foot_frac scatter — primary style-axis cross-plot
 
 Architecture context (unconditional VAE):
   · z encodes grade + angle + style simultaneously (no AdaLN conditioning)
@@ -565,7 +564,7 @@ def _plot_diagnostic(
 
     txt(0.5, y, "Style Learning Diagnostics", ha="center", fontsize=11,
         fontweight="bold"); y -= dh * 0.7
-    txt(0.5, y, "unconditional VAE — z encodes grade + angle + style", ha="center",
+    txt(0.5, y, "VAE — z encodes grade + angle + style", ha="center",
         fontsize=7.5, color="#666666", style="italic"); y -= dh * 0.55
     ax.axhline(y + dh * 0.2, color="#CCCCCC", lw=0.8)
     y -= dh * 0.1
@@ -714,7 +713,7 @@ def _plot_pc_scatter(
     ev2 = pc_ev_ratio[1] * 100 if len(pc_ev_ratio) > 1 else 0
     ax.set_xlabel(f"PC1  ({ev1:.1f}% var)", fontsize=8)
     ax.set_ylabel(f"PC2  ({ev2:.1f}% var)", fontsize=8)
-    ax.set_title("PC1 vs PC2 (latent PCA space)\nClusters should separate if style is learned", fontsize=9)
+    ax.set_title("PC1 vs PC2 (latent PCA space)", fontsize=9)
     ax.tick_params(labelsize=8)
     ax.grid(alpha=0.25)
 
@@ -740,7 +739,7 @@ def _plot_grade_box(
         patch.set_facecolor(colors[c]); patch.set_alpha(0.75)
 
     ax.set_xticklabels([f"C{c}" for c in unique], fontsize=7)
-    ax.set_title("Grade distribution per cluster\n(ideal: overlapping in micro-cluster)", fontsize=9)
+    ax.set_title("Grade distribution per cluster", fontsize=9)
     ax.set_ylabel("difficulty_average", fontsize=8)
     ax.tick_params(labelsize=8)
     ax.grid(axis="y", alpha=0.3)
@@ -750,31 +749,6 @@ def _plot_grade_box(
                          (22, "V6"), (26, "V8"), (30, "V10")]:
         ax.axhline(gval, color="grey", lw=0.6, ls="--", alpha=0.45)
         ax.text(len(unique) + 0.15, gval, vlabel, fontsize=6.5, color="grey", va="center")
-
-
-def _plot_style_scatter(
-    ax,
-    features: np.ndarray,
-    cluster_ids: np.ndarray,
-    stats: dict,
-    colors: dict,
-) -> None:
-    """move_size vs foot_frac scatter — the two primary style axes."""
-    for c, st in stats.items():
-        mask = cluster_ids == c
-        ax.scatter(features[mask, FEAT_MOVE_SIZE], features[mask, FEAT_FOOT_FRAC],
-                   c=colors[c], s=5, alpha=0.15, linewidths=0, rasterized=True)
-    for c, st in stats.items():
-        mv = st["mean"][FEAT_MOVE_SIZE]
-        ff = st["mean"][FEAT_FOOT_FRAC]
-        ax.scatter(mv, ff, s=180, color=colors[c], zorder=5, edgecolors="black", lw=0.8)
-        ax.text(mv + 0.003, ff + 0.005, f"C{c}",
-                fontsize=6.5, fontweight="bold", color=colors[c])
-    ax.set_xlabel("move_size  (tight=0 → full-board reach=1)", fontsize=8)
-    ax.set_ylabel("foot_fraction  (power=0 → technical=1)", fontsize=8)
-    ax.set_title("Primary style axes\n(move geometry vs. foot usage)", fontsize=9)
-    ax.tick_params(labelsize=8)
-    ax.grid(alpha=0.3)
 
 
 # ---------------------------------------------------------------------------
@@ -797,26 +771,30 @@ def make_figure(
     latent_dim: int,
     method: str = "kmeans",
     title_suffix: str = "",
+    show_grade_panel: bool = True,
     output_path: str,
 ) -> None:
     unique_clusters = sorted(stats.keys())
     colors = _cluster_colors(unique_clusters)
     n_samples = len(cluster_ids)
 
-    fig = plt.figure(figsize=(24, 20), constrained_layout=True)
+    if show_grade_panel:
+        fig = plt.figure(figsize=(24, 20), constrained_layout=True)
+        gs = gridspec.GridSpec(3, 3, figure=fig, height_ratios=[1.8, 1.3, 1.1])
+    else:
+        fig = plt.figure(figsize=(24, 15), constrained_layout=True)
+        gs = gridspec.GridSpec(2, 3, figure=fig, height_ratios=[1.8, 1.3])
+
     fig.suptitle(
         f"VAE Style Analysis{title_suffix}",
         fontsize=15, fontweight="bold",
     )
-    gs = gridspec.GridSpec(3, 3, figure=fig, height_ratios=[1.8, 1.3, 1.1])
 
     ax_scatter  = fig.add_subplot(gs[0, :2])   # UMAP/PCA scatter (wide)
     ax_diag     = fig.add_subplot(gs[0, 2])    # diagnostic summary
     ax_scree    = fig.add_subplot(gs[1, 0])    # scree + parallel analysis
     ax_heatmap  = fig.add_subplot(gs[1, 1])    # feature heatmap
     ax_pcscat   = fig.add_subplot(gs[1, 2])    # PC1 vs PC2 scatter
-    ax_grade    = fig.add_subplot(gs[2, :2])   # grade box plots (wide, fills gap left by removed panel)
-    ax_style    = fig.add_subplot(gs[2, 2])    # move_size vs foot_frac
 
     _plot_scatter(ax_scatter, projected_2d, cluster_ids, stats, colors,
                   proj_label, method)
@@ -830,9 +808,9 @@ def make_figure(
 
     _plot_pc_scatter(ax_pcscat, pc_scores, pc_ev_ratio, cluster_ids, stats, colors)
 
-    _plot_grade_box(ax_grade, features, cluster_ids, stats, colors)
-
-    _plot_style_scatter(ax_style, features, cluster_ids, stats, colors)
+    if show_grade_panel:
+        ax_grade = fig.add_subplot(gs[2, :])
+        _plot_grade_box(ax_grade, features, cluster_ids, stats, colors)
 
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     print(f"Saved: {output_path}")
@@ -936,6 +914,9 @@ def main() -> None:
                         help="Keep routes with floor(grade) <= this (e.g. 22 for V6).")
     parser.add_argument("--min-angle", type=float, default=None)
     parser.add_argument("--max-angle", type=float, default=None)
+    parser.add_argument("--no-grade-panel", action="store_true",
+                        help="Omit the grade distribution panel (useful for micro-clusters "
+                             "where grade has no variance).")
     parser.add_argument("--no-umap", action="store_true",
                         help="Use PCA for 2D scatter instead of UMAP.")
     parser.add_argument("--umap-n-neighbors", type=int, default=30)
@@ -1030,6 +1011,7 @@ def main() -> None:
         latent_dim=latent_matrix.shape[1],
         method=method,
         title_suffix=title_suffix,
+        show_grade_panel=not args.no_grade_panel,
         output_path=args.output_path,
     )
 
