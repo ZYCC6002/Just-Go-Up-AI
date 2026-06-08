@@ -1242,8 +1242,10 @@ def main() -> None:
         # kl=X(+Y): X = raw unweighted KL, Y = excess above kl_floor (diagnostic).
         train_pairwise_w = args.numeric_weight * args.pairwise_weight * train_m.pairwise_loss
         val_pairwise_w   = args.numeric_weight * args.pairwise_weight * val_m.pairwise_loss
-        train_kl_w = train_m.total_loss - train_recon - train_pairwise_w
-        val_kl_w   = val_m.total_loss - val_recon - val_pairwise_w
+        train_move_vector_w = args.numeric_weight * args.move_vector_weight * train_m.move_vector_loss
+        val_move_vector_w   = args.numeric_weight * args.move_vector_weight * val_m.move_vector_loss
+        train_kl_w = train_m.total_loss - train_recon - train_pairwise_w - train_move_vector_w
+        val_kl_w   = val_m.total_loss - val_recon - val_pairwise_w - val_move_vector_w
         train_kl_excess = max(train_m.kl_raw - kl_floor, 0.0)
         val_kl_excess = max(val_m.kl_raw - kl_floor, 0.0)
 
@@ -1370,7 +1372,8 @@ def main() -> None:
         )
     test_recon = test_m.categorical_loss + args.numeric_weight * test_m.numeric_loss
     test_pairwise_w = args.numeric_weight * args.pairwise_weight * test_m.pairwise_loss
-    test_kl_w = test_m.total_loss - test_recon - test_pairwise_w
+    test_move_vector_w = args.numeric_weight * args.move_vector_weight * test_m.move_vector_loss
+    test_kl_w = test_m.total_loss - test_recon - test_pairwise_w - test_move_vector_w
     test_kl_excess = max(test_m.kl_raw - args.free_bits * args.latent_dim, 0.0)
     print(
         f"Test (teacher-forced) | total={test_m.total_loss:.4f} recon={test_recon:.4f} kl_w={test_kl_w:.4f} "
