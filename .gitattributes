@@ -21,4 +21,5 @@ data/raw/kilter_images/product_sizes_layouts_sets/78-1.png filter=lfs diff=lfs m
 data/raw/kilter_images/product_sizes_layouts_sets/original-16x12-bolt-ons-v2.png filter=lfs diff=lfs merge=lfs -text
 data/raw/kilter_images/product_sizes_layouts_sets/original-16x12-screw-ons-v2.png filter=lfs diff=lfs merge=lfs -text
 data/models/analysis_model.pt filter=lfs diff=lfs merge=lfs -text
+data/models/cluster_19e1e1c68143.pt filter=lfs diff=lfs merge=lfs -text
 data/analysis/*.png filter=lfs diff=lfs merge=lfs -text
