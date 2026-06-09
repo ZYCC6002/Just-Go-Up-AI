@@ -227,8 +227,9 @@ def visualize_route(climb_name: str, *, sample=None) -> None:
         gridspec_kw={"width_ratios": [3, 1]},
     )
 
-    ax_img.imshow(img)
+    ax_img.imshow(img, interpolation="nearest")
     ax_img.set_title(climb.name)
+    ax_img.set_facecolor("white")
     ax_img.axis("off")
 
     for hold in holds:
@@ -256,6 +257,7 @@ def visualize_route(climb_name: str, *, sample=None) -> None:
     )
     ax_info.axis("off")
 
+    fig.patch.set_facecolor("white")
     fig.tight_layout()
     plt.show()
 

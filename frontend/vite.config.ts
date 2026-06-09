@@ -4,6 +4,10 @@ import react from '@vitejs/plugin-react'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+  define: {
+    // plotly.js references Node's `global`; polyfill for browser builds
+    global: 'globalThis',
+  },
   build: {
     // 1. Empties the target backend folders before building fresh copies
     emptyOutDir: true,

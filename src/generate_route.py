@@ -173,8 +173,9 @@ def visualize_generated_route(
         1, 2, figsize=(14, 8),
         gridspec_kw={"width_ratios": [3, 1]},
     )
-    ax_img.imshow(img)
+    ax_img.imshow(img, interpolation="nearest")
     ax_img.set_title(title)
+    ax_img.set_facecolor("white")
     ax_img.axis("off")
 
     placed: list[dict] = []
@@ -218,6 +219,7 @@ def visualize_generated_route(
         linespacing=1.55,
     )
     ax_info.axis("off")
+    fig.patch.set_facecolor("white")
     fig.tight_layout()
 
     if output_path:

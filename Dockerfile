@@ -28,17 +28,13 @@ COPY pyproject.toml ./
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir .
 
-# Copy source and backend
+# Copy source, backend, and checked-in data assets
 COPY src/ ./src/
 COPY backend/ ./backend/
+COPY data/ ./data/
 
 # Copy built frontend assets from stage 1
 COPY --from=frontend-builder /app/backend/static ./backend/static
-
-# Create data dirs — models and DB are not in the image.
-# At startup, backend/app.py should download them from HF Hub if not present.
-# See: https://huggingface.co/docs/huggingface_hub/guides/download
-RUN mkdir -p data/models data/raw
 
 RUN chown -R 1000:1000 /app
 USER 1000

@@ -17,6 +17,9 @@ wheels/
 # Images
 data/raw/kilter_images
 
+#Logs
+data/logs
+
 # Models
 models/
 *.pt
