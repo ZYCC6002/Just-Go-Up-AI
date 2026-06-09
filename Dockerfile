@@ -38,7 +38,7 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 # --no-dev            → skip dev/notebook dependencies
 ENV UV_SYSTEM_PYTHON=1
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --inexact
+RUN uv sync --frozen --no-dev --inexact --no-install-project
 
 # Copy source, backend, and checked-in data assets
 # (includes data/models/analysis_model.pt and the pre-built default cluster cache)
@@ -57,4 +57,4 @@ EXPOSE 7860
 # Single worker: cluster jobs run in BackgroundTasks (in-process _jobs dict),
 # so multiple workers would break job-status polling.
 # PyTorch already uses both vCPUs internally via OpenMP/MKL.
-CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["python", "-m", "uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "7860"]
