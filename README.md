@@ -1,11 +1,16 @@
 ---
-title: JustGoUpAI
-emoji: 🧗
+title: My Cool Demo
+emoji: 🧗‍♂️
 colorFrom: blue
-colorTo: indigo
-sdk: docker
-app_port: 7860
-pinned: false
+colorTo: green
+sdk: gradio
+sdk_version: 5.0.0
+python_version: 3.10
+app_file: app.py
+short_description: A simple interactive demo
+tags:
+  - demo
+  - classification
 ---
 
 # JustGoUpAI
