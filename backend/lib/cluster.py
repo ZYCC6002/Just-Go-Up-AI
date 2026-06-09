@@ -25,12 +25,16 @@ DEFAULT_CACHE_KEY = "19e1e1c68143"
 
 
 def _evict_oldest_caches() -> None:
-    """Delete the oldest cluster_*.pt files if more than _MAX_CACHES exist."""
-    caches = sorted(
-        _MODELS_DIR.glob("cluster_*.pt"),
+    """Delete the oldest cluster_*.pt files if more than _MAX_CACHES exist.
+
+    The DEFAULT_CACHE_KEY file is never evicted.
+    """
+    default_path = get_cache_path(DEFAULT_CACHE_KEY)
+    evictable = sorted(
+        (p for p in _MODELS_DIR.glob("cluster_*.pt") if p != default_path),
         key=lambda p: p.stat().st_mtime,
     )
-    for old in caches[:-_MAX_CACHES]:
+    for old in evictable[:-_MAX_CACHES]:
         old.unlink(missing_ok=True)
 
 

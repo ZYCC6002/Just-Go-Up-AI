@@ -94,6 +94,13 @@ export default function App() {
 
   useEffect(() => () => stopPolling(), [stopPolling]);
 
+  // ── Auto-load pre-built default cache on mount ────────────────────────────
+  useEffect(() => {
+    api.getDefaultCluster()
+      .then((job) => setClusterJob(job))
+      .catch(() => { /* no pre-built cache — user must cluster manually */ });
+  }, []);
+
   // ── Cluster ───────────────────────────────────────────────────────────────
   const handleCluster = useCallback(async () => {
     stopPolling();

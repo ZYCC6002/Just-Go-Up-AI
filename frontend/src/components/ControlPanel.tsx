@@ -326,6 +326,9 @@ export default function ControlPanel({
       </div>
 
       {/* ── CLUSTER BUTTON ── */}
+      <div style={{ fontSize: 10, color: "#555", marginBottom: 5, lineHeight: 1.4 }}>
+        ⚠ Custom configs not in cache may take <strong style={{ color: "#666" }}>1–3 min</strong> on shared hardware.
+      </div>
       <button
         onClick={onCluster}
         disabled={isRunning}
