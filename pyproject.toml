@@ -21,3 +21,15 @@ dependencies = [
     "pillow>=10.0.0",
     "hf-xet>=1.5.1",
 ]
+
+# Use the CPU-only PyTorch wheel on Linux (Docker / HF Spaces).
+# On macOS the regular PyPI wheel is used instead.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
