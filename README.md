@@ -1,16 +1,11 @@
 ---
-title: My Cool Demo
+title: Just Go Up AI
 emoji: 🧗‍♂️
 colorFrom: blue
 colorTo: green
-sdk: gradio
-sdk_version: 5.0.0
-python_version: 3.10
-app_file: app.py
-short_description: A simple interactive demo
-tags:
-  - demo
-  - classification
+sdk: docker
+python_version: 3.13
+short_description: ML project for Kilter Board Traning!
 ---
 
 # JustGoUpAI
