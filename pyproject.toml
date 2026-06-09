@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "boardlib>=0.14.1",
+    "fastapi>=0.136.3",
+    "uvicorn>=0.34.0",
     "ipykernel>=7.2.0",
     "matplotlib>=3.10.8",
     "numpy>=2.4.2",
@@ -15,4 +17,5 @@ dependencies = [
     "scikit-learn>=1.6.0",
     "torch>=2.10.0",
     "umap-learn>=0.5",
+    "hf-xet>=1.5.1",
 ]
