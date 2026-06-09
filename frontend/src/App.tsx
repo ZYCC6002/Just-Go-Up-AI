@@ -189,6 +189,19 @@ export default function App() {
           onSelectRoute={handleSelectRoute}
           sidebarWidth={260 + routePanelWidth + 6}
         />
+        {vizData && !expandedRoute && (
+          <div style={{
+            position: "absolute",
+            bottom: 12,
+            left: 12,
+            fontSize: 11,
+            color: "#999",
+            pointerEvents: "none",
+            userSelect: "none",
+          }}>
+            Click a dot to view the route →
+          </div>
+        )}
         {expandedRoute && (
           <div
             onClick={() => setExpandedRoute(null)}

@@ -431,6 +431,9 @@ export default function ControlPanel({
         </Row>
       </div>
 
+      <div style={{ fontSize: 10, color: "#555", marginBottom: 5, lineHeight: 1.4 }}>
+        ⚠ First visualization may take <strong style={{ color: "#666" }}>~1 min</strong> to project.
+      </div>
       <button
         onClick={onVisualize}
         disabled={!hasCacheKey || vizLoading || !jobDone}
