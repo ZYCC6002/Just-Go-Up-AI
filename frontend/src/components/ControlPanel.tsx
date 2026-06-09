@@ -326,26 +326,25 @@ export default function ControlPanel({
       </div>
 
       {/* ── CLUSTER BUTTON ── */}
-      <div style={{ fontSize: 10, color: "#555", marginBottom: 5, lineHeight: 1.4 }}>
-        ⚠ Custom configs not in cache may take <strong style={{ color: "#666" }}>1–3 min</strong> on shared hardware.
+      <div style={{ fontSize: 10, color: "#666", marginBottom: 5, lineHeight: 1.4, fontStyle: "italic" }}>
+        🚧 Custom clustering temporarily disabled during development.
       </div>
       <button
         onClick={onCluster}
-        disabled={isRunning}
+        disabled={true}
         style={{
           marginTop: 4,
           padding: "8px 0",
-          background: isRunning ? "#2a2a2a" : "#3b82f6",
-          color: isRunning ? "#666" : "#fff",
+          background: "#2a2a2a",
+          color: "#444",
           border: "none",
           borderRadius: 5,
           fontWeight: 600,
           fontSize: 13,
-          cursor: isRunning ? "not-allowed" : "pointer",
-          transition: "background 0.2s",
+          cursor: "not-allowed",
         }}
       >
-        {isRunning ? "Clustering…" : "Cluster"}
+        Cluster
       </button>
 
       {clusterJob && (
