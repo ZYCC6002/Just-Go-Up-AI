@@ -20,6 +20,7 @@ from data_analysis.clustered_analysis_utils import reduce_dimensions, standardiz
 from model_training import (
     DecoderEOSIds,
     build_model_from_checkpoint,
+    collate_hold_token_batch,
     filter_samples_by_decoder_max_len,
     iter_minibatches,
     select_device,
@@ -233,6 +234,36 @@ def _extract_latent_matrix(
     return np.vstack(latents)
 
 
+_ONNX_INPUT_NAMES = [
+    "type_encoded_id", "role_encoded_id", "hole_encoded_id",
+    "x", "y", "depth", "orientation_sin", "orientation_cos", "size",
+    "padding_mask", "shape_desc",
+]
+
+
+def _extract_latent_matrix_onnx(
+    *,
+    ort_session: Any,
+    samples: list[RouteSample],
+    batch_size: int,
+) -> np.ndarray:
+    """Extract mu vectors via ONNX Runtime (no PyTorch model required).
+
+    The ONNX session must have been exported with input names matching
+    _ONNX_INPUT_NAMES and outputs ["mu", "logvar"].  mu is used directly
+    as z (equivalent to sample_latent=False in the PyTorch bottleneck).
+    """
+    latents: list[np.ndarray] = []
+    for i in range(0, len(samples), batch_size):
+        batch = collate_hold_token_batch([s.tokens for s in samples[i : i + batch_size]])
+        ort_inputs = {name: batch[name].numpy() for name in _ONNX_INPUT_NAMES}
+        mu, _ = ort_session.run(["mu", "logvar"], ort_inputs)
+        latents.append(mu)
+    if not latents:
+        raise ValueError("No latent vectors extracted.")
+    return np.vstack(latents)
+
+
 def run_analysis(
     *,
     db_path: str,
@@ -260,6 +291,7 @@ def run_analysis(
     include_ungraded: bool,
     seed: int,
     no_noise: bool,
+    onnx_path: str | None = None,
 ) -> None:
     samples, vocabs = _load_samples_and_vocabs(
         db_path=db_path,
@@ -339,24 +371,35 @@ def run_analysis(
             for s, g in zip(samples, grades_at_angle)
         ]
 
-    device = select_device()
-    print(f"Using device: {device}")
+    if onnx_path is not None:
+        import onnxruntime as ort
 
-    model, _ = build_model_from_checkpoint(
-        checkpoint_path, vocabs, device, latent_dim_override=latent_dim_override
-    )
+        print(f"Using ONNX Runtime for latent extraction: {onnx_path}")
+        ort_session = ort.InferenceSession(
+            onnx_path, providers=["CPUExecutionProvider"]
+        )
+        latent_matrix = _extract_latent_matrix_onnx(
+            ort_session=ort_session, samples=samples, batch_size=batch_size
+        )
+    else:
+        device = select_device()
+        print(f"Using device: {device}")
 
-    samples, skipped = filter_samples_by_decoder_max_len(
-        samples, max_seq_len=model.decoder.cfg.max_seq_len
-    )
-    if skipped:
-        print(f"Skipped {skipped} routes exceeding decoder max_seq_len={model.decoder.cfg.max_seq_len}.")
-    if not samples:
-        raise ValueError("All samples filtered out by decoder max_seq_len.")
+        model, _ = build_model_from_checkpoint(
+            checkpoint_path, vocabs, device, latent_dim_override=latent_dim_override
+        )
 
-    latent_matrix = _extract_latent_matrix(
-        model=model, samples=samples, batch_size=batch_size, device=device
-    )
+        samples, skipped = filter_samples_by_decoder_max_len(
+            samples, max_seq_len=model.decoder.cfg.max_seq_len
+        )
+        if skipped:
+            print(f"Skipped {skipped} routes exceeding decoder max_seq_len={model.decoder.cfg.max_seq_len}.")
+        if not samples:
+            raise ValueError("All samples filtered out by decoder max_seq_len.")
+
+        latent_matrix = _extract_latent_matrix(
+            model=model, samples=samples, batch_size=batch_size, device=device
+        )
 
     # Deduplicate by UUID: the DB join (climbs × climb_stats) produces one
     # RouteSample per (UUID, angle).  The encoder does not see angle, so all
@@ -487,6 +530,15 @@ def main() -> None:
     parser.add_argument("--cluster-cache-path", type=str, default=str(PROJECT_ROOT / "data/routes_clustered.pt"))
     parser.add_argument("--metadata-source", type=str, default="kilter_board_csv")
     parser.add_argument("--metadata-product-id", type=int, default=1)
+    parser.add_argument(
+        "--onnx-path",
+        type=str,
+        default=None,
+        help="Path to exported encoder ONNX file (route_cvae_encoder.onnx). "
+             "When supplied, uses ONNX Runtime for latent extraction instead of loading "
+             "the full PyTorch checkpoint. The .onnx.data sidecar file (if present) must "
+             "be in the same directory. --checkpoint-path is still used to load vocabs.",
+    )
 
     # Filtering
     parser.add_argument("--max-routes", type=int, default=5000)
@@ -556,6 +608,7 @@ def main() -> None:
         include_ungraded=args.include_ungraded,
         seed=args.seed,
         no_noise=args.no_noise,
+        onnx_path=args.onnx_path,
     )
 
 
