@@ -20,8 +20,16 @@ data/raw/kilter_images
 # Models
 models/
 *.pt
+*.onnx
 *.pth
 *.ckpt
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Sensitive environment variables
+.env
+.env.*
+
+frontend/node_modules/
+settings.json
