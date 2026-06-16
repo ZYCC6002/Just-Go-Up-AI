@@ -35,6 +35,7 @@ def _load_samples_and_vocabs(
     checkpoint_path: str,
     metadata_source: str,
     metadata_product_id: int,
+    skip_vocabs: bool = False,
 ) -> tuple[list[RouteSample], Any]:
     """Load route samples and vocabs for latent extraction.
 
@@ -48,14 +49,17 @@ def _load_samples_and_vocabs(
     # The checkpoint stores the exact vocabs used during training.  Using them
     # avoids mismatches when the local DB has a different hold/type vocabulary
     # than the Colab DB the model was trained on.
+    # When skip_vocabs=True (ONNX path), vocabs are baked into the model and
+    # not needed here — skip the checkpoint load entirely.
     ckpt_vocabs: Any = None
-    try:
-        ckpt_payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        ckpt_vocabs = ckpt_payload.get("vocabs")
-        if ckpt_vocabs is not None:
-            print(f"Loaded training vocabs from checkpoint: {checkpoint_path}")
-    except Exception as exc:
-        print(f"Warning: could not read vocabs from checkpoint ({exc}); will use cache/DB vocabs.")
+    if not skip_vocabs:
+        try:
+            ckpt_payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            ckpt_vocabs = ckpt_payload.get("vocabs")
+            if ckpt_vocabs is not None:
+                print(f"Loaded training vocabs from checkpoint: {checkpoint_path}")
+        except Exception as exc:
+            print(f"Warning: could not read vocabs from checkpoint ({exc}); will use cache/DB vocabs.")
 
     # --- Samples: preprocessed cache or DB ------------------------------------
     cache_file = Path(cache_path)
@@ -234,6 +238,46 @@ def _extract_latent_matrix(
     return np.vstack(latents)
 
 
+def _create_ort_session(onnx_path: str) -> Any:
+    """Create an ORT InferenceSession, handling renamed external-data sidecars.
+
+    ONNX files with external data store the sidecar filename inside the proto.
+    If the .onnx file was renamed after export the stored name won't match the
+    actual .onnx.data file on disk.  This function detects that mismatch and
+    patches the proto in memory before handing it to ORT.
+    """
+    import onnxruntime as ort
+
+    try:
+        return ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    except Exception as exc:
+        if "External data path" not in str(exc):
+            raise
+
+    # Sidecar name mismatch — patch and reload via the onnx library.
+    import onnx
+    from onnx.external_data_helper import load_external_data_for_model
+
+    path = Path(onnx_path)
+    data_dir = path.parent
+    candidates = sorted(data_dir.glob("*.onnx.data")) + sorted(data_dir.glob("*.data"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No external data sidecar found in {data_dir}. "
+            f"Place the .onnx.data file alongside {path.name}."
+        )
+    actual_name = candidates[0].name
+    print(f"  External data sidecar name mismatch — patching to use: {actual_name}")
+
+    model = onnx.load(onnx_path, load_external_data=False)
+    for init in model.graph.initializer:
+        for field in init.external_data:
+            if field.key == "location":
+                field.value = actual_name
+    load_external_data_for_model(model, str(data_dir))
+    return ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"])
+
+
 _ONNX_INPUT_NAMES = [
     "type_encoded_id", "role_encoded_id", "hole_encoded_id",
     "x", "y", "depth", "orientation_sin", "orientation_cos", "size",
@@ -299,6 +343,7 @@ def run_analysis(
         checkpoint_path=checkpoint_path,
         metadata_source=metadata_source,
         metadata_product_id=metadata_product_id,
+        skip_vocabs=onnx_path is not None,
     )
     if not samples:
         raise ValueError("No route samples available for analysis.")
@@ -372,12 +417,8 @@ def run_analysis(
         ]
 
     if onnx_path is not None:
-        import onnxruntime as ort
-
         print(f"Using ONNX Runtime for latent extraction: {onnx_path}")
-        ort_session = ort.InferenceSession(
-            onnx_path, providers=["CPUExecutionProvider"]
-        )
+        ort_session = _create_ort_session(onnx_path)
         latent_matrix = _extract_latent_matrix_onnx(
             ort_session=ort_session, samples=samples, batch_size=batch_size
         )
